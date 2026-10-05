@@ -12,6 +12,5 @@ keystore.properties
 *.jks
 *.keystore
 
-# feedback media (clips, screenshots) stay local
-feedback/samples/
-feedback/diagnostics/
+# owner/tester feedback, diagnostics and samples stay local (not public)
+feedback/
