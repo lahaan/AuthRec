@@ -11,3 +11,6 @@ captures/
 keystore.properties
 *.jks
 *.keystore
+
+# feedback media (clips, screenshots) stay local
+feedback/samples/

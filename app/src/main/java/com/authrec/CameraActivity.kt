@@ -1406,12 +1406,18 @@ class CameraActivity : Activity() {
     }
 
     /**
-     * adb control, for testing without touching the phone. Extras:
-     * cmd = rec | stop, codec = HEVC_10 | HEVC_8 | AVC_8, bitrate = Mbps, fps = 24|25|30,
+     * adb control, for testing without touching the phone
+     * (adb shell am start -n com.authrec/.CameraActivity --es cmd rec ...). Extras:
+     * cmd = rec | stop | edit (look editor) | dumpcams (log every camera id) | refshot (RAW+ISP JPEG
+     *   reference into files/ref/, see tools/refshot),
+     * codec = HEVC_10 | HEVC_8 | AVC_8, bitrate = Mbps, fps = 24|25|30,
      * bake / superpixel / audio / wblock / simple = true|false, profile = APPLE_LOG | SLOG3 | LOGC3,
-     * view = index into the view list, ae = AUTO | LOCKED | MANUAL | PRIORITY, ev = EV (float), iso = ISO,
-     * shutter = 1/x denominator, af = CONTINUOUS | MANUAL, focus = diopters,
-     * strength / sat / vib = percent (vib: -100..100), tap = "x,y" in 0..1 image coordinates.
+     * view = index into the view list, ae = AUTO | LOCKED | MANUAL | PRIORITY, ev = EV (float),
+     * iso = ISO, shutter = 1/x denominator, af = CONTINUOUS | MANUAL, focus = diopters (float),
+     * clean = 0..3, strength / sat / vib = percent (vib: -100..100),
+     * tap = "x,y" in 0..1 image coordinates, lens = lens key (e.g. "0", "3", "5/4"),
+     * rawlens = "open/physical" + zoom = ratio (stream an arbitrary route; not saved),
+     * afverbose = true|false (log AF state every frame).
      */
     private fun handleCommands(intent: Intent?) {
         val extras = intent?.extras ?: return
