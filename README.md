@@ -12,7 +12,11 @@ shading); demosaicing, colour, log encoding and LUTs all run on the GPU.
 - Simple mode (look, tap to focus, exposure, record) and Pro mode
 
 Developed and tested on a Xiaomi 14 (Android 16 / HyperOS 3). Needs Android 12+ and a camera with
-RAW support.
+RAW support. CameraAPI2 L3 access necessary & SoC w GPU powerful enough (ie 8gen2 & above preferred)
+
+## Toknow
+
+Currently EV, Exposure and AF is a bit iffy and needs work and so does the whole UI/UX. Right now in just alpha/poc stage. Unknown how well works on other devices.
 
 ## Installing (no computer needed)
 
