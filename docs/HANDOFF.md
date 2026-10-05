@@ -30,6 +30,15 @@ see **CLAUDE.md**. New feedback/diagnostics/samples: **feedback/**.
 - Look editor "Clip frame" with 10-bit clips; LUT import of unusual .cube files (DOMAIN, 1D).
 - Anything on a non-Xiaomi or non-Snapdragon phone; the Xiaomi 15 Ultra (friend testing now).
 
+## Start here (next session)
+
+1. Read `feedback/notes.md` (2026-10-05): 10 triaged items from both phones with diagnoses.
+2. 0.2.1 changes (probe results in diagnostics, dark-room probe fix, logical-stream retry,
+   launcher-extras fix) are verified on the X14 (all 5 routes pass in a dark room) but not yet
+   released; publish it so the friend's 15 Ultra can send useful diagnostics (ask the owner first).
+3. Biggest owner pain points: noise from digital gain (item 5), heat (item 7), EV slider in Pro
+   (item 6), tap keeps AF Auto (item 8). 15 Ultra: missing lenses (item 1), lens-switch freeze (item 2).
+
 ## Known issues / owner feedback not yet addressed
 
 - Owner: "exposure control is a bit iffy" during recording and in general; AE/EV/AF "needs work",

@@ -14,3 +14,4 @@ keystore.properties
 
 # feedback media (clips, screenshots) stay local
 feedback/samples/
+feedback/diagnostics/

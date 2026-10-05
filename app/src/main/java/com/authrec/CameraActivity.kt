@@ -1420,6 +1420,9 @@ class CameraActivity : Activity() {
      * afverbose = true|false (log AF state every frame).
      */
     private fun handleCommands(intent: Intent?) {
+        // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
+        // without the launcher category are commands.
+        if (intent?.hasCategory(Intent.CATEGORY_LAUNCHER) == true) return
         val extras = intent?.extras ?: return
         if (recorder == null) {
             if (extras.containsKey("simple")) setSimple(extras.getBoolean("simple"))

@@ -252,7 +252,7 @@ class RawCamera(
             SessionConfiguration.SESSION_REGULAR,
             // With zoom routing, the metering stream stays on the logical camera: that's where its
             // 3A (and the active lens's native AF) runs, and HALs want a logical stream anyway.
-            listOf(output(reader.surface), if (lens?.zoomRatio?.let { it != 1f } == true) OutputConfiguration(metering.surface) else output(metering.surface)),
+            listOf(output(reader.surface), if (zoomRouted || lens?.logicalStream == true) OutputConfiguration(metering.surface) else output(metering.surface)),
             { handler.post(it) },
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {

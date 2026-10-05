@@ -38,6 +38,8 @@ data class Lens(
     var label: String = "",
     /** For a physical lens behind a logical camera: zoom ratio that makes the logical camera switch to it (1 = don't set). */
     val zoomRatio: Float = 1f,
+    /** The HAL only streams this physical lens's RAW with another stream on the logical camera. */
+    val logicalStream: Boolean = false,
 ) {
     /** The id whose characteristics describe this sensor. */
     val sensorId get() = physicalId ?: openId
@@ -45,13 +47,14 @@ data class Lens(
 
     fun toJson() = JSONObject().put("openId", openId).put("physicalId", physicalId ?: JSONObject.NULL)
         .put("front", front).put("equiv", equivFocalMm.toDouble()).put("w", rawWidth).put("h", rawHeight).put("label", label)
-        .put("zoom", zoomRatio.toDouble())
+        .put("zoom", zoomRatio.toDouble()).put("logicalStream", logicalStream)
 
     companion object {
         fun fromJson(j: JSONObject) = Lens(
             j.getString("openId"), j.optString("physicalId").takeIf { !j.isNull("physicalId") && it.isNotEmpty() },
             j.getBoolean("front"), j.getDouble("equiv").toFloat(), j.getInt("w"), j.getInt("h"), j.getString("label"),
             j.optDouble("zoom", 1.0).toFloat(),
+            j.optBoolean("logicalStream", false),
         )
     }
 }
@@ -87,12 +90,16 @@ class LensProbe(private val context: Context) {
             prefs.edit().putStringSet("crashed", crashed).remove("probing").apply()
         }
 
-        val candidates = candidates().filter { it.key !in crashed }
+        val all = candidates()
+        val candidates = all.filter { it.key !in crashed }
         progress("Finding lenses: ${candidates.size} candidates")
         val thread = HandlerThread("lens-probe").apply { start() }
         val handler = Handler(thread.looper)
         val working = mutableListOf<Lens>()
         val seenSensors = mutableSetOf<String>()
+        // Every candidate's outcome, kept for Send diagnostics (the scan's log is gone by then).
+        val results = JSONArray()
+        all.filter { it.key in crashed }.forEach { results.put("${it.key}: skipped (crashed the app in an earlier scan)") }
         try {
             candidates.forEachIndexed { i, lens ->
                 // The same sensor often appears twice (as a camera id and as a physical lens); keep the first that works.
@@ -100,11 +107,21 @@ class LensProbe(private val context: Context) {
                 if (sig in seenSensors) return@forEachIndexed
                 progress("Testing lens ${i + 1}/${candidates.size} (${lens.key})")
                 prefs.edit().putString("probing", lens.key).commit()
-                val result = runCatching { test(lens, handler) }.getOrElse { "error: ${it.message}" }
+                var lensToKeep = lens
+                var result = runCatching { test(lens, handler) }.getOrElse { "error: ${it.message}" }
+                // Some HALs reject a RAW-only stream on a physical sub-camera; retry with a stream
+                // on the logical camera too (what zoom routes always use).
+                if (result != OK && lens.physicalId != null && lens.zoomRatio == 1f) {
+                    val retry = runCatching { test(lens, handler, logicalStream = true) }.getOrElse { "error: ${it.message}" }
+                    if (retry == OK) lensToKeep = lens.copy(logicalStream = true)
+                    result = if (retry == OK) OK else "$result; with logical stream: $retry"
+                }
                 prefs.edit().remove("probing").commit()
+                results.put("${lens.key} (${"%.0f".format(lens.equivFocalMm)} mm eq, ${lens.rawWidth}x${lens.rawHeight}" +
+                    "${if (lens.zoomRatio != 1f) ", zoom %.2f".format(lens.zoomRatio) else ""}): $result")
                 Log.i(TAG, "lens ${lens.key} (${"%.0f".format(lens.equivFocalMm)} mm eq, ${lens.rawWidth}x${lens.rawHeight}): $result")
                 if (result == OK) {
-                    working += lens
+                    working += lensToKeep
                     seenSensors += sig
                 }
             }
@@ -115,6 +132,7 @@ class LensProbe(private val context: Context) {
         prefs.edit()
             .putString("fingerprint", Build.FINGERPRINT)
             .putInt("version", VERSION)
+            .putString("probeResults", results.toString(1))
             .putString("lenses", JSONArray(working.map { it.toJson() }).toString())
             .apply()
         return working
@@ -167,7 +185,7 @@ class LensProbe(private val context: Context) {
 
     /** Opens the lens, streams RAW for up to ~2.5 s and checks the frames. Returns [OK] or why not. */
     @SuppressLint("MissingPermission")
-    private fun test(lens: Lens, handler: Handler): String {
+    private fun test(lens: Lens, handler: Handler, logicalStream: Boolean = false): String {
         val opened = CountDownLatch(1)
         var device: CameraDevice? = null
         var error: String? = null
@@ -184,7 +202,7 @@ class LensProbe(private val context: Context) {
         val white = c.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023
         val reader = ImageReader.newInstance(lens.rawWidth, lens.rawHeight, ImageFormat.RAW_SENSOR, 3)
         // Zoom routes: the HAL wants a stream on the logical camera too (RAW-only physical fails).
-        val logicalYuv = if (lens.zoomRatio != 1f) ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
+        val logicalYuv = if (lens.zoomRatio != 1f || logicalStream) ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
             setOnImageAvailableListener({ it.acquireLatestImage()?.close() }, handler)
         } else null
         var frames = 0 // only touched on the probe handler thread until the test is over
@@ -235,10 +253,10 @@ class LensProbe(private val context: Context) {
 
         if (frames == 0) return "no frames"
         val (mean, std) = stats.get() ?: return "only $frames frames in 2.5 s"
-        // Real images have texture; a black or frozen/constant buffer doesn't. Kept loose so a
-        // dim room still passes: the bar is "pixels light up", not "looks good".
-        if (mean < 0.0005) return "black frames (mean %.5f)".format(mean)
-        if (std < 0.0003) return "flat frames (std %.5f)".format(std)
+        // A broken route delivers constant buffers (zero or frozen): no variation at all. A dark
+        // scene still has sensor noise, so judge by variation only, never by brightness (a dim
+        // room at night once made a working telephoto look "black").
+        if (std < 0.0003) return "flat frames (mean %.5f, std %.5f)".format(mean, std)
         Log.i(TAG, "lens ${lens.key}: $frames frames, first after $firstFrameMs ms, mean %.4f std %.4f".format(mean, std))
         return OK
     }
@@ -280,7 +298,7 @@ class LensProbe(private val context: Context) {
         private const val TAG = "AuthRec"
         private const val OK = "ok"
         /** Bump to force a rescan after changing how lenses are found. */
-        private const val VERSION = 4
+        private const val VERSION = 6
 
         /** RAW size closest to 4096×3072 (binned open gate). */
         fun rawSize(c: CameraCharacteristics): Size? =
