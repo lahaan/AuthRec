@@ -50,8 +50,8 @@ Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: *
 ## Start here (next session)
 
 1. Read `feedback/notes.md` (items 11–14 are this session's), then anything new in `feedback/`.
-2. 0.2.2 lives on branch `0.2.2` (not merged, not pushed): check with the owner, merge to main,
-   release (see CLAUDE.md), and ask the friend for Rescan lenses → Send diagnostics.
+2. 0.2.2 is published as a GitHub pre-release (v0.2.2, 2026-10-06). The owner is testing it and
+   collecting the friend's 15 Ultra diagnostics (it rescans on first start: lens cache version 7).
 3. From the friend's next report: did the zoom routes give 0.6x/3x/4.x? Did the main camera's
    launch errors recover by themselves (event log: "retry", "layout", "streaming again")?
 4. Owner decisions pending (see "Ideas" below): noise (item 5: ETTR-style AE / gain off), whether
