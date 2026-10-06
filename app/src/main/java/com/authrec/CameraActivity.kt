@@ -91,6 +91,13 @@ class CameraActivity : Activity() {
     private var simple = true
     /** See [Renderer.cleanup]. */
     private var cleanup = 2
+    /**
+     * Tone balance of the view, -100..100 (see [Renderer.toneHighlights]). Xiaomi's AE exposes for
+     * the sky and lets its ISP lift the rest; with one global gain our sky goes white in the view
+     * (the log keeps it). "Balance" pulls highlights down and lifts shadows a little.
+     */
+    private var toneHighlights = 0
+    private var toneShadows = 0
     /** User adjustment on top of the automatic per-lens gain before the log curve, in EV. */
     /**
      * The one exposure control (bottom −/+ and the slider show the same value). AUTO/LOCKED: real
@@ -161,6 +168,9 @@ class CameraActivity : Activity() {
     private lateinit var focusSeek: SeekBar
     private lateinit var focusLabel: TextView
     private lateinit var focusSquare: View
+    private lateinit var balanceButton: Button
+    private lateinit var highlightsBar: SeekBar
+    private lateinit var shadowsBar: SeekBar
     private lateinit var strengthBar: SeekBar
     private lateinit var saturationBar: SeekBar
     private lateinit var vibranceBar: SeekBar
@@ -201,6 +211,8 @@ class CameraActivity : Activity() {
         bitrateMbps = prefs.getInt("bitrate", 150)
         bakeLut = prefs.getBoolean("recordLook", true)
         cleanup = prefs.getInt("cleanup", 2)
+        toneHighlights = prefs.getInt("toneHi", 0)
+        toneShadows = prefs.getInt("toneLo", 0)
         superpixel = prefs.getBoolean("superpixel", false)
         audioOn = prefs.getBoolean("audio", true)
         capture = capture.copy(fps = prefs.getInt("fps", 30))
@@ -220,6 +232,8 @@ class CameraActivity : Activity() {
             .putInt("bitrate", bitrateMbps)
             .putBoolean("recordLook", bakeLut)
             .putInt("cleanup", cleanup)
+            .putInt("toneHi", toneHighlights)
+            .putInt("toneLo", toneShadows)
             .putBoolean("superpixel", superpixel)
             .putBoolean("audio", audioOn)
             .putInt("fps", capture.fps)
@@ -300,6 +314,9 @@ class CameraActivity : Activity() {
         profileButton = smallButton("") { cycleProfile() }
         viewButton = smallButton("") { showViewMenu() }
         val importButton = smallButton("+ LUT") { pickLut() }
+        balanceButton = smallButton("") {
+            if (toneHighlights == 0 && toneShadows == 0) setTone(BALANCE_HIGHLIGHTS, BALANCE_SHADOWS) else setTone(0, 0)
+        }
         val lookButton = smallButton("Adjust") {
             lookPanel.visibility = if (lookPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -346,7 +363,7 @@ class CameraActivity : Activity() {
             addView(wbButton)
             addView(fpsButton)
         }
-        val left = column(profileButton, viewButton, importButton, lookButton)
+        val left = column(profileButton, viewButton, importButton, lookButton, balanceButton)
         val right = column(recButton, codecButton, bitrateButton, resButton, audioButton, bakeButton, cleanButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = exposureSlider.layoutParams as FrameLayout.LayoutParams
@@ -424,6 +441,14 @@ class CameraActivity : Activity() {
             }
             return row to bar
         }
+        val (hiRow, hi) = slider("Highlights", 200, toneHighlights + 100, { "%+d".format(it - 100) }) {
+            if (it - 100 != toneHighlights) setTone(it - 100, toneShadows)
+        }
+        val (loRow, lo) = slider("Shadows", 200, toneShadows + 100, { "%+d".format(it - 100) }) {
+            if (it - 100 != toneShadows) setTone(toneHighlights, it - 100)
+        }
+        highlightsBar = hi
+        shadowsBar = lo
         val (strengthRow, s) = slider("LUT strength", 100, 100, { "$it%" }) { renderer?.lutStrength = it / 100f }
         val (satRow, sat) = slider("Saturation", 200, 100, { "$it%" }) { renderer?.saturation = it / 100f }
         val (vibRow, vib) = slider("Vibrance", 200, 100, { "%+d".format(it - 100) }) { renderer?.vibrance = (it - 100) / 100f }
@@ -433,6 +458,7 @@ class CameraActivity : Activity() {
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(smallButton("Reset") {
+                setTone(0, 0)
                 strengthBar.progress = 100
                 saturationBar.progress = 100
                 vibranceBar.progress = 100
@@ -444,6 +470,8 @@ class CameraActivity : Activity() {
             setBackgroundColor(0xB0000000.toInt())
             setPadding(32, 16, 32, 16)
             visibility = View.GONE
+            addView(hiRow)
+            addView(loRow)
             addView(strengthRow)
             addView(satRow)
             addView(vibRow)
@@ -491,6 +519,23 @@ class CameraActivity : Activity() {
     }
 
     private val saveSoon = Runnable { savePrefs() }
+
+    /** Tone balance of the view (both -100..100); the Balance button and the Adjust sliders. */
+    private fun setTone(highlights: Int, shadows: Int) {
+        toneHighlights = highlights.coerceIn(-100, 100)
+        toneShadows = shadows.coerceIn(-100, 100)
+        applyTone()
+        if (highlightsBar.progress != toneHighlights + 100) highlightsBar.progress = toneHighlights + 100
+        if (shadowsBar.progress != toneShadows + 100) shadowsBar.progress = toneShadows + 100
+        updateUi()
+        info.removeCallbacks(saveSoon)
+        info.postDelayed(saveSoon, 1000)
+    }
+
+    private fun applyTone() {
+        renderer?.toneHighlights = toneHighlights / 100f
+        renderer?.toneShadows = toneShadows / 100f
+    }
 
     /** Routes [exposureEv] to sensor exposure or digital gain depending on the AE mode. */
     private fun applyExposure() {
@@ -540,6 +585,13 @@ class CameraActivity : Activity() {
         bitrateButton.text = "$bitrateMbps Mbps"
         resButton.text = if (simple) (if (superpixel) "2K" else "4K") else if (superpixel) "Superpixel 2K" else "Open gate 4K"
         audioButton.text = if (audioOn) "Audio: on" else "Audio: off"
+        balanceButton.text = when {
+            toneHighlights == 0 && toneShadows == 0 -> "Balance: off"
+            toneHighlights == BALANCE_HIGHLIGHTS && toneShadows == BALANCE_SHADOWS -> "Balance: on"
+            else -> "Balance: %+d / %+d".format(toneHighlights, toneShadows)
+        }
+        // It shapes looks and LUTs; the plain log view shows the log as recorded.
+        balanceButton.isEnabled = views.getOrNull(viewIndex) !is ViewEntry.LogView
         bakeButton.text = if (bakeLut) "Record: Look" else "Record: Log"
         cleanButton.text = when (cleanup) {
             0 -> "Clean: off"
@@ -1354,6 +1406,8 @@ class CameraActivity : Activity() {
         r.profile = profile
         r.superpixel = superpixel
         r.cleanup = cleanup
+        r.toneHighlights = toneHighlights / 100f
+        r.toneShadows = toneShadows / 100f
         applyExposure()
         camera = cam
         renderer = r
@@ -1553,7 +1607,8 @@ class CameraActivity : Activity() {
         recordStartMs = SystemClock.elapsedRealtime()
         lastResult = null
         EventLog.log("Recording ${w}x$h ${codec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
-            "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, battery %.1f °C".format(batteryTempC))
+            "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, tone $toneHighlights/$toneShadows, " +
+            "battery %.1f °C".format(batteryTempC))
         // In simple mode the recording is what you see, so bake the look in.
         r.startRecording(rec, capture.fps, bakeLut || simple) { err ->
             runOnUiThread {
@@ -1748,7 +1803,8 @@ class CameraActivity : Activity() {
      * RawCamera.variant), cmd = failcam (simulate a camera failure) | rescan, lock = true (with tap:
      * lock focus there), afreset = true (as a double-tap), fullpreview = true|false (full-res preview),
      * fakeheat = °C (pretend battery temperature, until the next real reading) after fakeheatdelay ms,
-     * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects).
+     * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects),
+     * tonehi / tonelo = -100..100 (tone balance: highlights / shadows).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -1812,6 +1868,9 @@ class CameraActivity : Activity() {
         extras.getString("lutinput")?.let { v ->
             (views.getOrNull(viewIndex) as? ViewEntry.CubeFile)?.let { prefs.edit().putString("lutInput:${it.file.name}", v).apply() }
             applyView()
+        }
+        if (extras.containsKey("tonehi") || extras.containsKey("tonelo")) {
+            setTone(extras.getInt("tonehi", toneHighlights), extras.getInt("tonelo", toneShadows))
         }
         if (extras.containsKey("strength")) strengthBar.progress = extras.getInt("strength")
         if (extras.containsKey("sat")) saturationBar.progress = extras.getInt("sat")
@@ -1878,6 +1937,9 @@ class CameraActivity : Activity() {
         private const val WARM_C = 43f
         private const val HOT_WARN_C = 45f
         private const val HOT_STOP_C = 47f
+        /** What the Balance button sets: highlights down, shadows up a little. */
+        private const val BALANCE_HIGHLIGHTS = -60
+        private const val BALANCE_SHADOWS = 30
         /** Effective ISO from which the exposure slider's value turns amber. */
         private const val NOISY_ISO = 3200
         /** Full-resolution processing before a 4K recording starts (see [startRecording]). */

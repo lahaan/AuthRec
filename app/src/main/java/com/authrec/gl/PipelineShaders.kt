@@ -179,6 +179,10 @@ internal object PipelineShaders {
         uniform int uCurve;          // ours (LogProfile.shaderId)
         uniform int uLutCurve;       // the LUT's
         uniform mat3 uLutGamut;      // linear: our primaries → the LUT's
+        uniform bool uTone;          // tone balance on (see balanceTone)
+        uniform float uToneHi;       // -1..1: < 0 pulls highlights down, > 0 pushes them up
+        uniform float uToneLo;       // -1..1: > 0 lifts shadows, < 0 deepens them
+        uniform vec3 uLumaW;         // luminance weights of our gamut (Y row of RGB → XYZ)
         uniform float uLutSize;
         uniform float uLutStrength;  // 0 = plain log, 1 = full LUT
         uniform float uSaturation;   // 1 = unchanged
@@ -214,6 +218,27 @@ internal object PipelineShaders {
                 if (x > 0.010591) return 0.247190 * log(5.555556 * x + 0.052272) / log(10.0) + 0.385537;
                 return 5.367655 * x + 0.092809;
             }
+        }
+
+        float softplus(float x, float w) { return w * log(1.0 + exp(x / w)); }
+
+        /**
+         * Global tone balance, what a phone's ISP does locally when its AE has exposed for the sky:
+         * in stops around middle grey (0.18), highlights above +1 stop are compressed (slope
+         * 1 + 0.6·uToneHi) and shadows below −1 stop lifted (up to 2.5 stops at full strength, easing
+         * off towards black so noise isn't dragged up without limit). Soft half-stop knees keep
+         * the curve smooth and middle grey in place. The gain comes from luminance and applies to
+         * all three channels, so colours keep their ratios.
+         */
+        vec3 balanceTone(vec3 c) {
+            vec3 lin = vec3(decodeLog(uCurve, c.r), decodeLog(uCurve, c.g), decodeLog(uCurve, c.b));
+            float y = dot(lin, uLumaW);
+            if (y <= 1e-5) return c;
+            float e = log2(y / 0.18);
+            float hi = 0.6 * uToneHi * softplus(e - 1.0, 0.5);
+            float lo = 2.5 * uToneLo * tanh(softplus(-1.0 - e, 0.5) / 5.0);
+            lin *= exp2(hi + lo);
+            return vec3(encodeLogAs(uCurve, lin.r), encodeLogAs(uCurve, lin.g), encodeLogAs(uCurve, lin.b));
         }
 
         /** Our log → the log encoding (curve and gamut) the LUT was built for. */
@@ -301,7 +326,11 @@ internal object PipelineShaders {
             }
             if (uWriteLog) imageStore(uOutLog, p, vec4(c, 1.0));
             vec3 view = c;
-            if (uUseLut) view = mix(c, lutTetra(uLutConvert ? toLutInput(c) : c), uLutStrength);
+            if (uUseLut) {
+                // Tone balance belongs to the view (and a baked recording), never the clean log above.
+                vec3 t = uTone ? balanceTone(c) : c;
+                view = mix(t, lutTetra(uLutConvert ? toLutInput(t) : t), uLutStrength);
+            }
             imageStore(uOutView, p, vec4(look(view), 1.0));
         }
     """.trimIndent()

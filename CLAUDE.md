@@ -38,7 +38,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 | `EventLog.kt` | Persistent event log (`files/events.log`: opens, layouts, failures, retries, scans, recordings, heat, crashes); part of Send diagnostics |
 | `ExposureSlider.kt` | The vertical EV slider (relative drag, double-tap = 0, amber where it's digital gain) |
 | `gl/Renderer.kt` | GL thread: RAW upload, 3 compute passes, preview draw, encoder-surface draw (2nd shared EGL context, 10-bit config), auto gain, sharpness metric for contrast AF, stall stats |
-| `gl/PipelineShaders.kt` | GLSL: prep (black/shading/WB/defect pixels) → develop (MHC demosaic or superpixel, matrix, log) → finish (chroma NR, tetrahedral LUT, saturation/vibrance) + display (peaking) |
+| `gl/PipelineShaders.kt` | GLSL: prep (black/shading/WB/defect pixels) → develop (MHC demosaic or superpixel, matrix, log) → finish (chroma NR, clean log out, then for the view: tone balance, LUT input conversion, tetrahedral LUT, saturation/vibrance) + display (peaking) |
 | `gl/GlUtil.kt` | EGL core (main + encoder contexts), GL helpers |
 | `record/Recorder.kt` | MediaCodec video (surface input) + AAC audio on the camera clock + MediaMuxer → MediaStore `Movies/AuthRec` |
 | `SoftwareAf.kt` | Contrast-detect AF (coarse/fine sweeps, warm-up step, parabola fit, continuous monitor) for lenses whose ISP AF doesn't work for us |
@@ -90,6 +90,11 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 - The preview uses the superpixel path between recordings (≈4 ms vs ≈15–25 ms a frame); 4K
   recording first runs 1 s at full resolution (jumping straight in dropped frames while the GPU
   clocked up). The finish pass only writes the full-size log image when something uses it.
+- **Tone balance** ("Balance" button, Adjust → Highlights/Shadows, prefs `toneHi`/`toneLo`):
+  a luminance-based curve in stops around middle grey (highlights above +1 stop compressed, shadows
+  below −1 stop lifted, half-stop soft knees) applied before the look/LUT. It answers Xiaomi's AE
+  exposing for the sky (the ISP then tone-maps locally; our single global gain leaves the sky white
+  in the view while the log keeps it). View and baked recordings only; the clean log never gets it.
 - `LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID` can name the main sensor while a physical stream of
   another sensor still delivers (X14 `5/4`), so it's only a hint.
 - **Xiaomi 15 Ultra (HyperOS 2)**: hidden ids opened directly fail at configure with

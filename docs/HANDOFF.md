@@ -57,6 +57,13 @@ Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: *
 4. Owner decisions pending (see "Ideas" below): noise (item 5: ETTR-style AE / gain off), whether
    a 1 s REC warm-up is acceptable.
 
+## After 0.2.2 (on main, not released yet)
+
+- Tone balance: "Balance" button (left column, both modes; highlights −60 / shadows +30) and
+  Highlights / Shadows sliders in Adjust. Curve checked numerically (Balance: +4 stops → +2.9,
+  −4 → −3.6, middle grey unchanged) and all shaders compile offline (SDK glslang); not yet
+  looked at on the phone.
+
 ## Known issues / owner feedback not yet addressed
 
 - Noise from digital gain (item 5): the effective ISO is now shown and the slider turns amber from
@@ -75,10 +82,9 @@ Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: *
 
 ## Ideas discussed, not started
 
-- **ETTR-style exposure** (for item 5): drive sensor exposure from the RAW histogram (raise it
-  until the 99.5th percentile nears ~0.9 of white) and lower the digital gain by the same amount;
-  in daylight that's 2–3 EV more light on the sensor for free. Trade-off: less highlight headroom
-  than Xiaomi's AE keeps. Or a simple "Gain: Off" option. Owner to pick.
+- **ETTR-style exposure** (for item 5's noise): drive sensor exposure from the RAW histogram and
+  lower the digital gain by the same amount; 2–3 EV more light in daylight, less highlight
+  headroom. The owner is fine with the noise for now and chose tone balance instead (above).
 - Lighter 4K pipeline for heat: prep pass into R16F isn't allowed as an image format in GLES 3.1;
   next candidates: compute the LUT view at half resolution while recording log, zero-copy RAW
   upload (AHardwareBuffer, needs NDK), fewer full-res RGBA16F passes.

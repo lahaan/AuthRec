@@ -89,6 +89,12 @@ class Renderer(
     /** All digital gain before the log curve, in EV (auto gain or its default, plus the user's). */
     val totalGainEv get() = (if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv) + exposureOffsetEv
     @Volatile var lutStrength: Float = 1f
+    /**
+     * Tone balance of the view, -1..1 each (see PipelineShaders.finish `balanceTone`): pulls the
+     * highlights down / lifts the shadows before the look or LUT. The recorded log never gets it.
+     */
+    @Volatile var toneHighlights: Float = 0f
+    @Volatile var toneShadows: Float = 0f
     @Volatile var saturation: Float = 1f
     @Volatile var vibrance: Float = 0f
     /** 2×2 superpixel output at half resolution instead of demosaiced full resolution. */
@@ -506,6 +512,14 @@ class Renderer(
             GLES30.glUniform1i(Gl.uniform(finishProgram, "uLutCurve"), lutIn.shaderId)
             GLES30.glUniformMatrix3fv(Gl.uniform(finishProgram, "uLutGamut"), 1, false,
                 ColorMath.toGlColumnMajor(ColorMath.convert(p.primaries, lutIn.primaries)), 0)
+        }
+        val toneOn = abs(toneHighlights) > 0.001f || abs(toneShadows) > 0.001f
+        GLES30.glUniform1i(Gl.uniform(finishProgram, "uTone"), if (toneOn) 1 else 0)
+        if (toneOn) {
+            GLES30.glUniform1f(Gl.uniform(finishProgram, "uToneHi"), toneHighlights)
+            GLES30.glUniform1f(Gl.uniform(finishProgram, "uToneLo"), toneShadows)
+            val toXyz = ColorMath.rgbToXyz(p.primaries)
+            GLES30.glUniform3f(Gl.uniform(finishProgram, "uLumaW"), toXyz[3].toFloat(), toXyz[4].toFloat(), toXyz[5].toFloat())
         }
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uLutSize"), lutSize.toFloat())
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uLutStrength"), lutStrength)
