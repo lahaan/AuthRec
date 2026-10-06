@@ -85,16 +85,30 @@ class Renderer(
     /** Current auto gain in EV, for display. */
     @Volatile var autoGainEv: Float = Float.NaN
         private set
+
+    /** All digital gain before the log curve, in EV (auto gain or its default, plus the user's). */
+    val totalGainEv get() = (if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv) + exposureOffsetEv
     @Volatile var lutStrength: Float = 1f
     @Volatile var saturation: Float = 1f
     @Volatile var vibrance: Float = 0f
     /** 2×2 superpixel output at half resolution instead of demosaiced full resolution. */
     @Volatile var superpixel: Boolean = false
+    /**
+     * Full-resolution processing for the preview too. Off by default: the preview area is ~1600 px
+     * wide, so between recordings the cheap superpixel path (about a quarter of the GPU work) looks
+     * the same and keeps the phone cooler; recording always runs at the recorded resolution.
+     */
+    @Volatile var previewFullRes: Boolean = false
     /** 0 off, 1 fix defect pixels, 2 + chroma NR low, 3 + chroma NR high. */
     @Volatile var cleanup: Int = 2
 
     /** Red focus-peaking overlay on the preview (never recorded). */
     @Volatile var peaking: Boolean = false
+    /**
+     * The log encoding the current LUT expects, when it isn't ours: the view converts to it before
+     * the lookup (the recorded log stays in [profile]). null = apply the LUT to our log as is.
+     */
+    @Volatile var lutInput: LogProfile? = null
     @Volatile private var pendingLut: CubeLut? = null
     @Volatile private var lutEnabled = false
 
@@ -353,44 +367,56 @@ class Renderer(
      * [region], on 2×2-block averages of both greens to halve sensor noise, divided by the
      * mean, which cancels small exposure changes without amplifying noise in dark areas the way
      * dividing by the squared mean does. At most ~200×200 blocks.
+     *
+     * Runs on the GL thread for every frame while AF or a tapped spot is being watched, so the
+     * rows are copied out in bulk: reading pixel by pixel through the ByteBuffer cost ~20 ms a frame.
      */
     private fun measureSharpness(image: Image, region: FloatArray): Float {
         val plane = image.planes[0]
-        val buf = plane.buffer
+        val pixels = plane.buffer.asShortBuffer() // keeps the buffer's (native) byte order
+        val strideShorts = plane.rowStride / 2
         val (rx, ry) = sensor.redOffset
         val bx0 = ((region[0] * w).toInt() / 2).coerceIn(0, w / 2 - 3)
         val bx1 = ((region[2] * w).toInt() / 2).coerceIn(bx0 + 2, w / 2 - 2)
         val by0 = ((region[1] * h).toInt() / 2).coerceIn(0, h / 2 - 3)
         val by1 = ((region[3] * h).toInt() / 2).coerceIn(by0 + 2, h / 2 - 2)
         val step = ((bx1 - bx0) / 200).coerceAtLeast(1)
-        // Mean of the two greens in CFA block (bx, by).
-        fun g(bx: Int, by: Int): Float {
-            val x = bx * 2
-            val y = by * 2
-            val ge = buf.getShort((y + ry) * plane.rowStride + (x + 1 - rx) * 2).toInt() and 0xFFFF
-            val go = buf.getShort((y + 1 - ry) * plane.rowStride + (x + rx) * 2).toInt() and 0xFFFF
-            return (ge + go) * 0.5f
-        }
+        // Sensor rows 2·by .. 2·by+3 (this block row and the next), columns 2·bx0 .. 2·(bx1+1)+1.
+        val x0 = bx0 * 2
+        val len = (bx1 - bx0 + 2) * 2
+        if (rows.size != 4 || rows[0].size < len) rows = Array(4) { ShortArray(len) }
         var energy = 0.0
         var level = 0.0
         var n = 0
         var by = by0
         while (by < by1) {
-            var bx = bx0
-            while (bx < bx1) {
-                val c = g(bx, by)
-                val dx = g(bx + 1, by) - c
-                val dy = g(bx, by + 1) - c
+            for (k in 0 until 4) {
+                pixels.position((by * 2 + k) * strideShorts + x0)
+                pixels.get(rows[k], 0, len)
+            }
+            // Mean of the two greens of block column i (relative to bx0) in block row j (0 or 1).
+            fun g(i: Int, j: Int): Float {
+                val ge = rows[j * 2 + ry][i * 2 + 1 - rx].toInt() and 0xFFFF
+                val go = rows[j * 2 + 1 - ry][i * 2 + rx].toInt() and 0xFFFF
+                return (ge + go) * 0.5f
+            }
+            var i = 0
+            while (i < bx1 - bx0) {
+                val c = g(i, 0)
+                val dx = g(i + 1, 0) - c
+                val dy = g(i, 1) - c
                 energy += dx * dx + dy * dy
                 level += c
                 n++
-                bx += step
+                i += step
             }
             by += step
         }
         val mean = level / n
         return if (mean > 0) (energy / n / mean).toFloat() else 0f
     }
+
+    private var rows = arrayOf<ShortArray>()
 
     private fun updateAutoGain(raw: Float) {
         if (autoGainFrozen) return
@@ -401,10 +427,7 @@ class Renderer(
         autoGainEv = if (autoGainEv.isNaN()) target else autoGainEv + (target - autoGainEv) * 0.08f
     }
 
-    private fun currentGain(): Float {
-        val auto = if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv
-        return 2f.pow(auto + exposureOffsetEv)
-    }
+    private fun currentGain(): Float = 2f.pow(totalGainEv)
 
     private fun uploadRaw(image: Image) {
         val plane = image.planes[0]
@@ -424,8 +447,7 @@ class Renderer(
 
         val groupsX = (w + 15) / 16
         val groupsY = (h + 15) / 16
-        // Mid-recording the mode is fixed by what the encoder was set up for.
-        val sp = recording?.superpixel ?: superpixel
+        val sp = activeSuperpixel()
 
         // Pass 1: normalise RAW.
         GLES30.glUseProgram(prepProgram)
@@ -465,6 +487,14 @@ class Renderer(
         GLES31.glBindImageTexture(1, if (sp) spLogTex else logTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
         GLES30.glUniform1i(Gl.uniform(finishProgram, "uChromaNr"), (cleanup - 1).coerceIn(0, 2))
         GLES30.glUniform1i(Gl.uniform(finishProgram, "uUseLut"), if (lutEnabled) 1 else 0)
+        val lutIn = lutInput?.takeIf { it != p }
+        GLES30.glUniform1i(Gl.uniform(finishProgram, "uLutConvert"), if (lutIn != null) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(finishProgram, "uCurve"), p.shaderId)
+        if (lutIn != null) {
+            GLES30.glUniform1i(Gl.uniform(finishProgram, "uLutCurve"), lutIn.shaderId)
+            GLES30.glUniformMatrix3fv(Gl.uniform(finishProgram, "uLutGamut"), 1, false,
+                ColorMath.toGlColumnMajor(ColorMath.convert(p.primaries, lutIn.primaries)), 0)
+        }
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uLutSize"), lutSize.toFloat())
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uLutStrength"), lutStrength)
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uSaturation"), saturation)
@@ -485,9 +515,12 @@ class Renderer(
         val viewAspect = viewW.toFloat() / viewH
         val (vw, vh) = if (viewAspect > imgAspect) (viewH * imgAspect).toInt() to viewH else viewW to (viewW / imgAspect).toInt()
         GLES30.glViewport((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
-        val sp = recording?.superpixel ?: superpixel
+        val sp = activeSuperpixel()
         drawTexture(if (sp) spViewTex else viewTex, rotation, peakingTexel = if (peaking) (if (sp) 2f else 1f) else 0f)
     }
+
+    /** Mid-recording the mode is fixed by what the encoder was set up for; between recordings see [previewFullRes]. */
+    private fun activeSuperpixel() = recording?.superpixel ?: (superpixel || !previewFullRes)
 
     /** [peakingTexel] > 0 enables focus peaking, sampling that many full-res pixels apart. */
     private fun drawTexture(tex: Int, rotationQuarterTurns: Int, peakingTexel: Float = 0f) {
@@ -505,7 +538,7 @@ class Renderer(
      * look). [onFrame] runs on the GL thread.
      */
     fun captureLogFrame(width: Int, onFrame: (Bitmap) -> Unit) = handler.post {
-        val sp = recording?.superpixel ?: superpixel
+        val sp = activeSuperpixel()
         val height = width * h / w
         val tex = Gl.texture2D(GLES30.GL_RGBA8, width, height, linear = true)
         val fbo = IntArray(1).also { GLES30.glGenFramebuffers(1, it, 0) }[0]

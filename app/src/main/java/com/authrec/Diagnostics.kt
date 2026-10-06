@@ -63,6 +63,9 @@ object Diagnostics {
             context.getSharedPreferences(name, Context.MODE_PRIVATE).all.toSortedMap().forEach { (k, v) -> appendLine("$k = $v") }
             appendLine()
         }
+        appendLine("== Events (this and earlier launches) ==")
+        appendLine(EventLog.tail(500))
+        appendLine()
         appendLine("== App log ==")
         // An app may always read its own process's log.
         append(runCatching {

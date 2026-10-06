@@ -18,10 +18,12 @@ import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.os.Handler
+import android.os.SystemClock
 import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import com.authrec.EventLog
 import com.authrec.color.ColorCalibration
 import org.json.JSONArray
 import org.json.JSONObject
@@ -52,8 +54,11 @@ data class SensorInfo(
 )
 
 /**
- * SOFTWARE: our own contrast-detect AF drives the lens like MANUAL (for lenses whose ISP AF
- * doesn't run for third-party apps, e.g. Xiaomi's hidden telephoto).
+ * CONTINUOUS: the ISP's own continuous AF (it ignores AF regions on Xiaomi). TAP: the ISP's
+ * one-shot AF at [CaptureSettings.focusPoint], held until triggered again (the activity
+ * re-triggers it to follow a tapped spot). SOFTWARE: our own contrast-detect AF drives the lens
+ * like MANUAL (for lenses whose ISP AF doesn't run for third-party apps, e.g. Xiaomi's hidden
+ * telephoto, or ignores spots and triggers, e.g. zoom routes).
  */
 enum class AfMode { CONTINUOUS, TAP, MANUAL, SOFTWARE }
 
@@ -75,7 +80,7 @@ data class CaptureSettings(
     val exposureNs: Long = 1_000_000_000L / 60,
     val awbLock: Boolean = false,
     val af: AfMode = AfMode.CONTINUOUS,
-    /** TAP only: point in the image, 0..1 on both axes. */
+    /** Tapped spot in the image (0..1 on both axes) that AF and AE are weighted to; null = whole scene. */
     val focusPoint: PointF? = null,
     /** MANUAL only: 0 = infinity, [SensorInfo.minFocusDiopters] = closest. */
     val focusDiopters: Float = 0f,
@@ -107,17 +112,38 @@ class FrameMeta(
 /**
  * Opens the main back camera's 16-bit RAW stream with the ISP's auto exposure / white balance
  * still running, so we get its 3A decisions as metadata while doing all image processing ourselves.
+ *
+ * Everything that touches the device or session runs on [handler]'s thread, including close and
+ * release, so a lens switch can't pull the session out from under a request being built.
  */
 class RawCamera(
     private val context: Context,
     private val handler: Handler,
     /** Which lens to stream; null = first back camera with RAW. */
     private val lens: Lens?,
-    private val onError: (String) -> Unit,
+    /**
+     * Session layout, most complete first. The activity steps down when a lens fails before its
+     * first frame (some HALs reject or fall over on a combination others take):
+     * 0 = RAW + small metering stream, video template; 1 = RAW + 640 px metering stream, preview
+     * template; 2 = RAW only (no ISP brightness for the auto gain, and lenses whose 3A needs
+     * processed output report placeholder exposure; never used on zoom routes, which need it).
+     */
+    val variant: Int = 0,
+    /** Called on the camera thread when the camera fails or disconnects; the device is closed by then. */
+    private val onFailure: (String) -> Unit,
 ) {
     val info: SensorInfo
     val reader: ImageReader
-    private val metering: ImageReader
+    private val metering: ImageReader?
+
+    /** Most conservative [variant] this lens can use. */
+    val lastVariant get() = if (zoomRouted || lens?.logicalStream == true) 1 else 2
+
+    /** Capture results in the current session, and when the current open was requested (elapsedRealtime). */
+    @Volatile var resultsSeen = 0
+        private set
+    @Volatile var openRequestedMs = 0L
+        private set
 
     @Volatile var latestMeta: FrameMeta? = null
         private set
@@ -132,10 +158,14 @@ class RawCamera(
     private val characteristics: CameraCharacteristics
     private val staticBlack: FloatArray
     private val staticWhite: Float
+    // Camera thread only.
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
-    /** True from open() until close(); makes repeated open() calls harmless. */
+    /** An open is in flight or done; makes repeated open() calls harmless. */
     private var opened = false
+    /** Bumped by every open and close: callbacks from an older open are ignored. */
+    private var generation = 0
+    private var capturesFailed = 0
 
     init {
         val cm = context.getSystemService(CameraManager::class.java)
@@ -192,77 +222,116 @@ class RawCamera(
         // telephoto) the ISP only runs auto exposure / white balance while it has processed
         // output to produce, and with RAW alone it reports placeholder values.
         val aspect = size.width.toFloat() / size.height
-        val yuvSize = map.getOutputSizes(ImageFormat.YUV_420_888)
-            .filter { it.width >= 320 && abs(it.width.toFloat() / it.height - aspect) < 0.02f }
-            .minByOrNull { it.width * it.height } ?: Size(640, 480)
-        metering = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 2).apply {
-            setOnImageAvailableListener({ r ->
-                r.acquireLatestImage()?.use { ispLinearLogAverage = yLogAverage(it) }
-            }, handler)
+        val minWidth = if (variant == 0) 320 else 640
+        metering = if (variant.coerceAtMost(lastVariant) >= 2) null else {
+            val yuvSize = map.getOutputSizes(ImageFormat.YUV_420_888)
+                .filter { it.width >= minWidth && abs(it.width.toFloat() / it.height - aspect) < 0.02f }
+                .minByOrNull { it.width * it.height } ?: Size(640, 480)
+            ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 2).apply {
+                setOnImageAvailableListener({ r ->
+                    r.acquireLatestImage()?.use { ispLinearLogAverage = yLogAverage(it) }
+                }, handler)
+            }
         }
     }
 
     @SuppressLint("MissingPermission") // CameraActivity checks CAMERA before opening
     fun open(settings: CaptureSettings) {
         this.settings = settings
-        if (opened) return
+        // Set here too, so the watchdog never compares against an older open while this one queues.
+        openRequestedMs = SystemClock.elapsedRealtime()
+        handler.post { if (!opened) openNow() }
+    }
+
+    private val name get() = "lens ${lens?.key ?: info.cameraId}${lens?.zoomRatio?.takeIf { it != 1f }?.let { " @%.2fx".format(it) } ?: ""}"
+
+    private fun sinceOpenMs() = SystemClock.elapsedRealtime() - openRequestedMs
+
+    @SuppressLint("MissingPermission")
+    private fun openNow() {
+        val gen = ++generation
         opened = true
-        val cm = context.getSystemService(CameraManager::class.java)
+        resultsSeen = 0
+        capturesFailed = 0
+        openRequestedMs = SystemClock.elapsedRealtime()
+        EventLog.log("Opening $name, session layout $variant")
         try {
-            openCamera(cm)
+            context.getSystemService(CameraManager::class.java).openCamera(info.cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(d: CameraDevice) {
+                    if (gen != generation) { d.close(); return }
+                    device = d
+                    EventLog.log("Camera ${info.cameraId} opened after ${sinceOpenMs()} ms")
+                    if (debugFailOpens > 0) {
+                        debugFailOpens--
+                        fail("simulated failure before the first frame")
+                        return
+                    }
+                    createSession(d)
+                }
+
+                override fun onDisconnected(d: CameraDevice) {
+                    d.close()
+                    if (gen == generation) fail("camera disconnected (another app took it, or the camera service restarted)")
+                }
+
+                override fun onError(d: CameraDevice, error: Int) {
+                    d.close()
+                    if (gen == generation) fail("camera error ${errorName(error)}")
+                }
+            }, handler)
         } catch (e: Exception) {
-            opened = false
-            onError("Can't open camera: ${e.message}")
+            fail("can't open camera ${info.cameraId}: ${e.message}", e)
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun openCamera(cm: CameraManager) {
-        cm.openCamera(info.cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(d: CameraDevice) {
-                device = d
-                createSession(d)
-            }
+    /** Closes everything and tells the activity, which decides whether to retry. Camera thread. */
+    private fun fail(reason: String, e: Throwable? = null) {
+        EventLog.log("$name failed ${sinceOpenMs()} ms after opening ($resultsSeen results, layout $variant): $reason", e)
+        closeNow()
+        onFailure(reason)
+    }
 
-            override fun onDisconnected(d: CameraDevice) {
-                d.close()
-                device = null
-            }
-
-            override fun onError(d: CameraDevice, error: Int) {
-                d.close()
-                device = null
-                onError("Camera error $error")
-            }
-        }, handler)
+    private fun errorName(code: Int) = when (code) {
+        CameraDevice.StateCallback.ERROR_CAMERA_IN_USE -> "IN_USE"
+        CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE -> "MAX_CAMERAS_IN_USE"
+        CameraDevice.StateCallback.ERROR_CAMERA_DISABLED -> "DISABLED"
+        CameraDevice.StateCallback.ERROR_CAMERA_DEVICE -> "DEVICE"
+        CameraDevice.StateCallback.ERROR_CAMERA_SERVICE -> "SERVICE"
+        else -> "$code"
     }
 
     private fun createSession(d: CameraDevice) {
+        val gen = generation
+        // With zoom routing, the metering stream stays on the logical camera: that's where its
+        // 3A (and the active lens's native AF) runs, and HALs want a logical stream anyway.
+        val outputs = listOfNotNull(
+            output(reader.surface),
+            metering?.let { if (zoomRouted || lens?.logicalStream == true) OutputConfiguration(it.surface) else output(it.surface) },
+        )
+        val layout = "RAW ${info.size.width}x${info.size.height}${lens?.physicalId?.let { " (physical $it)" } ?: ""}" +
+            (metering?.let { " + YUV ${it.width}x${it.height}" } ?: " only")
         // Some lens routes are rejected by the HAL with an exception rather than onConfigureFailed.
         try {
-            createSessionUnchecked(d)
+            d.createCaptureSession(SessionConfiguration(
+                SessionConfiguration.SESSION_REGULAR,
+                outputs,
+                { handler.post(it) },
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(s: CameraCaptureSession) {
+                        if (gen != generation) { s.close(); return }
+                        session = s
+                        EventLog.log("Session configured after ${sinceOpenMs()} ms: $layout")
+                        applySettings(triggerAf = false)
+                    }
+
+                    override fun onConfigureFailed(s: CameraCaptureSession) {
+                        if (gen == generation) fail("session rejected: $layout")
+                    }
+                },
+            ))
         } catch (e: Exception) {
-            Log.e(TAG, "session setup failed for lens ${lens?.key}", e)
-            onError("This lens route can't be configured: ${e.message}")
+            fail("session setup failed ($layout): ${e.message}", e)
         }
-    }
-
-    private fun createSessionUnchecked(d: CameraDevice) {
-        d.createCaptureSession(SessionConfiguration(
-            SessionConfiguration.SESSION_REGULAR,
-            // With zoom routing, the metering stream stays on the logical camera: that's where its
-            // 3A (and the active lens's native AF) runs, and HALs want a logical stream anyway.
-            listOf(output(reader.surface), if (zoomRouted || lens?.logicalStream == true) OutputConfiguration(metering.surface) else output(metering.surface)),
-            { handler.post(it) },
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(s: CameraCaptureSession) {
-                    session = s
-                    update(settings)
-                }
-
-                override fun onConfigureFailed(s: CameraCaptureSession) = onError("RAW session rejected")
-            },
-        ))
     }
 
     /** Applies [settings] to the running stream (or remembers them until the session is up). */
@@ -271,7 +340,7 @@ class RawCamera(
         handler.post { applySettings(triggerAf = false) }
     }
 
-    /** Focuses (and, in auto exposure, meters) at [point] (0..1 image coordinates), then holds focus. */
+    /** Focuses once at [CaptureSettings.focusPoint] (TAP) and holds; call again to refocus there. */
     fun tapToFocus(settings: CaptureSettings) {
         this.settings = settings
         handler.post { applySettings(triggerAf = true) }
@@ -281,12 +350,17 @@ class RawCamera(
         val d = device ?: return
         val s = session ?: return
         val st = settings
-        val builder = buildRequest(d, listOf(reader.surface, metering.surface))
-        s.setRepeatingRequest(builder.build(), captureCallback, handler)
-        if (triggerAf && st.af == AfMode.TAP && info.minFocusDiopters > 0f && !zoomRouted) {
-            // One-shot scan; AF_MODE_AUTO then holds focus until the next tap.
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-            s.capture(builder.build(), captureCallback, handler)
+        try {
+            val builder = buildRequest(d, listOfNotNull(reader.surface, metering?.surface))
+            s.setRepeatingRequest(builder.build(), captureCallback, handler)
+            if (triggerAf && st.af == AfMode.TAP && info.minFocusDiopters > 0f && !zoomRouted) {
+                // One-shot scan; AF_MODE_AUTO then holds focus until the next trigger.
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                s.capture(builder.build(), captureCallback, handler)
+            }
+        } catch (e: Exception) {
+            // A session that just closed or errored; its own callback reports the failure.
+            Log.w(TAG, "$name: request not applied: ${e.message}")
         }
     }
 
@@ -315,7 +389,7 @@ class RawCamera(
         val st = settings
         val frameNs = 1_000_000_000L / st.fps
         val region = st.focusPoint?.let { meteringRegion(it) }
-        return d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+        return d.createCaptureRequest(if (variant == 0) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW).apply {
             targets.forEach { addTarget(it) }
             set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             set(CaptureRequest.CONTROL_AWB_LOCK, st.awbLock)
@@ -339,9 +413,10 @@ class RawCamera(
             when {
                 // Fixed-focus lenses (ultrawide, front) only accept AF off.
                 info.minFocusDiopters <= 0f -> set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                st.af == AfMode.CONTINUOUS -> set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                st.af == AfMode.TAP -> {
-                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                // Continuous AF follows the tapped spot, if any; AUTO focuses there once and holds (a lock).
+                st.af == AfMode.CONTINUOUS || st.af == AfMode.TAP -> {
+                    set(CaptureRequest.CONTROL_AF_MODE,
+                        if (st.af == AfMode.TAP) CaptureRequest.CONTROL_AF_MODE_AUTO else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                     if (region != null && info.maxAfRegions > 0) set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
                 }
                 else -> {
@@ -349,8 +424,8 @@ class RawCamera(
                     set(CaptureRequest.LENS_FOCUS_DISTANCE, st.focusDiopters.coerceIn(0f, info.minFocusDiopters))
                 }
             }
-            // Tap also meters exposure there, unless exposure is manual.
-            if (st.af == AfMode.TAP && st.ae in listOf(AeMode.AUTO, AeMode.LOCKED) && region != null && info.maxAeRegions > 0) {
+            // A tapped spot also weights auto exposure, unless exposure is ours (manual / priority).
+            if (st.ae in listOf(AeMode.AUTO, AeMode.LOCKED) && region != null && info.maxAeRegions > 0) {
                 set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
             }
         }
@@ -503,18 +578,26 @@ class RawCamera(
         }
     }
 
-    fun close() {
-        opened = false
-        session?.close()
-        session = null
-        device?.close()
-        device = null
+    /** Debug: behaves as if the HAL had reported a device error. */
+    fun simulateFailure() = handler.post { if (opened) fail("simulated failure") }
+
+    /** Closes the device (asynchronously, on the camera thread); [open] can follow at once. */
+    fun close() = handler.post { closeNow() }
+
+    /** Closes the device and the readers; the camera object can't be used after this. */
+    fun release() = handler.post {
+        closeNow()
+        reader.close()
+        metering?.close()
     }
 
-    fun release() {
-        close()
-        reader.close()
-        metering.close()
+    private fun closeNow() {
+        generation++
+        opened = false
+        runCatching { session?.close() }
+        session = null
+        runCatching { device?.close() }
+        device = null
     }
 
     private var afLogged = 0L
@@ -522,8 +605,20 @@ class RawCamera(
     @Volatile var afVerbose = false
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+            // Single failed frames happen; only a run of them is worth a line in the event log.
+            capturesFailed++
+            if (capturesFailed == 1 || capturesFailed == 10 || capturesFailed == 100) {
+                EventLog.log("$name: capture failed (reason ${failure.reason}, $capturesFailed so far, $resultsSeen ok)")
+            }
+        }
+
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-            val now = android.os.SystemClock.elapsedRealtime()
+            if (++resultsSeen == 1) {
+                EventLog.log("$name: first frame ${sinceOpenMs()} ms after opening" +
+                    (result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.let { ", active lens $it" } ?: ""))
+            }
+            val now = SystemClock.elapsedRealtime()
             if (now - afLogged > (if (afVerbose) 0 else 2000)) {
                 afLogged = now
                 Log.d(TAG, "AF lens=${lens?.key ?: info.cameraId} mode=${result.get(CaptureResult.CONTROL_AF_MODE)} " +
@@ -592,6 +687,8 @@ class RawCamera(
 
     companion object {
         private const val TAG = "AuthRec"
+        /** Debug: this many upcoming opens fail right after opening (exercises the retry ladder). */
+        @Volatile var debugFailOpens = 0
         const val OPEN_GATE_W = 4096
         const val OPEN_GATE_H = 3072
         private val IDENTITY = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)

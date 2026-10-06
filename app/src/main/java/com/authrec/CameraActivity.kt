@@ -8,12 +8,15 @@ import android.graphics.Color
 import android.graphics.PointF
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.util.Log
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -110,7 +113,22 @@ class CameraActivity : Activity() {
     private var lensIndex = 0
     private var scanning = false
     private var pendingScan = false
-    private var resumed = false
+    /** Read by the lens scan's thread to stop when we leave the foreground. */
+    @Volatile private var resumed = false
+
+    /** Failures of the current lens since it last streamed properly; drives retries and fallbacks. */
+    private var cameraFailures = 0
+    /** [RawCamera.variant] for the current lens; steps down when a layout fails before any frame. */
+    private var sessionVariant = 0
+    private var retryPending = false
+    private var retryWaitStartMs = 0L
+
+    /** Cameras the camera service reports busy or gone (e.g. while it restarts after a HAL crash). */
+    private val unavailableCameras = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val availabilityCallback = object : android.hardware.camera2.CameraManager.AvailabilityCallback() {
+        override fun onCameraAvailable(id: String) { unavailableCameras -= id }
+        override fun onCameraUnavailable(id: String) { unavailableCameras += id }
+    }
 
     private var recorder: Recorder? = null
     private var recordStartMs = 0L
@@ -146,12 +164,13 @@ class CameraActivity : Activity() {
     private lateinit var strengthBar: SeekBar
     private lateinit var saturationBar: SeekBar
     private lateinit var vibranceBar: SeekBar
-    private lateinit var gainBar: LinearLayout
-    private lateinit var exposureSeek: SeekBar
-    private lateinit var exposureLabel: TextView
+    private lateinit var exposureSlider: ExposureSlider
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        EventLog.init(this)
+        EventLog.log("App ${packageManager.getPackageInfo(packageName, 0).versionName} started on ${android.os.Build.MODEL}")
+        getSystemService(android.hardware.camera2.CameraManager::class.java).registerAvailabilityCallback(availabilityCallback, Handler(mainLooper))
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         loadPrefs()
         installBundledLuts()
@@ -255,10 +274,15 @@ class CameraActivity : Activity() {
                 renderer?.detachSurface()
             }
         })
-        surfaceView.setOnTouchListener { _, e ->
-            if (e.actionMasked == MotionEvent.ACTION_UP) onPreviewTap(e.x, e.y)
-            true
-        }
+        // Tap: focus and meter there, and keep tracking it. Long-press: lock focus there.
+        // Double-tap: back to automatic focus on the whole scene.
+        val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent) = true
+            override fun onSingleTapUp(e: MotionEvent): Boolean { onPreviewTap(e.x, e.y, lock = false); return true }
+            override fun onLongPress(e: MotionEvent) = onPreviewTap(e.x, e.y, lock = true)
+            override fun onDoubleTap(e: MotionEvent): Boolean { resetFocusToAuto(); return true }
+        })
+        surfaceView.setOnTouchListener { _, e -> gestures.onTouchEvent(e); true }
 
         info = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -266,7 +290,7 @@ class CameraActivity : Activity() {
             textSize = 12f
         }
         focusSquare = View(this).apply {
-            background = GradientDrawable().apply { setStroke(4, Color.YELLOW) }
+            background = GradientDrawable().apply { setStroke(4, Color.WHITE) }
             visibility = View.GONE
         }
 
@@ -278,7 +302,6 @@ class CameraActivity : Activity() {
         val importButton = smallButton("+ LUT") { pickLut() }
         val lookButton = smallButton("Adjust") {
             lookPanel.visibility = if (lookPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-            lookPanel.post { updateUi() } // exposure bar sits above the panel, needs its height
         }
         fpsButton = smallButton("") { setCapture(capture.copy(fps = when (capture.fps) { 24 -> 25; 25 -> 30; else -> 24 })) }
         codecButton = smallButton("") { codec = VideoCodec.entries[(codec.ordinal + 1) % VideoCodec.entries.size]; settingsChanged() }
@@ -307,7 +330,7 @@ class CameraActivity : Activity() {
         lookPanel = buildLookPanel()
         priorityPanel = buildPriorityPanel()
         focusBar = buildFocusBar()
-        gainBar = buildExposureBar()
+        exposureSlider = ExposureSlider(this) { ev -> setExposureEv(ev, fromSlider = true) }
 
         fun column(vararg views: View) = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -325,6 +348,11 @@ class CameraActivity : Activity() {
         }
         val left = column(profileButton, viewButton, importButton, lookButton)
         val right = column(recButton, codecButton, bitrateButton, resButton, audioButton, bakeButton, cleanButton)
+        right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            val lp = exposureSlider.layoutParams as FrameLayout.LayoutParams
+            val margin = v.width + 48 + 12
+            if (lp.rightMargin != margin) { lp.rightMargin = margin; exposureSlider.requestLayout() }
+        }
 
         proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, exposureBar)
         lockedWhileRecording = listOf(profileButton, fpsButton, codecButton, bitrateButton, resButton, audioButton, bakeButton, importButton, modeSwitch, lensButton)
@@ -358,9 +386,9 @@ class CameraActivity : Activity() {
             addView(lookPanel, FrameLayout.LayoutParams(900, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
                 setMargins(0, 0, 0, 170)
             })
-            addView(gainBar, FrameLayout.LayoutParams(900, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                setMargins(0, 0, 0, 32)
-            })
+            // Beside the right-hand buttons, in the black margin next to the 4:3 image.
+            addView(exposureSlider, FrameLayout.LayoutParams(170, (resources.displayMetrics.heightPixels * 0.62f).toInt(),
+                Gravity.CENTER_VERTICAL or Gravity.END))
             addView(priorityPanel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
                 setMargins(0, 0, 0, 170)
             })
@@ -453,45 +481,16 @@ class CameraActivity : Activity() {
         }
     }
 
-    /**
-     * Exposure slider, ±5 EV in 1/10 stops: same value as the bottom −/+ (see [exposureEv]).
-     * Beyond the camera's AE compensation range the rest is applied as gain before the log curve.
-     * Shown on its own in Simple mode; in Pro it sits above the Look panel.
-     */
-    private fun buildExposureBar(): LinearLayout {
-        exposureLabel = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            minWidth = 230
-        }
-        exposureSeek = SeekBar(this).apply {
-            max = 100
-            progress = ((exposureEv + 5) * 10).toInt()
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
-                    if (fromUser) setExposureEv(p / 10f - 5)
-                }
-                override fun onStartTrackingTouch(sb: SeekBar) = Unit
-                override fun onStopTrackingTouch(sb: SeekBar) = savePrefs()
-            })
-        }
-        val reset = smallButton("↺") { setExposureEv(0f) }
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(0x80000000.toInt())
-            setPadding(32, 4, 16, 4)
-            addView(exposureLabel)
-            addView(exposureSeek, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            addView(reset)
-        }
-    }
-
-    private fun setExposureEv(ev: Float) {
+    private fun setExposureEv(ev: Float, fromSlider: Boolean = false) {
         exposureEv = (Math.round(ev * 10) / 10f).coerceIn(-5f, 5f)
         applyExposure()
         updateUi()
+        // While dragging, save once the finger has settled.
+        info.removeCallbacks(saveSoon)
+        if (fromSlider) info.postDelayed(saveSoon, 1000) else savePrefs()
     }
+
+    private val saveSoon = Runnable { savePrefs() }
 
     /** Routes [exposureEv] to sensor exposure or digital gain depending on the AE mode. */
     private fun applyExposure() {
@@ -530,8 +529,8 @@ class CameraActivity : Activity() {
         lockedWhileRecording.forEach { it.isEnabled = !recording && !stopping }
         proOnly.forEach { it.visibility = if (simple) View.GONE else View.VISIBLE }
         modeSwitch.text = if (simple) "Pro ▸" else "Simple ▸"
-        lensButton.text = lenses.getOrNull(lensIndex)?.label ?: "Lens"
-        lensButton.visibility = if (lenses.size > 1) View.VISIBLE else View.GONE
+        // Always shown, even with one lens: its menu is also where Rescan and Send diagnostics live.
+        lensButton.text = lenses.getOrNull(lensIndex)?.label?.takeIf { it.isNotEmpty() } ?: "Lens"
 
         profileButton.text = profile.label
         viewButton.text = if (simple) "Look: ${views.getOrNull(viewIndex)?.label}" else "View: ${views.getOrNull(viewIndex)?.label}"
@@ -556,9 +555,9 @@ class CameraActivity : Activity() {
         }
         afButton.text = when (capture.af) {
             AfMode.CONTINUOUS -> "AF: Auto"
-            AfMode.TAP -> "AF: Tap"
+            AfMode.TAP -> if (tapTracking) "AF: Auto" else "AF: Locked"
             AfMode.MANUAL -> "MF"
-            AfMode.SOFTWARE -> if (softContinuous) "AF: Auto" else "AF: Tap"
+            AfMode.SOFTWARE -> if (softContinuous) "AF: Auto" else "AF: Locked"
         }
         wbButton.text = if (capture.awbLock) "WB: Locked" else "WB: Auto"
         val manual = capture.ae == AeMode.MANUAL
@@ -580,17 +579,16 @@ class CameraActivity : Activity() {
             updateFocusLabel()
         }
         renderer?.peaking = mf
-        exposureLabel.text = "Exposure %+.1f".format(exposureEv)
-        exposureSeek.progress = ((exposureEv + 5) * 10).toInt()
-        // Simple: the exposure slider is the one control. Pro: inside the Look panel.
-        gainBar.visibility = if (simple || lookPanel.visibility == View.VISIBLE) View.VISIBLE else View.GONE
-        (gainBar.layoutParams as FrameLayout.LayoutParams).bottomMargin = when {
-            lookPanel.visibility == View.VISIBLE -> 170 + lookPanel.height + 8
-            else -> 32
+        if (mf) focusSquare.visibility = View.GONE
+        exposureSlider.setValue(exposureEv)
+        exposureSlider.sensorRange = when (capture.ae) {
+            // Beyond the AE compensation range the rest is digital gain.
+            AeMode.AUTO, AeMode.LOCKED -> camera?.info?.let { it.evRange.lower * it.evStep..it.evRange.upper * it.evStep } ?: -5f..5f
+            AeMode.PRIORITY -> -5f..5f
+            AeMode.MANUAL -> 0f..0f // all digital gain: ISO and shutter are set by hand
         }
         (lookPanel.layoutParams as FrameLayout.LayoutParams).bottomMargin = if (simple) 120 else 170
         lookPanel.requestLayout()
-        gainBar.requestLayout()
         priorityPanel.visibility = if (!simple && capture.ae == AeMode.PRIORITY && priorityPanelOpen) View.VISIBLE else View.GONE
         prioGear.visibility = if (capture.ae == AeMode.PRIORITY) View.VISIBLE else View.GONE
         updatePriorityPanel()
@@ -610,7 +608,7 @@ class CameraActivity : Activity() {
 
     // ---- Focus ----
 
-    private fun onPreviewTap(x: Float, y: Float) {
+    private fun onPreviewTap(x: Float, y: Float, lock: Boolean) {
         // A tap on the image first dismisses any open panel.
         if (priorityPanelOpen || lookPanel.visibility == View.VISIBLE) {
             priorityPanelOpen = false
@@ -632,22 +630,43 @@ class CameraActivity : Activity() {
         if (u !in 0f..1f || v !in 0f..1f) return
         repeat(displayQuarterTurns) { val t = u; u = v; v = 1 - t }
 
-        focusAt(u, v)
+        focusAt(u, v, lock)
+        // Stays while focus follows (white, dimmed after a moment) or is locked (yellow) at that spot.
         focusSquare.apply {
             translationX = x - 70
             translationY = y - 70
+            (background as GradientDrawable).setStroke(if (lock) 6 else 4, if (lock) Color.YELLOW else Color.WHITE)
+            animate().cancel()
+            alpha = 1f
             visibility = View.VISIBLE
-            removeCallbacks(hideFocusSquare)
-            postDelayed(hideFocusSquare, 1500)
+            animate().alpha(if (lock) 1f else 0.45f).setStartDelay(1200).setDuration(400).start()
         }
+        if (lock) performHapticFeedbackCompat()
         updateUi()
     }
 
-    private val hideFocusSquare = Runnable { focusSquare.visibility = View.GONE }
+    private fun performHapticFeedbackCompat() =
+        window.decorView.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+
+    /** Double-tap: focus (and metering) back to the whole scene, automatic. */
+    private fun resetFocusToAuto() {
+        focusSquare.visibility = View.GONE
+        if (capture.af == AfMode.MANUAL && !simple) return
+        stopSpotWatch()
+        softAf?.cancel()
+        if (hasAf() && usesSoftwareAf()) {
+            runSoftwareAf(0.5f, 0.5f, continuous = true, meter = false)
+        } else {
+            setCapture(capture.copy(af = AfMode.CONTINUOUS, focusPoint = null))
+        }
+    }
 
     private var softAf: SoftwareAf? = null
-    /** On a contrast-AF lens: true = "AF: Auto" (centre, keeps refocusing), false = "AF: Tap" (holds the tapped spot). */
+    /** On a contrast-AF lens: true = "AF: Auto" (keeps refocusing), false = "AF: Locked" (holds the tapped spot). */
     private var softContinuous = true
+    /** TAP on an ISP-AF lens: true = following the spot (shown as "AF: Auto"), false = locked there. */
+    private var tapTracking = false
+    private var spotWatch: Runnable? = null
 
     private fun softAfKey() = "softAf:${lenses.getOrNull(lensIndex)?.key}"
 
@@ -657,38 +676,116 @@ class CameraActivity : Activity() {
     private fun hasAf() = (camera?.info?.minFocusDiopters ?: 0f) > 0f
 
     /**
-     * Focus (and meter) at image point (u, v). Uses the ISP's AF; if the lens ignores the AF
-     * trigger (its AF state stays inactive), switches that lens to our contrast AF for good.
-     * On zoom-routed lenses taps always use contrast AF (see below).
+     * Focus and meter at image point (u, v). [lock] = false: continuous AF keeps following that
+     * spot (the mode stays "AF: Auto"); true: focus once there and hold ("AF: Locked").
+     * Uses the ISP's AF; a lens whose ISP ignores the AF trigger (its state stays inactive) is
+     * switched to our contrast AF for good. Zoom-routed lenses always use contrast AF for a spot:
+     * their native AF ignores regions and triggers.
      */
-    private fun focusAt(u: Float, v: Float) {
+    private fun focusAt(u: Float, v: Float, lock: Boolean = false) {
         val cam = camera ?: return
-        // Zoom routes: the phone's native AF only does continuous focus (taps and regions are
-        // ignored there), so a tap uses our contrast AF on the spot; "AF: Auto" stays native.
         if (hasAf() && (usesSoftwareAf() || cam.zoomRouted)) {
-            runSoftwareAf(u, v, continuous = false)
+            runSoftwareAf(u, v, continuous = !lock)
             return
         }
         softAf?.cancel()
+        if (!hasAf()) {
+            // Fixed focus: the spot only steers auto exposure.
+            capture = capture.copy(focusPoint = PointF(u, v))
+            cam.update(capture)
+            updateUi()
+            return
+        }
+        // The ISP's continuous AF ignores spots (Xiaomi 14: regions and cancel triggers change
+        // nothing), so its fast one-shot AF focuses there; to follow the spot, it's triggered
+        // again whenever the spot goes soft.
+        tapTracking = !lock
         capture = capture.copy(af = AfMode.TAP, focusPoint = PointF(u, v))
         cam.tapToFocus(capture)
         updateUi()
-        // Zoom routes focus natively via continuous AF + region (no trigger to check).
-        if (hasAf() && !cam.zoomRouted) info.postDelayed({
+        info.postDelayed({
             if (capture.af == AfMode.TAP && camera === cam && cam.latestMeta?.afState == 0) {
-                Log.i(TAG, "Lens ${lenses.getOrNull(lensIndex)?.key} ignores AF triggers; using contrast AF")
+                EventLog.log("Lens ${lenses.getOrNull(lensIndex)?.key} ignores AF triggers; using contrast AF")
                 prefs.edit().putBoolean(softAfKey(), true).apply()
-                runSoftwareAf(u, v, continuous = false)
+                runSoftwareAf(u, v, continuous = !lock)
             }
         }, 900)
+        if (!lock) watchSpot(cam, u, v)
     }
 
-    private fun runSoftwareAf(u: Float, v: Float, continuous: Boolean) {
+    /**
+     * Keeps a tapped spot sharp with the ISP's one-shot AF: once focus has locked, the spot's
+     * sharpness becomes the baseline; if it stays well below that for half a second (the subject
+     * moved, or the framing changed), AF is triggered again at the same spot.
+     */
+    private fun watchSpot(cam: RawCamera, u: Float, v: Float) {
+        stopSpotWatch()
+        val r = renderer ?: return
+        val half = 0.07f
+        r.sharpnessRegion = floatArrayOf(u - half, v - half, u + half, v + half)
+        var triggeredAt = SystemClock.elapsedRealtime()
+        var waitingForLock = true
+        var baseline = 0f
+        var samples = 0
+        var low = 0
+        var ignoreUntil = 0L
+        var lastFrame = r.frameCounter
+        val tick = object : Runnable {
+            override fun run() {
+                if (spotWatch !== this) return
+                if (camera !== cam || renderer !== r || capture.af != AfMode.TAP || !tapTracking) {
+                    stopSpotWatch()
+                    return
+                }
+                val now = SystemClock.elapsedRealtime()
+                val state = cam.latestMeta?.afState ?: 0
+                if (waitingForLock) {
+                    // 4/5 = (not) focused, locked. Measure only frames taken after the lens settled.
+                    if (state == 4 || state == 5 || now - triggeredAt > 3000) {
+                        waitingForLock = false
+                        baseline = 0f
+                        samples = 0
+                        low = 0
+                        ignoreUntil = r.frameCounter + 3
+                    }
+                } else if (r.frameCounter != lastFrame && r.frameCounter > ignoreUntil) {
+                    lastFrame = r.frameCounter
+                    val s = r.sharpness
+                    when {
+                        samples < 5 -> { baseline += s / 5; samples++ }
+                        s < baseline * 0.6f -> if (++low >= 15) {
+                            Log.d(TAG, "spot went soft (%.5f vs %.5f); refocusing".format(s, baseline))
+                            cam.tapToFocus(capture)
+                            triggeredAt = now
+                            waitingForLock = true
+                        }
+                        else -> {
+                            low = 0
+                            baseline = baseline * 0.98f + s * 0.02f
+                        }
+                    }
+                }
+                info.postDelayed(this, 30)
+            }
+        }
+        spotWatch = tick
+        info.postDelayed(tick, 100)
+    }
+
+    private fun stopSpotWatch() {
+        spotWatch?.let { info.removeCallbacks(it) }
+        if (spotWatch != null && softAf?.isSearching != true) renderer?.sharpnessRegion = null
+        spotWatch = null
+    }
+
+    /** [meter]: also weight auto exposure to the spot (not for the default centre AF). */
+    private fun runSoftwareAf(u: Float, v: Float, continuous: Boolean, meter: Boolean = true) {
         val cam = camera ?: return
         val r = renderer ?: return
+        stopSpotWatch()
         softAf?.cancel()
         softContinuous = continuous
-        capture = capture.copy(af = AfMode.SOFTWARE, focusPoint = PointF(u, v))
+        capture = capture.copy(af = AfMode.SOFTWARE, focusPoint = if (meter) PointF(u, v) else null)
         // Centre AF looks at a bigger area so it isn't fooled by one small detail.
         val half = if (continuous) 0.12f else 0.07f
         softAf = SoftwareAf(
@@ -704,9 +801,11 @@ class CameraActivity : Activity() {
     private fun cycleAf() {
         val soft = usesSoftwareAf()
         Log.d(TAG, "cycleAf from ${capture.af} soft=$soft continuous=$softContinuous")
+        focusSquare.visibility = View.GONE
+        stopSpotWatch()
         if (capture.af == AfMode.MANUAL) {
             if (soft) {
-                runSoftwareAf(0.5f, 0.5f, continuous = true)
+                runSoftwareAf(0.5f, 0.5f, continuous = true, meter = false)
             } else {
                 setCapture(capture.copy(af = AfMode.CONTINUOUS, focusPoint = null))
             }
@@ -720,14 +819,16 @@ class CameraActivity : Activity() {
 
     /** After switching lenses: focus modes and tap points don't carry over between lenses. */
     private fun resetFocusForLens() {
+        stopSpotWatch()
         softAf?.cancel()
         softAf = null
+        focusSquare.visibility = View.GONE
         capture = capture.copy(af = AfMode.CONTINUOUS, focusPoint = null)
         if (hasAf() && usesSoftwareAf()) {
             softContinuous = true
             capture = capture.copy(af = AfMode.SOFTWARE)
             // Give the stream a moment to start before the first sweep.
-            info.postDelayed({ if (capture.af == AfMode.SOFTWARE && softContinuous) runSoftwareAf(0.5f, 0.5f, continuous = true) }, 1200)
+            info.postDelayed({ if (capture.af == AfMode.SOFTWARE && softContinuous) runSoftwareAf(0.5f, 0.5f, continuous = true, meter = false) }, 1200)
         }
     }
 
@@ -976,14 +1077,23 @@ class CameraActivity : Activity() {
         pendingScan = false
         scanning = true
         info.text = "Finding lenses…"
+        updateUi()
         Thread {
-            val found = runCatching { probe.scan { msg -> runOnUiThread { info.text = msg } } }
-                .onFailure { Log.e(TAG, "lens scan failed", it) }
+            val found = runCatching { probe.scan({ msg -> runOnUiThread { info.text = msg } }, keepGoing = { resumed }) }
+                .onFailure { EventLog.log("Lens scan failed", it) }
                 .getOrDefault(emptyList())
             runOnUiThread {
                 scanning = false
+                if (found == null) {
+                    // We went to the background mid-scan; onResume starts it again.
+                    pendingScan = true
+                    if (resumed) findLensesThenStart(forceScan = true)
+                    return@runOnUiThread
+                }
                 lenses = found
                 selectSavedLens()
+                cameraFailures = 0
+                sessionVariant = 0
                 lastResult = "Found ${found.size} lens${if (found.size == 1) "" else "es"}: " + found.joinToString { it.label }
                 setupPipeline()
                 if (resumed) camera?.open(capture)
@@ -994,11 +1104,14 @@ class CameraActivity : Activity() {
 
     private fun selectSavedLens() {
         val key = prefs.getString("lens", null)
-        lensIndex = lenses.indexOfFirst { it.key == key }.takeIf { it >= 0 }
-            ?: lenses.indexOfFirst { it.label == "1x" }.takeIf { it >= 0 } ?: 0
+        lensIndex = lenses.indexOfFirst { it.key == key }.takeIf { it >= 0 } ?: mainLensIndex() ?: 0
         // Prefer the native-AF route over its backup.
-        twinOf(lenses[lensIndex])?.takeIf { lenses[lensIndex].zoomRatio == 1f }?.let { lensIndex = lenses.indexOf(it) }
+        lenses.getOrNull(lensIndex)?.let { l -> twinOf(l)?.takeIf { l.zoomRatio == 1f }?.let { lensIndex = lenses.indexOf(it) } }
     }
+
+    /** The 1x lens (or failing that the first back lens): where we retreat when a lens keeps failing. */
+    private fun mainLensIndex(): Int? = lenses.indexOfFirst { it.label == "1x" }.takeIf { it >= 0 }
+        ?: lenses.indexOfFirst { !it.front }.takeIf { it >= 0 }
 
     /** Zoom routes whose native AF failed this session (we're on their backup). */
     private val nativeFailed = mutableSetOf<String>()
@@ -1022,12 +1135,11 @@ class CameraActivity : Activity() {
         val current = lenses.getOrNull(lensIndex) ?: return false
         if (current.zoomRatio == 1f) return false
         val backup = twinOf(current) ?: return false
-        Log.w(TAG, "Native AF route ${current.key} failed ($reason); using backup ${backup.key}")
+        EventLog.log("Native AF route ${current.key} failed ($reason); using backup ${backup.key}")
         nativeFailed += current.key
         if (recorder != null) stopRecording()
-        lensIndex = lenses.indexOf(backup)
         lastResult = "${current.label}: native AF route stopped ($reason); switched to backup AF"
-        restartPipeline()
+        switchLens(lenses.indexOf(backup), remember = false)
         return true
     }
 
@@ -1035,15 +1147,16 @@ class CameraActivity : Activity() {
     private fun showLensMenu() {
         if (recorder != null || stopping) return
         val menu = android.widget.PopupMenu(this, lensButton)
-        val order = lenses.indices.sortedWith(compareBy({ lenses[it].front }, { lenses[it].equivFocalMm }))
+        // Lenses can't be switched mid-scan, but a report can always be sent.
+        val order = if (scanning) emptyList() else lenses.indices.sortedWith(compareBy({ lenses[it].front }, { lenses[it].equivFocalMm }))
         order.filter { inMenu(it) }.forEachIndexed { pos, i ->
             val l = lenses[i]
             val mark = if (i == lensIndex) "● " else ""
             menu.menu.add(0, i, pos, "$mark${l.label}  ·  ${"%.0f".format(l.equivFocalMm)} mm")
         }
-        menu.menu.add(1, RESCAN_ITEM, order.size, "Rescan lenses")
+        if (!scanning) menu.menu.add(1, RESCAN_ITEM, order.size, "Rescan lenses")
         menu.menu.add(1, DIAGNOSTICS_ITEM, order.size + 1, "Send diagnostics…")
-        menu.menu.add(1, BENCH_ITEM, order.size + 2, "Run capability bench")
+        if (!scanning) menu.menu.add(1, BENCH_ITEM, order.size + 2, "Run capability bench")
         menu.setOnMenuItemClickListener { item ->
             when {
                 item.itemId == RESCAN_ITEM -> rescanLenses()
@@ -1054,9 +1167,7 @@ class CameraActivity : Activity() {
                 item.itemId == BENCH_ITEM -> startActivity(Intent(this, com.authrec.bench.BenchActivity::class.java))
                 item.itemId != lensIndex -> {
                     nativeFailed -= lenses[item.itemId].key
-                    lensIndex = item.itemId
-                    prefs.edit().putString("lens", lenses[lensIndex].key).apply()
-                    restartPipeline()
+                    switchLens(item.itemId)
                 }
             }
             true
@@ -1077,25 +1188,79 @@ class CameraActivity : Activity() {
             }
             menu.menu.add(group, i, i, (if (i == viewIndex) "● " else "") + v.label)
         }
+        // An imported LUT is built for one log format; ours gets converted to it before the lookup.
+        val cube = views.getOrNull(viewIndex) as? ViewEntry.CubeFile
+        if (cube != null && !simple) {
+            val current = lutInputOf(cube.file)
+            val sub = menu.menu.addSubMenu(4, LUT_INPUT_MENU, views.size, "LUT expects: ${current?.label ?: "our log as is"} ▸")
+            sub.add(5, LUT_INPUT_BASE, 0, (if (current == null) "● " else "") + "Our log as is (no conversion)")
+            LogProfile.entries.forEach { p -> sub.add(5, LUT_INPUT_BASE + 1 + p.ordinal, p.ordinal + 1, (if (current == p) "● " else "") + p.label) }
+        }
         menu.setOnMenuItemClickListener { item ->
-            viewIndex = item.itemId
-            applyView()
-            settingsChanged()
+            when {
+                item.itemId == LUT_INPUT_MENU -> return@setOnMenuItemClickListener false // opens the submenu
+                item.itemId >= LUT_INPUT_BASE -> {
+                    val p = LogProfile.entries.getOrNull(item.itemId - LUT_INPUT_BASE - 1)
+                    prefs.edit().putString("lutInput:${cube?.file?.name}", p?.name ?: "NONE").apply()
+                    applyView()
+                    updateUi()
+                }
+                else -> {
+                    viewIndex = item.itemId
+                    applyView()
+                    settingsChanged()
+                }
+            }
             true
         }
         menu.show()
     }
 
+    /**
+     * The log format an imported LUT expects: what the user picked, else a guess from its file
+     * name (most are named after their input, e.g. "…SLog3…"), else null (apply to our log as is).
+     */
+    private fun lutInputOf(file: File): LogProfile? {
+        prefs.getString("lutInput:${file.name}", null)?.let { return runCatching { LogProfile.valueOf(it) }.getOrNull() }
+        val name = file.name.lowercase().replace(Regex("[^a-z0-9]"), "")
+        return when {
+            "slog3" in name || "sgamut3" in name || "slog" in name -> LogProfile.SLOG3
+            "logc" in name || "alexa" in name || "arri" in name || "awg" in name -> LogProfile.LOGC3
+            "applelog" in name -> LogProfile.APPLE_LOG
+            name.startsWith("tealmaxx") -> LogProfile.SLOG3 // bundled; built for S-Log3 input
+            else -> null
+        }
+    }
+
     private fun rescanLenses() {
         if (recorder != null || scanning) return
+        EventLog.log("Rescan requested")
         teardownPipeline()
         findLensesThenStart(forceScan = true)
     }
 
+    /** Switches to lens [index] with a fresh start (failure count, session layout). */
+    private fun switchLens(index: Int, remember: Boolean = true) {
+        val l = lenses.getOrNull(index) ?: return
+        EventLog.log("Switching to ${l.label} (${l.key})")
+        lensIndex = index
+        if (remember) prefs.edit().putString("lens", l.key).apply()
+        cameraFailures = 0
+        sessionVariant = 0
+        restartPipeline()
+    }
+
+    /**
+     * Frames stop going to the renderer first, then the renderer finishes its frame and lets go of
+     * GL, and only then are the camera and its readers closed (on the camera thread, behind any
+     * request still being built there). The next camera's open queues up behind that close.
+     */
     private fun teardownPipeline() {
-        camera?.close()
-        camera?.release()
+        info.removeCallbacks(retryCamera)
+        retryPending = false
+        camera?.reader?.setOnImageAvailableListener(null, null)
         renderer?.release()
+        camera?.release()
         camera = null
         renderer = null
     }
@@ -1108,13 +1273,76 @@ class CameraActivity : Activity() {
         updateUi()
     }
 
+    private val retryCamera: Runnable = object : Runnable {
+        override fun run() {
+            // While the camera service has the camera down (restarting HAL, device still closing),
+            // an attempt would only fail again and count against the lens: wait for it, up to 10 s.
+            val id = lenses.getOrNull(lensIndex)?.openId
+            if (id != null && id in unavailableCameras && SystemClock.elapsedRealtime() - retryWaitStartMs < 10_000) {
+                info.postDelayed(this, 300)
+                return
+            }
+            retryPending = false
+            if (resumed && !scanning) restartPipeline()
+        }
+    }
+
+    /**
+     * The camera failed or stopped delivering frames. Retries with growing pauses (a HAL that just
+     * restarted, or a previous device still closing, usually recovers within seconds), steps to a
+     * plainer session layout if one keeps failing before its first frame, and finally retreats
+     * to the main lens, so a bad moment never leaves a frozen screen.
+     */
+    private fun onCameraFailure(cam: RawCamera, reason: String) {
+        if (cam !== camera || retryPending) return // an old session's late news, or already handled
+        // A stall seen by the watchdog leaves the device open; let go of it so it shows as available.
+        cam.close()
+        if (recorder != null) stopRecording()
+        if (!resumed) return // onResume reopens
+        if (fallBackToBackup(reason)) return
+        val lens = lenses.getOrNull(lensIndex)
+        val noFrames = (renderer?.frameCounter ?: 0L) == 0L
+        cameraFailures++
+        if (noFrames && cameraFailures % 2 == 0 && sessionVariant < cam.lastVariant) {
+            sessionVariant++
+            EventLog.log("Lens ${lens?.key}: no frames with this session layout twice; trying layout $sessionVariant")
+        }
+        if (cameraFailures <= MAX_CAMERA_RETRIES) {
+            val delay = minOf(4000L, 600L shl (cameraFailures - 1))
+            EventLog.log("Lens ${lens?.key}: retry $cameraFailures/$MAX_CAMERA_RETRIES in $delay ms ($reason)")
+            showMessage("Camera problem: $reason. Retrying ($cameraFailures/$MAX_CAMERA_RETRIES)…")
+            retryPending = true
+            retryWaitStartMs = SystemClock.elapsedRealtime() + delay
+            info.postDelayed(retryCamera, delay)
+            return
+        }
+        val main = mainLensIndex()
+        if (main != null && main != lensIndex) {
+            EventLog.log("Lens ${lens?.key} keeps failing; switching to ${lenses[main].key}")
+            showMessage("${lens?.label} failed ($reason); switched to ${lenses[main].label}")
+            switchLens(main)
+            return
+        }
+        EventLog.log("Giving up on lens ${lens?.key} after $cameraFailures failures")
+        showMessage("Camera failed: $reason. Lens button → Rescan lenses, or Send diagnostics")
+    }
+
+    /** Shows [msg] now (the stats line, which normally carries it, only updates while frames flow). */
+    private fun showMessage(msg: String) {
+        lastResult = msg
+        info.text = msg
+        updateUi()
+    }
+
     private fun setupPipeline() {
         if (camera != null) return
-        val cam = try {
-            RawCamera(this, cameraHandler, lenses.getOrNull(lensIndex)) { msg ->
-                runOnUiThread { if (!fallBackToBackup("camera error")) info.text = msg }
+        lateinit var cam: RawCamera
+        cam = try {
+            RawCamera(this, cameraHandler, lenses.getOrNull(lensIndex), sessionVariant) { reason ->
+                runOnUiThread { onCameraFailure(cam, reason) }
             }
         } catch (e: Exception) {
+            EventLog.log("Camera unavailable for lens ${lenses.getOrNull(lensIndex)?.key}", e)
             info.text = "Camera unavailable: ${e.message}"
             return
         }
@@ -1153,29 +1381,29 @@ class CameraActivity : Activity() {
     }
 
     /**
-     * Restarts the camera if frames stop arriving (a lens can stall in some conditions). Gives up
-     * after a few tries in a row and says so instead of looping.
+     * Treats a camera that stops delivering frames (a lens can stall in some conditions), or never
+     * starts, like any other camera failure; and clears the failure count once a lens streams well.
      */
-    private var stallRestarts = 0
     private val watchdog: Runnable = object : Runnable {
         override fun run() {
             info.removeCallbacks(this)
             if (!resumed) return
             val r = renderer
-            val last = r?.lastFrameMs ?: 0L
-            if (r != null && camera != null && !scanning && last > 0 && SystemClock.elapsedRealtime() - last > 2500) {
-                if (fallBackToBackup("no frames")) {
-                    stallRestarts = 0
-                } else if (stallRestarts < 3) {
-                    stallRestarts++
-                    Log.w(TAG, "No frames from lens ${lenses.getOrNull(lensIndex)?.key} for 2.5 s; restarting camera ($stallRestarts)")
-                    if (recorder != null) stopRecording()
-                    restartPipeline()
-                } else {
-                    lastResult = "This lens stopped delivering frames; try another lens"
+            val cam = camera
+            if (r != null && cam != null && !scanning && !retryPending && cam.openRequestedMs > 0) {
+                val now = SystemClock.elapsedRealtime()
+                val last = r.lastFrameMs
+                when {
+                    // Frames of this open have arrived and then stopped.
+                    last >= cam.openRequestedMs && now - last > 2500 -> onCameraFailure(cam, "no frames for 2.5 s")
+                    // None yet since the (re)open.
+                    last < cam.openRequestedMs && now - cam.openRequestedMs > 6000 -> onCameraFailure(cam, "no frames after opening")
+                    cameraFailures > 0 && last >= cam.openRequestedMs && now - cam.openRequestedMs > 5000 && now - last < 500 -> {
+                        EventLog.log("Lens ${lenses.getOrNull(lensIndex)?.key} streaming again (layout $sessionVariant)")
+                        cameraFailures = 0
+                        if (lastResult?.startsWith("Camera problem") == true) lastResult = null
+                    }
                 }
-            } else if (last > 0 && SystemClock.elapsedRealtime() - last < 1000) {
-                stallRestarts = 0
             }
             info.postDelayed(this, 1000)
         }
@@ -1183,6 +1411,8 @@ class CameraActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        registerReceiver(batteryReceiver, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        getSystemService(PowerManager::class.java).addThermalStatusListener(mainExecutor, thermalListener)
         info.postDelayed(watchdog, 3000)
         if (capture.ae == AeMode.PRIORITY) priorityTick.run()
         refreshViews(selectLabel = views.getOrNull(viewIndex)?.label)
@@ -1194,13 +1424,18 @@ class CameraActivity : Activity() {
 
     override fun onPause() {
         resumed = false
+        runCatching { unregisterReceiver(batteryReceiver) }
+        getSystemService(PowerManager::class.java).removeThermalStatusListener(thermalListener)
         if (recorder != null) stopRecording()
+        info.removeCallbacks(retryCamera)
+        retryPending = false
         camera?.close()
         savePrefs()
         super.onPause()
     }
 
     override fun onDestroy() {
+        getSystemService(android.hardware.camera2.CameraManager::class.java).unregisterAvailabilityCallback(availabilityCallback)
         renderer?.release()
         camera?.release()
         cameraThread.quitSafely()
@@ -1222,6 +1457,57 @@ class CameraActivity : Activity() {
         settingsChanged()
     }
 
+    // ---- Heat ----
+
+    /**
+     * HyperOS's PowerKeeper force-stops even the app in front once the battery passes ~48 °C (seen
+     * on the Xiaomi 14: "mAllowedKillBatteryTempThreshhold is 48"; Android's own thermal status
+     * still said "none" at 50 °C), and a recording cut off that way is lost. So the battery
+     * temperature is watched: a warning as it climbs, and recording stops cleanly at [HOT_STOP_C].
+     */
+    private var batteryTempC = Float.NaN
+    private var thermalStatus = PowerManager.THERMAL_STATUS_NONE
+    private var heatLevel = 0
+
+    private val batteryReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context, intent: Intent) {
+            val t = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+            if (t != Int.MIN_VALUE) onHeat(t / 10f, thermalStatus)
+        }
+    }
+
+    private val thermalListener = PowerManager.OnThermalStatusChangedListener { status -> onHeat(batteryTempC, status) }
+
+    private fun onHeat(tempC: Float, status: Int) {
+        if (status != thermalStatus) EventLog.log("Thermal status $status (battery %.1f °C)".format(tempC))
+        batteryTempC = tempC
+        thermalStatus = status
+        val level = when {
+            tempC >= HOT_STOP_C -> 3
+            tempC >= HOT_WARN_C -> 2
+            tempC >= WARM_C -> 1
+            else -> 0
+        }
+        if (level != heatLevel) {
+            EventLog.log("Battery %.1f °C (heat level $heatLevel → $level)".format(tempC))
+            heatLevel = level
+        }
+        if (recorder != null && (tempC >= HOT_STOP_C || status >= PowerManager.THERMAL_STATUS_SEVERE)) {
+            EventLog.log("Stopping recording: battery %.1f °C, thermal status $status".format(tempC))
+            stopRecording()
+            lastResult = "Recording stopped: phone too hot (%.1f °C). The system closes apps at about 48 °C.".format(tempC)
+        }
+    }
+
+    /** One line about heat for the info text, or null while the phone is cool. */
+    private fun heatNote(): String? = when {
+        batteryTempC >= HOT_STOP_C -> "🌡 %.1f °C: too hot to record, let the phone cool".format(batteryTempC)
+        batteryTempC >= HOT_WARN_C -> "🌡 %.1f °C: recording stops at %.0f °C".format(batteryTempC, HOT_STOP_C)
+        batteryTempC >= WARM_C -> "🌡 %.1f °C".format(batteryTempC)
+        thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> "🌡 phone is throttling (thermal status $thermalStatus)"
+        else -> null
+    }
+
     // ---- Recording ----
 
     private fun toggleRecording() = if (recorder == null) startRecording() else stopRecording()
@@ -1230,13 +1516,17 @@ class CameraActivity : Activity() {
         val cam = camera ?: return
         val r = renderer ?: return
         if (stopping) return
+        if (batteryTempC >= HOT_STOP_C) {
+            showMessage("Phone too hot to record (%.1f °C); the system would close the app mid-recording".format(batteryTempC))
+            return
+        }
         val w = if (superpixel) cam.info.size.width / 2 else cam.info.size.width
         val h = if (superpixel) cam.info.size.height / 2 else cam.info.size.height
         val config = RecordConfig(codec, bitrateMbps, capture.fps, audioOn, cam.info.timestampsAreBoottime)
         val rec = try {
             Recorder(this, config, w, h)
         } catch (e: Exception) {
-            Log.e(TAG, "recorder setup failed", e)
+            EventLog.log("Recorder setup failed", e)
             lastResult = "Can't record: ${e.message}"
             updateUi()
             return
@@ -1244,6 +1534,8 @@ class CameraActivity : Activity() {
         recorder = rec
         recordStartMs = SystemClock.elapsedRealtime()
         lastResult = null
+        EventLog.log("Recording ${w}x$h ${codec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
+            "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, battery %.1f °C".format(batteryTempC))
         // In simple mode the recording is what you see, so bake the look in.
         r.startRecording(rec, capture.fps, bakeLut || simple) { err ->
             runOnUiThread {
@@ -1267,7 +1559,7 @@ class CameraActivity : Activity() {
                     "≈%.0f Mbps".format(result.bytes * 8 / secs / 1e6) +
                     (if (result.audio) " + audio" else "") +
                     (result.error?.let { " — $it" } ?: "")
-                Log.i(TAG, "$msg → ${result.uri}")
+                EventLog.log("Recording: $msg → ${result.uri}")
                 runOnUiThread {
                     stopping = false
                     lastResult = msg
@@ -1379,6 +1671,7 @@ class CameraActivity : Activity() {
                 .onFailure { lastResult = "LUT error: ${it.message}" }
                 .getOrNull()
         }
+        r.lutInput = (views.getOrNull(viewIndex) as? ViewEntry.CubeFile)?.let { lutInputOf(it.file) }
         r.setLut(lut)
     }
 
@@ -1387,11 +1680,19 @@ class CameraActivity : Activity() {
         val m = stats.meta
         val shutter = if (m != null && m.exposureNs > 0) "1/${(1e9 / m.exposureNs).toInt()}" else "-"
         val out = if (superpixel) "${cam.info.size.width / 2}×${cam.info.size.height / 2} superpixel" else "${cam.info.size.width}×${cam.info.size.height}"
+        // Sensor ISO times the digital gain before the log curve: what the noise looks like.
+        val gainEv = renderer?.totalGainEv ?: 0f
+        val effectiveIso = m?.iso?.let { (it * Math.pow(2.0, gainEv.toDouble())).roundToInt() }
+        exposureSlider.warn = (effectiveIso ?: 0) >= NOISY_ISO
         info.text = buildString {
+            heatNote()?.let { append(it) }
             if (!simple) {
+                if (isNotEmpty()) append("\n")
                 append("$out · ${profile.label}\n")
-                append("ISO ${m?.iso ?: "-"} · $shutter · gain %+.1f EV · %.1f fps · frame %.1f ms".format(
-                    (renderer?.autoGainEv ?: 0f) + (renderer?.exposureOffsetEv ?: 0f), stats.fps, stats.gpuMs))
+                append("ISO ${m?.iso ?: "-"} (≈${effectiveIso ?: "-"} with gain) · $shutter · gain %+.1f EV · %.1f fps · frame %.1f ms".format(
+                    gainEv, stats.fps, stats.gpuMs))
+                renderer?.lutInput?.takeIf { it != profile && views.getOrNull(viewIndex) is ViewEntry.CubeFile }
+                    ?.let { append("\nLUT expects ${it.label}: converting from ${profile.label}") }
                 if (capture.ae == AeMode.PRIORITY && priorityAtLimit) append("\n⚠ priority limits reached: image darker than target")
                 if (m != null && m.shading == null) append("\nno lens shading map")
             }
@@ -1417,7 +1718,9 @@ class CameraActivity : Activity() {
      * clean = 0..3, strength / sat / vib = percent (vib: -100..100),
      * tap = "x,y" in 0..1 image coordinates, lens = lens key (e.g. "0", "3", "5/4"),
      * rawlens = "open/physical" + zoom = ratio (stream an arbitrary route; not saved),
-     * afverbose = true|false (log AF state every frame).
+     * afverbose = true|false (log AF state every frame), layout = 0..2 (session layout, see
+     * RawCamera.variant), cmd = failcam (simulate a camera failure) | rescan, lock = true (with tap:
+     * lock focus there), afreset = true (as a double-tap), fullpreview = true|false (full-res preview).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -1458,15 +1761,15 @@ class CameraActivity : Activity() {
             val lens = Lens(openId, physId, false, focal * 43.27f / kotlin.math.hypot(sensor.width, sensor.height), size.width, size.height,
                 "test $route", extras.getFloat("zoom", 1f))
             lenses = lenses.filterNot { it.label.startsWith("test ") } + lens
-            lensIndex = lenses.lastIndex
-            restartPipeline()
+            switchLens(lenses.lastIndex, remember = false)
         }
         extras.getString("lens")?.let { key ->
-            lenses.indexOfFirst { it.key == key }.takeIf { it >= 0 && it != lensIndex && recorder == null }?.let {
-                lensIndex = it
-                prefs.edit().putString("lens", key).apply()
-                restartPipeline()
-            }
+            lenses.indexOfFirst { it.key == key }.takeIf { it >= 0 && it != lensIndex && recorder == null }?.let { switchLens(it) }
+        }
+        // Debug: force a session layout (see RawCamera.variant) on the current lens.
+        if (extras.containsKey("layout") && recorder == null) {
+            sessionVariant = extras.getInt("layout").coerceIn(0, 2)
+            restartPipeline()
         }
         if (extras.containsKey("ev")) setExposureEv(extras.getFloat("ev"))
         if (extras.containsKey("clean")) {
@@ -1481,7 +1784,9 @@ class CameraActivity : Activity() {
         if (extras.containsKey("sat")) saturationBar.progress = extras.getInt("sat")
         if (extras.containsKey("vib")) vibranceBar.progress = extras.getInt("vib") + 100
         if (extras.containsKey("afverbose")) camera?.afVerbose = extras.getBoolean("afverbose")
-        extras.getString("tap")?.split(",")?.map { it.toFloat() }?.let { (u, v) -> focusAt(u, v) }
+        extras.getString("tap")?.split(",")?.map { it.toFloat() }?.let { (u, v) -> focusAt(u, v, lock = extras.getBoolean("lock", false)) }
+        if (extras.getBoolean("afreset", false)) resetFocusToAuto()
+        if (extras.containsKey("fullpreview")) renderer?.previewFullRes = extras.getBoolean("fullpreview")
         savePrefs()
         updateUi()
         when (extras.getString("cmd")) {
@@ -1490,6 +1795,13 @@ class CameraActivity : Activity() {
             "stop" -> stopRecording()
             "edit" -> info.postDelayed({ openLookEditor() }, 1500)
             "dumpcams" -> Thread { dumpCameras() }.start()
+            // Exercises the failure handling: the camera closes as if the HAL had reported an error
+            // (after the resume that follows this intent), and the next `count` opens fail too.
+            "failcam" -> info.postDelayed({
+                RawCamera.debugFailOpens = extras.getInt("count", 0)
+                camera?.simulateFailure()
+            }, 2000)
+            "rescan" -> rescanLenses()
             "refshot" -> info.postDelayed({
                 camera?.referenceCapture(File(getExternalFilesDir(null), "ref")) { msg ->
                     Log.i(TAG, msg)
@@ -1523,6 +1835,16 @@ class CameraActivity : Activity() {
         private const val REQ_EDIT_LOOK = 3
         /** Fallback RAW log-average for AE: Priority if no measurement exists yet. */
         private const val DEFAULT_PRIORITY_TARGET = 0.025
+        /** Retries of a failing lens before falling back to the main lens. */
+        private const val MAX_CAMERA_RETRIES = 6
+        /** Battery temperatures (°C): show it, warn, stop recording (PowerKeeper kills at ~48). */
+        private const val WARM_C = 43f
+        private const val HOT_WARN_C = 45f
+        private const val HOT_STOP_C = 47f
+        /** Effective ISO from which the exposure slider's value turns amber. */
+        private const val NOISY_ISO = 3200
+        private const val LUT_INPUT_MENU = 9_000
+        private const val LUT_INPUT_BASE = 9_001
         private const val RESCAN_ITEM = 10_000
         private const val DIAGNOSTICS_ITEM = 10_001
         private const val BENCH_ITEM = 10_002

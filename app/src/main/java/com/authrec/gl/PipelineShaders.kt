@@ -173,12 +173,52 @@ internal object PipelineShaders {
 
         uniform int uChromaNr;       // 0 off, 1 low, 2 high
         uniform bool uUseLut;
+        uniform bool uLutConvert;    // the LUT expects another log encoding than ours
+        uniform int uCurve;          // ours (LogProfile.shaderId)
+        uniform int uLutCurve;       // the LUT's
+        uniform mat3 uLutGamut;      // linear: our primaries → the LUT's
         uniform float uLutSize;
         uniform float uLutStrength;  // 0 = plain log, 1 = full LUT
         uniform float uSaturation;   // 1 = unchanged
         uniform float uVibrance;     // 0 = unchanged; boosts muted colours more than saturated ones
 
         float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+        // Same curves as LogProfile (encode in the develop pass).
+        float decodeLog(int curve, float y) {
+            if (curve == 0) {  // Apple Log
+                if (y >= 0.20855532) return exp2((y - 0.69336945) / 0.08550479) - 0.00964052;
+                if (y > 0.0) return sqrt(y / 47.28711236) - 0.05641088;
+                return -0.05641088;
+            } else if (curve == 1) {  // S-Log3
+                float v = y * 1023.0;
+                if (v >= 171.2102946929) return pow(10.0, (v - 420.0) / 261.5) * 0.19 - 0.01;
+                return (v - 95.0) * 0.01125 / (171.2102946929 - 95.0);
+            } else {  // LogC3 EI 800
+                if (y > 5.367655 * 0.010591 + 0.092809) return (pow(10.0, (y - 0.385537) / 0.247190) - 0.052272) / 5.555556;
+                return (y - 0.092809) / 5.367655;
+            }
+        }
+
+        float encodeLogAs(int curve, float x) {
+            if (curve == 0) {
+                if (x >= 0.01) return 0.08550479 * log2(x + 0.00964052) + 0.69336945;
+                if (x >= -0.05641088) return 47.28711236 * (x + 0.05641088) * (x + 0.05641088);
+                return 0.0;
+            } else if (curve == 1) {
+                if (x >= 0.01125) return (420.0 + log((x + 0.01) / 0.19) / log(10.0) * 261.5) / 1023.0;
+                return (x * (171.2102946929 - 95.0) / 0.01125 + 95.0) / 1023.0;
+            } else {
+                if (x > 0.010591) return 0.247190 * log(5.555556 * x + 0.052272) / log(10.0) + 0.385537;
+                return 5.367655 * x + 0.092809;
+            }
+        }
+
+        /** Our log → the log encoding (curve and gamut) the LUT was built for. */
+        vec3 toLutInput(vec3 c) {
+            vec3 lin = uLutGamut * vec3(decodeLog(uCurve, c.r), decodeLog(uCurve, c.g), decodeLog(uCurve, c.b));
+            return vec3(encodeLogAs(uLutCurve, lin.r), encodeLogAs(uLutCurve, lin.g), encodeLogAs(uLutCurve, lin.b));
+        }
 
         /** Saturation and vibrance on the display-referred view, around Rec.709 luma. */
         vec3 look(vec3 c) {
@@ -259,7 +299,7 @@ internal object PipelineShaders {
             }
             imageStore(uOutLog, p, vec4(c, 1.0));
             vec3 view = c;
-            if (uUseLut) view = mix(c, lutTetra(c), uLutStrength);
+            if (uUseLut) view = mix(c, lutTetra(uLutConvert ? toLutInput(c) : c), uLutStrength);
             imageStore(uOutView, p, vec4(look(view), 1.0));
         }
     """.trimIndent()
