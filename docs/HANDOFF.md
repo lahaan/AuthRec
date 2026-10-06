@@ -34,11 +34,12 @@ Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: *
 - **Everything 15 Ultra-specific in 0.2.2** (zoom routes for 0.6x/3x/periscope, zoom stepping,
   HAL-recovery waits, layouts 1/2 on its main camera). Needs the friend's next diagnostics; the
   event log in Send diagnostics now shows each scan step and every open/failure.
-- 4K recording start after the half-res preview: one run lost ~10 frames in the first 1.3 s
-  (before the warm-up), with a 1 s full-res warm-up one run lost 4 single frames at 0.7–1.0 s and the
-  next lost none; with a full-res preview: none. All runs were on a warm phone (41–44 °C) with the
-  camera reopened ~2 s earlier by `am start`. Re-test on a cool phone; if drops persist, make the
-  warm-up longer or keep the preview at full res in open-gate mode.
+- 4K recording start after the half-res preview. Without warm-up: one run lost ~10 frames in the
+  first 1.3 s, another 2 single frames; with a full-res preview: none. With the 1 s warm-up, warm
+  phone (43 °C): 4 single-frame drops at 0.7–1.0 s, then a clean run; cool phone (39–40 °C): one
+  267 ms stall at 1.2 s (cause not found in the logs), then two clean runs (254 frames each). Every
+  test had the camera reopened ~2.5 s before by `am start`, which real use doesn't. Check real
+  recordings; if drops persist, lengthen the warm-up or keep the preview at full res in open gate.
 - Tap "keep following": the re-trigger on a soft spot is untested with a real moving subject.
 - LUT input conversion: maths checked (exact round trips, same XYZ path as the develop pass); not
   yet judged by eye on a decent scene (the on-device comparison scene was a blurry wall).
