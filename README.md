@@ -8,7 +8,10 @@ shading); demosaicing, colour, log encoding and LUTs all run on the GPU.
 - Apple Log / S-Log3 / LogC3, HEVC 10-bit / HEVC 8-bit / H.264, up to 150 Mbps, AAC audio
 - Live 3D LUTs (tetrahedral), built-in film-style looks, look editor that exports `.cube`
 - Lens discovery (incl. lenses hidden from normal apps), native or contrast-detect AF, focus peaking
+- Tap to focus and follow a spot, long-press to lock focus, double-tap for automatic focus
 - AE: Auto / Priority (shutter & ISO limits) / Locked / Manual; optional colour noise reduction
+- Imported LUTs are fed the log format they were built for (e.g. an S-Log3 LUT while recording LogC3)
+- Warns when the phone gets hot and stops recording cleanly before the system would close the app
 - Simple mode (look, tap to focus, exposure, record) and Pro mode
 
 Developed and tested on a Xiaomi 14 (Android 16 / HyperOS 3). Needs Android 12+ and a camera with

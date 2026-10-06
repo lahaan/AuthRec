@@ -7,8 +7,9 @@ package com.authrec.gl
  *   with highlights clipped where the first channel saturates so they stay neutral.
  * Pass 2 (develop): Malvar-He-Cutler demosaic (or 2×2 superpixel) → camera-to-target-gamut
  *   matrix → log curve.
- * Pass 3 (finish): optional chroma noise reduction in log space → the clean log (recorded) and
- *   the view (3D LUT at adjustable strength, saturation/vibrance; shown and optionally baked). Writes both the clean log image and the LUT view, so the encoder can
+ * Pass 3 (finish): optional chroma noise reduction in log space → the view (3D LUT at
+ *   adjustable strength, saturation/vibrance; shown and optionally baked) and, when something
+ *   needs it (recording log, a look-editor capture), the clean log image, so the encoder can
  *   record either while the screen shows the view.
  */
 internal object PipelineShaders {
@@ -172,6 +173,7 @@ internal object PipelineShaders {
         layout(rgba16f, binding = 1) writeonly uniform highp image2D uOutLog;
 
         uniform int uChromaNr;       // 0 off, 1 low, 2 high
+        uniform bool uWriteLog;      // the clean log image is wanted (recording log, or a capture)
         uniform bool uUseLut;
         uniform bool uLutConvert;    // the LUT expects another log encoding than ours
         uniform int uCurve;          // ours (LogProfile.shaderId)
@@ -297,7 +299,7 @@ internal object PipelineShaders {
                 }
                 c = vec3(y0) + acc / wsum;
             }
-            imageStore(uOutLog, p, vec4(c, 1.0));
+            if (uWriteLog) imageStore(uOutLog, p, vec4(c, 1.0));
             vec3 view = c;
             if (uUseLut) view = mix(c, lutTetra(uLutConvert ? toLutInput(c) : c), uLutStrength);
             imageStore(uOutView, p, vec4(look(view), 1.0));

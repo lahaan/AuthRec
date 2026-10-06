@@ -99,6 +99,12 @@ class Renderer(
      * the same and keeps the phone cooler; recording always runs at the recorded resolution.
      */
     @Volatile var previewFullRes: Boolean = false
+    /**
+     * Full resolution ahead of a recording: jumping from the light preview straight into 4K
+     * recording dropped frames for ~1 s while the GPU clocked up, so the activity sets this,
+     * waits a moment, then starts recording.
+     */
+    @Volatile var warmingUp: Boolean = false
     /** 0 off, 1 fix defect pixels, 2 + chroma NR low, 3 + chroma NR high. */
     @Volatile var cleanup: Int = 2
 
@@ -303,6 +309,10 @@ class Renderer(
         }
         runPipeline(meta)
         recording?.let { encodeFrame(it, timestamp) }
+        pendingLogCapture?.let { (width, onFrame) ->
+            pendingLogCapture = null
+            deliverLogCapture(width, onFrame)
+        }
         return meta
     }
 
@@ -486,6 +496,8 @@ class Renderer(
         GLES31.glBindImageTexture(0, if (sp) spViewTex else viewTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
         GLES31.glBindImageTexture(1, if (sp) spLogTex else logTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
         GLES30.glUniform1i(Gl.uniform(finishProgram, "uChromaNr"), (cleanup - 1).coerceIn(0, 2))
+        // Writing the full-size log image costs ~100 MB of memory traffic a frame; skip it unless used.
+        GLES30.glUniform1i(Gl.uniform(finishProgram, "uWriteLog"), if (recording?.bakeLut == false || pendingLogCapture != null) 1 else 0)
         GLES30.glUniform1i(Gl.uniform(finishProgram, "uUseLut"), if (lutEnabled) 1 else 0)
         val lutIn = lutInput?.takeIf { it != p }
         GLES30.glUniform1i(Gl.uniform(finishProgram, "uLutConvert"), if (lutIn != null) 1 else 0)
@@ -520,7 +532,7 @@ class Renderer(
     }
 
     /** Mid-recording the mode is fixed by what the encoder was set up for; between recordings see [previewFullRes]. */
-    private fun activeSuperpixel() = recording?.superpixel ?: (superpixel || !previewFullRes)
+    private fun activeSuperpixel() = recording?.superpixel ?: (superpixel || !(previewFullRes || warmingUp))
 
     /** [peakingTexel] > 0 enables focus peaking, sampling that many full-res pixels apart. */
     private fun drawTexture(tex: Int, rotationQuarterTurns: Int, peakingTexel: Float = 0f) {
@@ -534,10 +546,15 @@ class Renderer(
     }
 
     /**
-     * Grabs the current clean log image at [width] px wide (8-bit is plenty for previewing a
-     * look). [onFrame] runs on the GL thread.
+     * Grabs the clean log image of the next frame at [width] px wide (8-bit is plenty for
+     * previewing a look). [onFrame] runs on the GL thread.
      */
-    fun captureLogFrame(width: Int, onFrame: (Bitmap) -> Unit) = handler.post {
+    fun captureLogFrame(width: Int, onFrame: (Bitmap) -> Unit) = handler.post { pendingLogCapture = width to onFrame }
+
+    /** Set on the GL thread; the next processed frame writes the log image and hands it over. */
+    private var pendingLogCapture: Pair<Int, (Bitmap) -> Unit>? = null
+
+    private fun deliverLogCapture(width: Int, onFrame: (Bitmap) -> Unit) {
         val sp = activeSuperpixel()
         val height = width * h / w
         val tex = Gl.texture2D(GLES30.GL_RGBA8, width, height, linear = true)

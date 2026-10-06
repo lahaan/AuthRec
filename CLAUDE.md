@@ -30,9 +30,11 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 
 | File | Role |
 |---|---|
-| `CameraActivity.kt` | The whole UI (plain Views, landscape), settings/prefs, lens selection & fallback, AF modes (incl. contrast-AF hookup), AE: Priority loop, exposure routing, recording start/stop, looks list, watchdog, adb hooks (`handleCommands`) |
-| `camera/RawCamera.kt` | Camera2 session: RAW_SENSOR stream + tiny YUV "metering" stream, request building (AE/AF/AWB/zoom routing/regions), per-frame `FrameMeta` with colour-metadata fallbacks, reference-shot capture |
-| `camera/LensProbe.kt` | Finds every RAW-capable lens (listed ids, hidden ids 0–31, physical sub-cameras, logical-zoom routes), test-streams each, caches per firmware (`VERSION`), labels 0.6x/1x/2.6x |
+| `CameraActivity.kt` | The whole UI (plain Views, landscape), settings/prefs, lens selection & fallback, camera failure recovery (`onCameraFailure`: retries, session layouts, fallback to 1x) + watchdog, AF modes (tap = one-shot AF + spot watch, contrast-AF hookup), AE: Priority loop, exposure routing, heat guard, recording start/stop (4K warm-up), looks list, adb hooks (`handleCommands`) |
+| `camera/RawCamera.kt` | Camera2 session (all device/session work on the camera thread): RAW_SENSOR stream + tiny YUV "metering" stream, session layouts 0–2 (`variant`), request building (AE/AF/AWB/zoom routing/regions), per-frame `FrameMeta` with colour-metadata fallbacks, failure reporting, reference-shot capture |
+| `camera/LensProbe.kt` | Finds every RAW-capable lens (listed ids, hidden ids 0–31, zoom routes, physical sub-cameras), test-streams each with HAL-recovery waits, keeps listed cameras, caches per firmware (`VERSION`), labels 0.6x/1x/2.6x |
+| `EventLog.kt` | Persistent event log (`files/events.log`: opens, layouts, failures, retries, scans, recordings, heat, crashes); part of Send diagnostics |
+| `ExposureSlider.kt` | The vertical EV slider (relative drag, double-tap = 0, amber where it's digital gain) |
 | `gl/Renderer.kt` | GL thread: RAW upload, 3 compute passes, preview draw, encoder-surface draw (2nd shared EGL context, 10-bit config), auto gain, sharpness metric for contrast AF, stall stats |
 | `gl/PipelineShaders.kt` | GLSL: prep (black/shading/WB/defect pixels) → develop (MHC demosaic or superpixel, matrix, log) → finish (chroma NR, tetrahedral LUT, saturation/vibrance) + display (peaking) |
 | `gl/GlUtil.kt` | EGL core (main + encoder contexts), GL helpers |
@@ -73,6 +75,26 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 - Camera can only be opened while the activity is resumed (HyperOS refuses "background" opens).
 - Front camera rotation: `(sensorOrientation + displayDeg) % 360` (back: minus). App is landscape-only.
 - Changing AF mode per tap (video ⇄ picture) stalls Xiaomi's pipeline for a moment: avoid.
+  CONTINUOUS_VIDEO ⇄ AUTO costs at most one frame (measured).
+- **Xiaomi's continuous AF ignores AF regions and AF_TRIGGER_CANCEL** (X14 main: focus didn't move
+  for near or far taps). So a tap = AUTO + region + trigger (fast PDAF one-shot), and the activity's
+  spot watch re-triggers it when the spot's sharpness stays below 60 % of its locked value for
+  15 frames ("AF: Auto" stays the label); long-press = the same without the watch ("AF: Locked");
+  double-tap = back to CONTINUOUS_VIDEO.
+- **Heat: HyperOS PowerKeeper force-stops even the foreground app at ~48 °C battery**
+  (`mAllowedKillBatteryTempThreshhold is 48`; Android's thermal status still reads 0). The app
+  watches ACTION_BATTERY_CHANGED: banner from 43 °C, warning from 45 °C, recording stops (file
+  saved) and won't start at 47 °C.
+- The preview uses the superpixel path between recordings (≈4 ms vs ≈15–25 ms a frame); 4K
+  recording first runs 1 s at full resolution (jumping straight in dropped frames while the GPU
+  clocked up). The finish pass only writes the full-size log image when something uses it.
+- `LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID` can name the main sensor while a physical stream of
+  another sensor still delivers (X14 `5/4`), so it's only a hint.
+- **Xiaomi 15 Ultra (HyperOS 2)**: hidden ids opened directly fail at configure with
+  `Function not implemented (-38)`; a RAW-only physical stream of a non-active lens on logical 0
+  crashed its camera HAL (every later call: `unknown device`). Zoom routes (logical 0 +
+  CONTROL_ZOOM_RATIO, physical RAW + logical YUV) are the expected way in; unverified until the
+  friend's next diagnostics.
 
 ## Conventions
 
@@ -88,7 +110,17 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 
 - adb hooks: `adb shell am start -n com.authrec/.CameraActivity --es cmd rec --es codec HEVC_10 …`
   (full list in the KDoc of `CameraActivity.handleCommands`; `lens=5/4`, `tap=0.5,0.5`, `ev=-1.0`,
-  `clean=3`, `afverbose=true`, `cmd=dumpcams|refshot|edit`).
+  `clean=3`, `afverbose=true` (`--ez`), `cmd=dumpcams|refshot|edit|rescan|failcam`, `layout=0..2`,
+  `fakeheat=47.5`, `lutinput=SLOG3`, `fullpreview=true`).
+  **Every `am start` pauses and resumes the activity, i.e. closes and reopens the camera**, so
+  state that lives in the session (AF, a recording) is reset by the next command; hooks that must
+  act on a running session post themselves (`failcam` after 2 s, `fakeheatdelay`). For taps use
+  real input instead: `adb shell input tap X Y` (the 4:3 image spans x 535–2135 on the X14),
+  long-press `adb shell input swipe X Y X Y 900`.
+- Event log: `adb shell run-as com.authrec cat files/events.log` (debug build).
+- **Mind the heat while testing**: the app runs the camera whenever it's in front. Go back to the
+  home screen (or YouTube) between tests and watch `adb shell dumpsys battery | grep temperature`
+  (tenths of °C); above ~44 °C let it cool, at 48 °C PowerKeeper starts killing apps (YouTube too).
 - `tools/rectest.sh <secs> <tag> [extras]` records, pulls, reports drops (needs ffmpeg).
 - `tools/refshot/` RAW+ISP JPEG reference and the Python pipeline replica for colour/exposure work.
 - Screenshots: `adb exec-out screencap -p > shot.png` (2670×1200 landscape). UI element bounds:

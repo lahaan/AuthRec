@@ -1,77 +1,95 @@
-# Handoff: state as of v0.2.0 (2026-10-05)
+# Handoff: state as of 0.2.2 (2026-10-06)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
-→ features, testing each step on the owner's Xiaomi 14 over adb. Architecture and device quirks:
-see **CLAUDE.md**. New feedback/diagnostics/samples: **feedback/**.
+→ features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
+(0.2.1: diagnosable lens probe), then 0.2.2: robustness for the 15 Ultra and the owner's feedback.
+Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: **feedback/**
+(`notes.md` has every reported item, its diagnosis and status).
 
 ## Working and verified on the Xiaomi 14
 
-- Open gate 4096×3072 from RAW_SENSOR (14-bit) at 24/25/30 fps, 0 dropped frames over 15–30 s
-  recordings (one warm-up drop in the first 0.25 s), incl. strongest chroma NR.
-- HEVC Main10 is genuinely 10-bit (726 distinct Y levels, low bits uniform); HEVC 8-bit and H.264
-  High at open gate also work. 150 Mbps measured. AAC stereo 48 kHz synced on the camera clock.
-- Superpixel 2048×1536 mode; Apple Log / S-Log3 / LogC3; built-in looks, user looks, imported
-  .cube (tetrahedral); look editor with .cube export; LUT strength/saturation/vibrance.
-- Lenses: 0.6x (hidden id 3), 1x (0), 2.6x (logical 5 → physical 4, native continuous AF; backup =
-  direct id 4 with contrast AF), Front (1). Owner confirmed AF and tap focus work, incl. low light.
-- Colour vs ISP JPEG: hue within ~2.5–3°; auto gain matches ISP midtone brightness.
-- Chroma NR: −70 % colour noise in a flat patch, luma texture unchanged. Defect-pixel repair.
-- Priority AE panel (limits, ✕ Done, ⚙ to reopen), unified EV ±5, Simple mode with 4K/2K + Adjust.
-- Release v0.2.0 published (signed), README with install steps.
+- Open gate 4096×3072 from RAW_SENSOR (14-bit) at 24/25/30 fps; HEVC Main10 genuinely 10-bit;
+  HEVC 8-bit and H.264 High; 150 Mbps; AAC stereo on the camera clock. Superpixel 2048×1536.
+- Apple Log / S-Log3 / LogC3; built-in looks, user looks, imported .cube (tetrahedral); look editor.
+- Lenses: 0.6x (hidden id 3), 1x (0), 2.6x (logical 5 → physical 4 at zoom 2.58, native AF;
+  backup = direct id 4 with contrast AF), Front (1). 0.2.2's scan finds the same five in ~4 s.
+- Colour vs ISP JPEG within ~2.5–3° hue; auto gain matches ISP midtone brightness.
+- **0.2.2, tested this session:**
+  - Lens scan: same result as before; a scan interrupted by leaving the app is abandoned and
+    restarted cleanly; an earlier PowerKeeper kill mid-scan was counted as strike 1 (not skipped).
+  - Camera failure recovery: simulated failures walk the whole ladder (retry with backoff → session
+    layout 1 → layout 2 → streaming again, failure count reset). Layouts 0 and 2 stream on 1x and
+    Front; 8 rapid lens switches in 3.5 s: no crash, last one streams.
+  - Heat guard: banner from 43 °C, warning from 45 °C; with a faked 47.3 °C mid-recording the
+    recording stopped and was saved (100 frames) with the reason shown.
+  - Tap focus: near/far taps move focus (0.98 → 6.1 diopters on a near wall, locked in ~1 s);
+    the AF mode switch costs ≤1 frame; static scene: no refocus hunting. Long-press locks.
+  - Sharpness measure (contrast AF / spot watch) rewritten with bulk row reads: frame time with a
+    watched spot 27.6 → 8.5 ms. Contrast AF on the backup telephoto still locks sharply.
+  - Half-res preview between recordings: ~4 ms a frame instead of ~15–25.
+  - Vertical EV slider (both modes, right side), effective ISO in Pro's info line.
 
 ## Built but not verified (or only partly)
 
-- **Send diagnostics…** share sheet: never opened on a device yet.
-- Front camera orientation: last change reverted to the original formula; owner reported the 180°
-  version upside down in landscape. Needs the owner's eyes.
-- Ultrawide in the dark: owner said "fixed" after moving to direct id 3; watchdog untested in anger.
-- Native-AF telephoto in the dark (does the logical camera switch sensors and trigger the fallback?).
-- AE: Priority behaviour indoors at its limits; "limits reached" warning.
+- **Everything 15 Ultra-specific in 0.2.2** (zoom routes for 0.6x/3x/periscope, zoom stepping,
+  HAL-recovery waits, layouts 1/2 on its main camera). Needs the friend's next diagnostics; the
+  event log in Send diagnostics now shows each scan step and every open/failure.
+- 4K recording start after the half-res preview: one run lost ~10 frames in the first 1.3 s
+  (before the warm-up), with a 1 s full-res warm-up one run lost 4 single frames at 0.7–1.0 s and the
+  next lost none; with a full-res preview: none. All runs were on a warm phone (41–44 °C) with the
+  camera reopened ~2 s earlier by `am start`. Re-test on a cool phone; if drops persist, make the
+  warm-up longer or keep the preview at full res in open-gate mode.
+- Tap "keep following": the re-trigger on a soft spot is untested with a real moving subject.
+- LUT input conversion: maths checked (exact round trips, same XYZ path as the develop pass); not
+  yet judged by eye on a decent scene (the on-device comparison scene was a blurry wall).
+- Front camera orientation on the 15 Ultra looked right in the friend's screenshot (upright).
 - Look editor "Clip frame" with 10-bit clips; LUT import of unusual .cube files (DOMAIN, 1D).
-- Anything on a non-Xiaomi or non-Snapdragon phone; the Xiaomi 15 Ultra (friend testing now).
+- AE: Priority at its limits; "limits reached" warning.
 
 ## Start here (next session)
 
-1. Read `feedback/notes.md` (2026-10-05): 10 triaged items from both phones with diagnoses.
-2. 0.2.1 changes (probe results in diagnostics, dark-room probe fix, logical-stream retry,
-   launcher-extras fix) are verified on the X14 (all 5 routes pass in a dark room) but not yet
-   released; publish it so the friend's 15 Ultra can send useful diagnostics (ask the owner first).
-3. Biggest owner pain points: noise from digital gain (item 5), heat (item 7), EV slider in Pro
-   (item 6), tap keeps AF Auto (item 8). 15 Ultra: missing lenses (item 1), lens-switch freeze (item 2).
+1. Read `feedback/notes.md` (items 11–14 are this session's), then anything new in `feedback/`.
+2. 0.2.2 lives on branch `0.2.2` (not merged, not pushed): check with the owner, merge to main,
+   release (see CLAUDE.md), and ask the friend for Rescan lenses → Send diagnostics.
+3. From the friend's next report: did the zoom routes give 0.6x/3x/4.x? Did the main camera's
+   launch errors recover by themselves (event log: "retry", "layout", "streaming again")?
+4. Owner decisions pending (see "Ideas" below): noise (item 5: ETTR-style AE / gain off), whether
+   a 1 s REC warm-up is acceptable.
 
 ## Known issues / owner feedback not yet addressed
 
-- Owner: "exposure control is a bit iffy" during recording and in general; AE/EV/AF "needs work",
-  UI/UX overall alpha. Get specifics from feedback/ before redesigning.
-- Native telephoto AF ignores tap regions (both AF modes) → taps fall back to contrast AF (~3 s).
-  Region-aware native taps probably need Xiaomi vendor tags / session op mode (MotionCam has a
-  vendor-tag editor and `sessionOpMode` per camera; Qualcomm `org.codeaurora.qcamera3.*` session
-  keys are listed by `cmd=dumpcams`).
-- Contrast AF is slow (~3 s per tap) and the "AF: Auto" software monitor refocuses with a visible
-  local search; centre AF on a diagonal subject picks the dominant detail.
-- Brief fps dip right after taps on the native-AF telephoto (seen with picture AF; video AF looked
-  fine at 29 fps; re-check).
-- No portrait orientation (all UI landscape-locked; holding the phone upright shows the image
-  sideways).
-- Auto gain is per-scene adaptive and only learns at EV 0; in very high-contrast scenes Xiaomi
-  underexposes RAW more, so footage can still come out darker than the ISP's.
-- AUTO_BIAS_EV (0.3) was fitted on one overcast daylight scene on the main camera only.
-- `afverbose`, `rawlens`, contrast-AF curve logging are debug aids; keep them out of the UI.
+- Noise from digital gain (item 5): the effective ISO is now shown and the slider turns amber from
+  ≈ISO 3200, but the cause stays: Xiaomi's AE exposes RAW ~2.2–3 EV under its own rendering (even
+  in daylight: ISO 50 1/2300 + 3 EV of gain), and we add it back digitally.
+- Front camera with session layout 2 (RAW only, the last fallback) comes out magenta and unshaded:
+  Xiaomi's front ISP runs no AWB/shading without the metering stream. Only reached after layouts 0
+  and 1 fail twice each.
+- Native telephoto AF ignores tap regions (both AF modes) → taps there use contrast AF (~3 s).
+  Region-aware native taps probably need Xiaomi vendor tags / session op mode.
+- Contrast AF coarse pass is affected by lens lag (values from the previous position); the fine
+  pass corrects it, but the curve logs look odd.
+- No portrait orientation (landscape-locked UI).
+- Auto gain only learns at EV 0 in AE Auto; AUTO_BIAS_EV (0.3) fitted on one daylight scene.
+- `afverbose`, `rawlens`, `failcam`, `fakeheat`, `layout`, contrast-AF curve logging are debug aids.
 
 ## Ideas discussed, not started
 
-- "AuthRec Log": a sensor-fitted log curve (~95 % code-value use vs ~66–76 % for the standard
-  curves) plus conversion LUTs to Apple Log/S-Log3 for Resolve.
-- RAW (MCRAW-style) recording mode; storage-bandwidth bound (~250–750 MB/s at open gate).
+- **ETTR-style exposure** (for item 5): drive sensor exposure from the RAW histogram (raise it
+  until the 99.5th percentile nears ~0.9 of white) and lower the digital gain by the same amount;
+  in daylight that's 2–3 EV more light on the sensor for free. Trade-off: less highlight headroom
+  than Xiaomi's AE keeps. Or a simple "Gain: Off" option. Owner to pick.
+- Lighter 4K pipeline for heat: prep pass into R16F isn't allowed as an image format in GLES 3.1;
+  next candidates: compute the LUT view at half resolution while recording log, zero-copy RAW
+  upload (AHardwareBuffer, needs NDK), fewer full-res RGBA16F passes.
+- "AuthRec Log": a sensor-fitted log curve plus conversion LUTs to Apple Log/S-Log3.
+- RAW (MCRAW-style) recording; storage-bandwidth bound (~250–750 MB/s at open gate).
+- Logical-RAW zoom route for phones whose physical streams don't work: RAW on the logical camera at
+  CONTROL_ZOOM_RATIO, sensor metadata from the active physical camera (needs per-frame CFA/levels).
 - Portrait UI; on-screen histogram/zebras; per-lens calibration of the auto-gain bias via refshot.
-- Zero-copy RAW upload (AHardwareBuffer) to cut ~6 ms/frame.
 
-## Suggested way to split work between agents
+## Testing notes
 
-Independent tracks that touch mostly separate files (use git worktrees/branches):
-1. **Exposure/AE** (`CameraActivity` exposure section, `Renderer` auto gain): act on owner feedback.
-2. **AF** (`SoftwareAf`, `RawCamera` AF request code, vendor-tag experiments for native taps).
-3. **Device compatibility** (`LensProbe`, `RawCamera` fallbacks, `Diagnostics`) driven by the
-   15 Ultra diagnostics.
-4. **UI/UX** (`CameraActivity` layout code): only after 1–3 settle, since it touches the same file.
-Every track tests on the phone over adb (one phone: coordinate who is using it).
+- One phone, over USB; it runs hot while the camera is open. See CLAUDE.md "Mind the heat".
+- `am start` hooks pause/resume the activity (camera reopens); use `adb shell input tap` for UI.
+- The event log (`adb shell run-as com.authrec cat files/events.log`) is the quickest way to see
+  what the camera did; it's also what testers send via Send diagnostics.

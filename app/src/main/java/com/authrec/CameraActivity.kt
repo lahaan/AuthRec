@@ -521,12 +521,13 @@ class CameraActivity : Activity() {
         val recording = recorder != null
         recButton.text = when {
             stopping -> "Saving…"
+            warmingUp -> "Starting…"
             recording -> "■ STOP"
             else -> "● REC"
         }
         recButton.setTextColor(if (recording) Color.RED else Color.WHITE)
         recButton.isEnabled = !stopping
-        lockedWhileRecording.forEach { it.isEnabled = !recording && !stopping }
+        lockedWhileRecording.forEach { it.isEnabled = !recording && !stopping && !warmingUp }
         proOnly.forEach { it.visibility = if (simple) View.GONE else View.VISIBLE }
         modeSwitch.text = if (simple) "Pro ▸" else "Simple ▸"
         // Always shown, even with one lens: its menu is also where Rescan and Send diagnostics live.
@@ -1137,7 +1138,7 @@ class CameraActivity : Activity() {
         val backup = twinOf(current) ?: return false
         EventLog.log("Native AF route ${current.key} failed ($reason); using backup ${backup.key}")
         nativeFailed += current.key
-        if (recorder != null) stopRecording()
+        stopRecording("Stopped: ${current.label} native AF route failed") // also cancels a warm-up
         lastResult = "${current.label}: native AF route stopped ($reason); switched to backup AF"
         switchLens(lenses.indexOf(backup), remember = false)
         return true
@@ -1297,7 +1298,7 @@ class CameraActivity : Activity() {
         if (cam !== camera || retryPending) return // an old session's late news, or already handled
         // A stall seen by the watchdog leaves the device open; let go of it so it shows as available.
         cam.close()
-        if (recorder != null) stopRecording()
+        stopRecording("Stopped: camera problem ($reason)") // also cancels a warm-up
         if (!resumed) return // onResume reopens
         if (fallBackToBackup(reason)) return
         val lens = lenses.getOrNull(lensIndex)
@@ -1426,7 +1427,7 @@ class CameraActivity : Activity() {
         resumed = false
         runCatching { unregisterReceiver(batteryReceiver) }
         getSystemService(PowerManager::class.java).removeThermalStatusListener(thermalListener)
-        if (recorder != null) stopRecording()
+        stopRecording() // also cancels a warm-up
         info.removeCallbacks(retryCamera)
         retryPending = false
         camera?.close()
@@ -1494,8 +1495,7 @@ class CameraActivity : Activity() {
         }
         if (recorder != null && (tempC >= HOT_STOP_C || status >= PowerManager.THERMAL_STATUS_SEVERE)) {
             EventLog.log("Stopping recording: battery %.1f °C, thermal status $status".format(tempC))
-            stopRecording()
-            lastResult = "Recording stopped: phone too hot (%.1f °C). The system closes apps at about 48 °C.".format(tempC)
+            stopRecording("Stopped: phone too hot (%.1f °C; the system closes apps at about 48 °C)".format(tempC))
         }
     }
 
@@ -1510,7 +1510,16 @@ class CameraActivity : Activity() {
 
     // ---- Recording ----
 
-    private fun toggleRecording() = if (recorder == null) startRecording() else stopRecording()
+    private fun toggleRecording() = if (recorder == null && !warmingUp) startRecording() else stopRecording()
+
+    /** Between pressing REC and the first recorded frame while the pipeline warms up at full resolution. */
+    private var warmingUp = false
+    private val startAfterWarmUp = Runnable {
+        if (warmingUp) {
+            warmingUp = false
+            if (resumed) startRecording() else renderer?.warmingUp = false
+        }
+    }
 
     private fun startRecording() {
         val cam = camera ?: return
@@ -1518,6 +1527,15 @@ class CameraActivity : Activity() {
         if (stopping) return
         if (batteryTempC >= HOT_STOP_C) {
             showMessage("Phone too hot to record (%.1f °C); the system would close the app mid-recording".format(batteryTempC))
+            return
+        }
+        // The preview runs at half resolution to save power; jumping straight into 4K recording
+        // dropped frames for ~1 s while the GPU clocked up. Run full resolution for a moment first.
+        if (!superpixel && !r.previewFullRes && !r.warmingUp) {
+            r.warmingUp = true
+            warmingUp = true
+            updateUi()
+            info.postDelayed(startAfterWarmUp, WARM_UP_MS)
             return
         }
         val w = if (superpixel) cam.info.size.width / 2 else cam.info.size.width
@@ -1546,16 +1564,24 @@ class CameraActivity : Activity() {
         updateUi()
     }
 
-    private fun stopRecording() {
+    /** [why]: shown with the result when something other than the user stopped the recording. */
+    private fun stopRecording(why: String? = null) {
+        if (warmingUp) {
+            info.removeCallbacks(startAfterWarmUp)
+            warmingUp = false
+            renderer?.warmingUp = false
+            updateUi()
+        }
         val rec = recorder ?: return
         val r = renderer ?: return
+        r.warmingUp = false
         recorder = null
         stopping = true
         updateUi()
         r.stopRecording {
             rec.stop { result ->
                 val secs = (SystemClock.elapsedRealtime() - recordStartMs) / 1000.0
-                val msg = "Saved ${result.frames} frames, ${result.bytes / 1_000_000} MB, " +
+                val msg = (why?.let { "$it. " } ?: "") + "Saved ${result.frames} frames, ${result.bytes / 1_000_000} MB, " +
                     "≈%.0f Mbps".format(result.bytes * 8 / secs / 1e6) +
                     (if (result.audio) " + audio" else "") +
                     (result.error?.let { " — $it" } ?: "")
@@ -1720,7 +1746,9 @@ class CameraActivity : Activity() {
      * rawlens = "open/physical" + zoom = ratio (stream an arbitrary route; not saved),
      * afverbose = true|false (log AF state every frame), layout = 0..2 (session layout, see
      * RawCamera.variant), cmd = failcam (simulate a camera failure) | rescan, lock = true (with tap:
-     * lock focus there), afreset = true (as a double-tap), fullpreview = true|false (full-res preview).
+     * lock focus there), afreset = true (as a double-tap), fullpreview = true|false (full-res preview),
+     * fakeheat = °C (pretend battery temperature, until the next real reading) after fakeheatdelay ms,
+     * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -1780,6 +1808,11 @@ class CameraActivity : Activity() {
             viewIndex = extras.getInt("view").coerceIn(0, views.lastIndex)
             applyView()
         }
+        // Debug: the current imported LUT's expected input (APPLE_LOG | SLOG3 | LOGC3 | NONE = as is).
+        extras.getString("lutinput")?.let { v ->
+            (views.getOrNull(viewIndex) as? ViewEntry.CubeFile)?.let { prefs.edit().putString("lutInput:${it.file.name}", v).apply() }
+            applyView()
+        }
         if (extras.containsKey("strength")) strengthBar.progress = extras.getInt("strength")
         if (extras.containsKey("sat")) saturationBar.progress = extras.getInt("sat")
         if (extras.containsKey("vib")) vibranceBar.progress = extras.getInt("vib") + 100
@@ -1787,6 +1820,10 @@ class CameraActivity : Activity() {
         extras.getString("tap")?.split(",")?.map { it.toFloat() }?.let { (u, v) -> focusAt(u, v, lock = extras.getBoolean("lock", false)) }
         if (extras.getBoolean("afreset", false)) resetFocusToAuto()
         if (extras.containsKey("fullpreview")) renderer?.previewFullRes = extras.getBoolean("fullpreview")
+        // Debug: pretend the battery is this hot (until the next real reading), e.g. fakeheat=47.5.
+        if (extras.containsKey("fakeheat")) {
+            info.postDelayed({ onHeat(extras.getFloat("fakeheat"), thermalStatus) }, extras.getInt("fakeheatdelay", 500).toLong())
+        }
         savePrefs()
         updateUi()
         when (extras.getString("cmd")) {
@@ -1843,6 +1880,8 @@ class CameraActivity : Activity() {
         private const val HOT_STOP_C = 47f
         /** Effective ISO from which the exposure slider's value turns amber. */
         private const val NOISY_ISO = 3200
+        /** Full-resolution processing before a 4K recording starts (see [startRecording]). */
+        private const val WARM_UP_MS = 1000L
         private const val LUT_INPUT_MENU = 9_000
         private const val LUT_INPUT_BASE = 9_001
         private const val RESCAN_ITEM = 10_000
