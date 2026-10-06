@@ -21,8 +21,10 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 - Signing key: `~/Desktop/Android-Projects/AuthRec-signing/` (outside the repo, never commit it).
   The owner's phone runs the **debug** build; release and debug signatures differ, so installing
   one over the other needs an uninstall (which wipes settings/looks).
-- Release: bump `versionCode`/`versionName` in `app/build.gradle.kts`, `assembleRelease`, then
-  `gh release create vX.Y.Z app/build/outputs/apk/release/app-release.apk#AuthRec-X.Y.Z.apk --prerelease`
+- Release: bump `versionCode`/`versionName` in `app/build.gradle.kts`, `assembleRelease`, push
+  main, copy the APK to a file named `AuthRec-X.Y.Z.apk` (a `file#label` argument only sets the
+  display label; the download stays `app-release.apk`), then
+  `gh release create vX.Y.Z <dir>/AuthRec-X.Y.Z.apk --prerelease --target main`
   (repo: github.com/lahaan/AuthRec, public). Publishing is outward-facing: confirm with the owner.
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
