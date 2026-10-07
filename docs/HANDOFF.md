@@ -1,4 +1,4 @@
-# Handoff: state as of 0.3.0 (2026-10-07, committed, tested on the X14, not released yet)
+# Handoff: state as of 0.3.0 (2026-10-07, released as GitHub pre-release v0.3.0)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -8,7 +8,7 @@ owner's next round (new UI, eDR, a look from a reference photo).
 Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: **feedback/**
 (`notes.md` has every reported item, its diagnosis and status; 15–21 are 0.3.0's).
 
-## 0.3.0 (committed on main, not pushed or released yet)
+## 0.3.0 (pre-release v0.3.0, 2026-10-07)
 
 Tested on the X14 this session:
 - Recorder: partial frames joined (`recdebug=split`: 165/165, clean decode), file starts on a key
@@ -75,7 +75,7 @@ Not verified:
 ## Start here (next session)
 
 1. Read `feedback/notes.md` (items 15–21 are 0.3.0's), then anything new in `feedback/`.
-2. If 0.3.0 has been released: from the friend's next diagnostics, check the `Encoder …` line of
+2. 0.3.0 is out (pre-release, same signing key as 0.2.2). From the friend's next diagnostics, check the `Encoder …` line of
    her recordings (partial frames? key frame first?), the `… colour:` lines (physical results on
    `0/4`, `0/5`?), and that the scan kept 4.1x and skipped `0/3` after one crash.
 3. The owner will send UI sketches for the Glass layout; layouts live in `ui/` (CLAUDE.md).
