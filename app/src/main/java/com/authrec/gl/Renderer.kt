@@ -65,6 +65,12 @@ class Renderer(
         private set
     @Volatile var rawClipFraction: Float = 0f
         private set
+    /**
+     * Share of the image the view shows blown out although the RAW still holds it (more than
+     * ~3.5 stops over middle grey after the gain, sensor not clipped): what eDR brings back.
+     */
+    @Volatile var recoverableClipFraction: Float = 0f
+        private set
     /** Region (0..1 image coords: left, top, right, bottom) whose sharpness is measured, or null. */
     @Volatile var sharpnessRegion: FloatArray? = null
     /** Contrast of [sharpnessRegion] in the latest frame (brightness-normalised gradient energy). */
@@ -95,6 +101,11 @@ class Renderer(
      */
     @Volatile var toneHighlights: Float = 0f
     @Volatile var toneShadows: Float = 0f
+    /**
+     * The user's white balance trim on top of the ISP's (gains for R, G, G, B; see
+     * CameraActivity.setWbShift). Part of development like the ISP's own gains, so the log gets it too.
+     */
+    @Volatile var wbShift: FloatArray = floatArrayOf(1f, 1f, 1f, 1f)
     @Volatile var saturation: Float = 1f
     @Volatile var vibrance: Float = 0f
     /** 2×2 superpixel output at half resolution instead of demosaiced full resolution. */
@@ -365,16 +376,19 @@ class Renderer(
         var sum = 0.0
         var n = 0
         var clipped = 0
+        var recoverable = 0
+        val gain = currentGain()
         for (gy in 1 until 24) for (gx in 1 until 32) {
             // Green on a red row: red's row, the other column parity.
             val x = ((w * gx / 32) and 1.inv()) + (1 - rx)
             val y = ((h * gy / 24) and 1.inv()) + ry
             val v = ((buf.getShort(y * plane.rowStride + x * 2).toInt() and 0xFFFF) - black) / range
             sum += Math.log(v.coerceAtLeast(0f) + 1e-4)
-            if (v > 0.9f) clipped++
+            if (v > 0.9f) clipped++ else if (v * gain > 2f) recoverable++
             n++
         }
         rawClipFraction = clipped.toFloat() / n
+        recoverableClipFraction = recoverable.toFloat() / n
         return Math.exp(sum / n).toFloat().also { rawBrightness = it }
     }
 
@@ -472,7 +486,9 @@ class Renderer(
         GLES31.glBindImageTexture(0, linearTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
         GLES30.glUniform4fv(Gl.uniform(prepProgram, "uBlack"), 1, meta?.blackLevel ?: floatArrayOf(0f, 0f, 0f, 0f), 0)
         GLES30.glUniform1f(Gl.uniform(prepProgram, "uWhite"), meta?.whiteLevel ?: 1023f)
-        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uWb"), 1, meta?.wbGains ?: floatArrayOf(1f, 1f, 1f, 1f), 0)
+        val shift = wbShift
+        val wb = meta?.wbGains ?: floatArrayOf(1f, 1f, 1f, 1f)
+        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uWb"), 1, FloatArray(4) { wb[it] * shift[it] }, 0)
         GLES30.glUniform2i(Gl.uniform(prepProgram, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
         GLES30.glUniform1i(Gl.uniform(prepProgram, "uFixDefects"), if (cleanup >= 1) 1 else 0)
         GLES31.glDispatchCompute(groupsX, groupsY, 1)

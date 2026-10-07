@@ -1,10 +1,35 @@
-# Handoff: state as of 0.2.2 (2026-10-06)
+# Handoff: state as of 0.3.0 (2026-10-07, committed, tested on the X14, not released yet)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
-(0.2.1: diagnosable lens probe), then 0.2.2: robustness for the 15 Ultra and the owner's feedback.
+(0.2.1: diagnosable lens probe), then 0.2.2: robustness for the 15 Ultra and the owner's feedback,
+then 0.3.0: the third 15 Ultra report (green clip starts, tint, lenses coming and going) and the
+owner's next round (new UI, eDR, a look from a reference photo).
 Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: **feedback/**
-(`notes.md` has every reported item, its diagnosis and status).
+(`notes.md` has every reported item, its diagnosis and status; 15–21 are 0.3.0's).
+
+## 0.3.0 (committed on main, not pushed or released yet)
+
+Tested on the X14 this session:
+- Recorder: partial frames joined (`recdebug=split`: 165/165, clean decode), file starts on a key
+  frame with audio shifted (`recdebug=dropkey`: sync frame after 8 frames, file starts at 0),
+  normal clips unchanged (IDR first, no B-frames). Event log line per recording: encoder name,
+  first outputs, buffer size.
+- Lens scan v8: same five lenses in 4.5 s. Colour line per open (WB, matrix, black, source).
+- Glass layout: every panel opened and used (ISO dial → manual ISO, Adjust with eDR curve drag,
+  settings sheet, eDR suggestion banner via `edrhint=show`, record / warm-up / REC pill / save,
+  lens chips 0.6× → Front (flip) → back → 2.6×), switch to Classic and back (Classic = old screen,
+  "eDR" button, Warmth/Tint in Adjust). Autobahn live and in the look editor; colour mixer UI.
+- Colour vs Xiaomi's JPEG in a magenta-LED room (refshot, 1x): hue error 1.1°, no neutral cast.
+
+Not verified:
+- Everything 15 Ultra: the green start (the fix targets partial-frame buffers, the most likely
+  cause; the event log line will tell), the tint (colour line + whether physical results arrive),
+  periscope found reliably, `0/3` remembered after one more crash.
+- The eDR suggestion's trigger in a real daylight scene (the banner itself works; the trigger
+  needs RAW-unclipped highlights blown by our gain, which the night-time test room didn't have).
+- Glass on other screen sizes (laid out in dp from the 4:3 margins; 16:9 phones have narrow
+  margins, so the side controls overlap the image there).
 
 ## Working and verified on the Xiaomi 14
 
@@ -49,20 +74,19 @@ Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: *
 
 ## Start here (next session)
 
-1. Read `feedback/notes.md` (items 11–14 are this session's), then anything new in `feedback/`.
-2. 0.2.2 is published as a GitHub pre-release (v0.2.2, 2026-10-06). The owner is testing it and
-   collecting the friend's 15 Ultra diagnostics (it rescans on first start: lens cache version 7).
-3. From the friend's next report: did the zoom routes give 0.6x/3x/4.x? Did the main camera's
-   launch errors recover by themselves (event log: "retry", "layout", "streaming again")?
+1. Read `feedback/notes.md` (items 15–21 are 0.3.0's), then anything new in `feedback/`.
+2. If 0.3.0 has been released: from the friend's next diagnostics, check the `Encoder …` line of
+   her recordings (partial frames? key frame first?), the `… colour:` lines (physical results on
+   `0/4`, `0/5`?), and that the scan kept 4.1x and skipped `0/3` after one crash.
+3. The owner will send UI sketches for the Glass layout; layouts live in `ui/` (CLAUDE.md).
 4. Owner decisions pending (see "Ideas" below): noise (item 5: ETTR-style AE / gain off), whether
    a 1 s REC warm-up is acceptable.
 
-## After 0.2.2 (on main, not released yet)
+## After 0.2.2
 
-- Tone balance: "Balance" button (left column, both modes; highlights −60 / shadows +30) and
-  Highlights / Shadows sliders in Adjust. Curve checked numerically (Balance: +4 stops → +2.9,
-  −4 → −3.6, middle grey unchanged) and all shaders compile offline (SDK glslang); not yet
-  looked at on the phone.
+- Tone balance ("Balance", now eDR in 0.3.0): curve checked numerically (−60/+30: +4 stops →
+  +2.9, −4 → −3.6, middle grey unchanged), shaders compile offline (SDK glslang); on the phone
+  in a window scene: sky 235 → 216, mid-tones unchanged, shadows +6–7 levels, ~0.2 ms a frame.
 
 ## Known issues / owner feedback not yet addressed
 
@@ -81,6 +105,14 @@ Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: *
 - `afverbose`, `rawlens`, `failcam`, `fakeheat`, `layout`, contrast-AF curve logging are debug aids.
 
 ## Ideas discussed, not started
+
+- **15 Ultra ultrawide**: no route works (direct id: −38 at configure; physical stream on
+  logical 0: camera service crash). Next candidate: RAW on the logical camera itself at
+  CONTROL_ZOOM_RATIO 0.6, using the active physical camera's CFA/levels per frame
+  (`LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID`; the UW is GRBG, the main RGGB). Can be tried on the
+  X14's logical camera first.
+- Real backdrop blur for Glass panels over the image (render a blurred copy in the GL display
+  pass); for now the panels use a dark translucent base.
 
 - **ETTR-style exposure** (for item 5's noise): drive sensor exposure from the RAW histogram and
   lower the digital gain by the same amount; 2–3 EV more light in daylight, less highlight

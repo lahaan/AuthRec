@@ -3,7 +3,10 @@ package com.authrec
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Shader
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
@@ -18,12 +21,12 @@ import kotlin.math.roundToInt
  *
  * The parts of the range the sensor can't deliver (beyond the camera's exposure compensation,
  * so plain digital gain) are drawn amber, and the value turns amber while [warn] is set (high
- * effective ISO: expect noise).
+ * effective ISO: expect noise). [glass]: drawn in a glass capsule with a glossy knob.
  */
-class ExposureSlider(context: Context, private val onChange: (Float) -> Unit) : View(context) {
+class ExposureSlider(context: Context, private val glass: Boolean = false, private val onChange: (Float) -> Unit) : View(context) {
 
     /** ± range in EV. */
-    var range = 5f
+    var range = CameraActivity.EV_RANGE
     var value = 0f
         private set
     /** EV the sensor can reach; outside it the slider is amber. */
@@ -52,9 +55,24 @@ class ExposureSlider(context: Context, private val onChange: (Float) -> Unit) : 
     private val trackX get() = width - 44f
     private fun yOf(v: Float) = height - pad - (v + range) / (2 * range) * (height - 2 * pad)
 
+    private val capsule = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3f }
+    private val knobGloss = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val knobRing = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 5f; color = 0xFF4FD8FF.toInt() }
+    private val box = RectF()
+
     override fun onDraw(c: Canvas) {
         val x = trackX
-        c.drawText("EV", x, 30f, title)
+        if (glass) {
+            // A glass capsule around the track, like the other Glass controls.
+            box.set(x - 30f, 4f, x + 30f, height - 4f)
+            capsule.shader = LinearGradient(0f, box.top, 0f, box.bottom, 0x50FFFFFF, 0x18FFFFFF, Shader.TileMode.CLAMP)
+            capsule.alpha = 255
+            c.drawRoundRect(box, 30f, 30f, capsule)
+            rim.shader = LinearGradient(0f, box.top, 0f, box.bottom, 0xA0FFFFFF.toInt(), 0x30FFFFFF, Shader.TileMode.CLAMP)
+            c.drawRoundRect(box, 30f, 30f, rim)
+        }
+        c.drawText("EV", x, if (glass) 42f else 30f, title)
         val lo = sensorRange.start.coerceIn(-range, range)
         val hi = sensorRange.endInclusive.coerceIn(-range, range)
         if (lo > -range) c.drawLine(x, yOf(-range), x, yOf(lo), amberLine)
@@ -66,6 +84,11 @@ class ExposureSlider(context: Context, private val onChange: (Float) -> Unit) : 
         }
         val y = yOf(value)
         c.drawCircle(x, y, 20f, knob)
+        if (glass) {
+            knobGloss.shader = LinearGradient(0f, y - 20f, 0f, y + 4f, 0xFFFFFFFF.toInt(), 0x00FFFFFF, Shader.TileMode.CLAMP)
+            c.drawCircle(x, y - 6f, 12f, knobGloss)
+            c.drawCircle(x, y, 20f, knobRing)
+        }
         label.color = if (warn) AMBER else Color.WHITE
         c.drawText("%+.1f".format(value), x - 34f, y + 12f, label)
     }

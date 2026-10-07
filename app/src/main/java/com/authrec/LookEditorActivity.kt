@@ -135,6 +135,7 @@ class LookEditorActivity : Activity() {
         addSlider("Shadow hue", 0f, 360f, { "%.0f°".format(it) }, { params.shadowHue }) { params = params.copy(shadowHue = it) }
         addSlider("Highlight tint", 0f, 1f, ::pct, { params.highlightTint }) { params = params.copy(highlightTint = it) }
         addSlider("Highlight hue", 0f, 360f, { "%.0f°".format(it) }, { params.highlightHue }) { params = params.copy(highlightHue = it) }
+        addColourMixer()
         val mono = Switch(this).apply {
             text = "Black & white"
             setTextColor(Color.WHITE)
@@ -175,12 +176,17 @@ class LookEditorActivity : Activity() {
     private fun pct(v: Float) = "%.0f%%".format(v * 100)
     private fun signedPct(v: Float) = "%+.0f".format(v * 100)
 
-    private fun addSlider(label: String, min: Float, max: Float, format: (Float) -> String, get: () -> Float, set: (Float) -> Unit) {
+    /** [labelPrefix]: for sliders whose target changes (the colour mixer's band). */
+    private fun addSlider(
+        label: String, min: Float, max: Float, format: (Float) -> String, get: () -> Float,
+        labelPrefix: (() -> String)? = null, set: (Float) -> Unit,
+    ) {
         val steps = 1000
         val text = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 12f
         }
+        fun caption() = (labelPrefix?.let { "${it()} " } ?: "") + "$label  ${format(get())}"
         fun toProgress(v: Float) = ((v - min) / (max - min) * steps).toInt().coerceIn(0, steps)
         val bar = SeekBar(this).apply {
             this.max = steps
@@ -189,20 +195,66 @@ class LookEditorActivity : Activity() {
                 override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
                     if (!fromUser) return
                     set(min + (max - min) * p / steps)
-                    text.text = "$label  ${format(get())}"
+                    text.text = caption()
                     render()
                 }
                 override fun onStartTrackingTouch(sb: SeekBar) = Unit
                 override fun onStopTrackingTouch(sb: SeekBar) = Unit
             })
         }
-        text.text = "$label  ${format(get())}"
+        text.text = caption()
         sliders += {
             bar.progress = toProgress(get())
-            text.text = "$label  ${format(get())}"
+            text.text = caption()
         }
         sliderPanel.addView(text)
         sliderPanel.addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+    }
+
+    /** Band the colour mixer sliders edit (index into [Looks.MIX_BANDS]). */
+    private var mixBand = 3
+
+    /** Colour mixer: pick a hue band with the swatches, then its hue / saturation / lightness. */
+    private fun addColourMixer() {
+        sliderPanel.addView(TextView(this).apply {
+            text = "Colour mixer"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(0, 24, 0, 8)
+        })
+        val swatches = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val chips = Looks.MIX_BANDS.mapIndexed { i, (name, hue) ->
+            TextView(this).apply {
+                contentDescription = name
+                setOnClickListener {
+                    mixBand = i
+                    sliders.forEach { it() }
+                }
+                swatches.addView(this, LinearLayout.LayoutParams(0, 64, 1f).apply { setMargins(4, 0, 4, 0) })
+                tag = Color.HSVToColor(floatArrayOf(hue, 0.75f, 0.9f))
+            }
+        }
+        fun paintChips() = chips.forEachIndexed { i, chip ->
+            chip.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = 12f
+                setColor(chip.tag as Int)
+                if (i == mixBand) setStroke(6, Color.WHITE)
+            }
+        }
+        sliders += { paintChips() }
+        paintChips()
+        sliderPanel.addView(swatches, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        fun band(values: List<Float>) = values[mixBand]
+        fun with(values: List<Float>, v: Float) = values.toMutableList().also { it[mixBand] = v }
+        addSlider("Hue", -30f, 30f, { "%+.0f°".format(it) }, { band(params.mixHue) }, labelPrefix = { Looks.MIX_BANDS[mixBand].first }) {
+            params = params.copy(mixHue = with(params.mixHue, it))
+        }
+        addSlider("Saturation", -1f, 1f, ::signedPct, { band(params.mixSat) }, labelPrefix = { Looks.MIX_BANDS[mixBand].first }) {
+            params = params.copy(mixSat = with(params.mixSat, it))
+        }
+        addSlider("Lightness", -1f, 1f, ::signedPct, { band(params.mixLum) }, labelPrefix = { Looks.MIX_BANDS[mixBand].first }) {
+            params = params.copy(mixLum = with(params.mixLum, it))
+        }
     }
 
     private fun setParams(p: LookParams) {

@@ -22,13 +22,11 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
-import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Button
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
@@ -46,13 +44,20 @@ import com.authrec.gl.Renderer
 import com.authrec.record.RecordConfig
 import com.authrec.record.Recorder
 import com.authrec.record.VideoCodec
+import com.authrec.ui.CameraUi
+import com.authrec.ui.ClassicUi
+import com.authrec.ui.GlassUi
+import com.authrec.ui.Stepper
+import com.authrec.ui.UiKit
+import com.authrec.ui.dp
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
  * Live open-gate RAW → log preview with real-time looks/LUTs, and recording to HEVC/H.264 with
- * audio. Two layouts: Simple (look, tap to focus, record) and Pro (everything).
+ * audio. Two modes: Simple (look, tap to focus, record) and Pro (everything); two layouts
+ * ([GlassUi], [ClassicUi]) over the same state and actions, which live here.
  *
  * Looks: built-in film-style presets, looks made in [LookEditorActivity], and imported .cube
  * files (in Android/data/com.authrec/files/luts/).
@@ -62,8 +67,8 @@ import kotlin.math.roundToInt
  */
 class CameraActivity : Activity() {
 
-    /** Entries the View/Look button cycles through. */
-    private sealed class ViewEntry(val label: String) {
+    /** Entries of the look menu. */
+    internal sealed class ViewEntry(val label: String) {
         object LogView : ViewEntry("Log")
         class BuiltIn(val look: Look) : ViewEntry(look.name)
         class UserLook(val look: Look) : ViewEntry("★ ${look.name}")
@@ -72,39 +77,72 @@ class CameraActivity : Activity() {
 
     private val cameraThread = HandlerThread("camera").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
-    private val prefs by lazy { getSharedPreferences("authrec", MODE_PRIVATE) }
+    internal val prefs by lazy { getSharedPreferences("authrec", MODE_PRIVATE) }
 
-    private var camera: RawCamera? = null
+    internal var camera: RawCamera? = null
+        private set
     private var renderer: Renderer? = null
     private var surface: Triple<SurfaceHolder, Int, Int>? = null
     private var displayQuarterTurns = 0
 
-    private var capture = CaptureSettings()
-    private var profile = LogProfile.APPLE_LOG
-    private var views: List<ViewEntry> = listOf(ViewEntry.LogView)
-    private var viewIndex = 1
-    private var codec = VideoCodec.HEVC_10
-    private var bitrateMbps = 150
-    private var bakeLut = false
-    private var superpixel = false
-    private var audioOn = true
-    private var simple = true
+    internal var capture = CaptureSettings()
+        private set
+    internal var profile = LogProfile.APPLE_LOG
+        private set
+    internal var views: List<ViewEntry> = listOf(ViewEntry.LogView)
+        private set
+    internal var viewIndex = 1
+        private set
+    internal var codec = VideoCodec.HEVC_10
+        private set
+    internal var bitrateMbps = 150
+        private set
+    internal var bakeLut = false
+        private set
+    internal var superpixel = false
+        private set
+    internal var audioOn = true
+        private set
+    internal var simple = true
+        private set
     /** See [Renderer.cleanup]. */
-    private var cleanup = 2
+    internal var cleanup = 2
+        private set
     /**
-     * Tone balance of the view, -100..100 (see [Renderer.toneHighlights]). Xiaomi's AE exposes for
-     * the sky and lets its ISP lift the rest; with one global gain our sky goes white in the view
-     * (the log keeps it). "Balance" pulls highlights down and lifts shadows a little.
+     * eDR (extended dynamic range of the view; not HDR): a tone curve that pulls the highlights
+     * down and lifts the shadows before the look/LUT (see [Renderer.toneHighlights]). Xiaomi's AE
+     * exposes for the sky and lets its ISP lift the rest; with one global gain our sky goes white
+     * in the view while the log keeps it. Simple switches it on and off; Pro shapes it with
+     * [edrHighlights] / [edrShadows] (−100..100) on the curve graph.
      */
-    private var toneHighlights = 0
-    private var toneShadows = 0
-    /** User adjustment on top of the automatic per-lens gain before the log curve, in EV. */
+    internal var edrOn = false
+        private set
+    internal var edrHighlights = EDR_HIGHLIGHTS
+        private set
+    internal var edrShadows = EDR_SHADOWS
+        private set
+    /** View adjustments: LUT strength 0..100 %, saturation 0..200 %, vibrance −100..100. */
+    internal var lutStrength = 100
+        private set
+    internal var saturationPct = 100
+        private set
+    internal var vibrancePct = 0
+        private set
+    /** White balance trim on top of the ISP's AWB, −100..100 each (see [setWbShift]). */
+    internal var wbWarmth = 0
+        private set
+    internal var wbTint = 0
+        private set
+    /** The original layout instead of Glass (Settings → Interface). */
+    internal var classicUi = false
+        private set
     /**
-     * The one exposure control (bottom −/+ and the slider show the same value). AUTO/LOCKED: real
+     * The one exposure control (the slider, and the classic layout's −/+). AUTO/LOCKED: real
      * sensor exposure via AE compensation, any remainder below one AE step as digital gain.
      * PRIORITY: shifts our loop's brightness target. MANUAL: digital gain (ISO/shutter are yours).
      */
-    private var exposureEv = 0f
+    internal var exposureEv = 0f
+        private set
 
     /** Limits for AE: Priority. Shutter in ns (fastest = shortest). */
     private data class PriorityLimits(
@@ -116,9 +154,12 @@ class CameraActivity : Activity() {
     )
     private var limits = PriorityLimits()
 
-    private var lenses: List<Lens> = emptyList()
-    private var lensIndex = 0
-    private var scanning = false
+    internal var lenses: List<Lens> = emptyList()
+        private set
+    internal var lensIndex = 0
+        private set
+    internal var scanning = false
+        private set
     private var pendingScan = false
     /** Read by the lens scan's thread to stop when we leave the foreground. */
     @Volatile private var resumed = false
@@ -138,43 +179,36 @@ class CameraActivity : Activity() {
     }
 
     private var recorder: Recorder? = null
-    private var recordStartMs = 0L
-    private var stopping = false
+    internal var recordStartMs = 0L
+        private set
+    internal var stopping = false
+        private set
     private var lastResult: String? = null
 
-    private lateinit var info: TextView
-    private lateinit var recButton: Button
-    private lateinit var lockedWhileRecording: List<View>
-    private lateinit var proOnly: List<View>
-    private lateinit var modeSwitch: Button
-    private lateinit var lensButton: Button
-    private lateinit var profileButton: Button
-    private lateinit var viewButton: Button
-    private lateinit var fpsButton: Button
-    private lateinit var codecButton: Button
-    private lateinit var bitrateButton: Button
-    private lateinit var resButton: Button
-    private lateinit var audioButton: Button
-    private lateinit var bakeButton: Button
-    private lateinit var cleanButton: Button
-    private lateinit var aeButton: Button
-    private lateinit var afButton: Button
-    private lateinit var wbButton: Button
-    private lateinit var evGroup: Stepper
-    private lateinit var isoGroup: Stepper
-    private lateinit var shutterGroup: Stepper
-    private lateinit var lookPanel: LinearLayout
-    private lateinit var focusBar: LinearLayout
+    internal val recording get() = recorder != null
+    /** Frames lost while recording (from the renderer's stats). */
+    internal var droppedFrames = 0
+        private set
+
+    // Views both layouts place; the rest belongs to [ui].
+    internal lateinit var surfaceView: SurfaceView
+        private set
+    internal lateinit var info: TextView
+        private set
+    internal lateinit var focusSquare: View
+        private set
+    internal lateinit var exposureSlider: ExposureSlider
+        private set
+    internal lateinit var focusBar: LinearLayout
+        private set
     private lateinit var focusSeek: SeekBar
     private lateinit var focusLabel: TextView
-    private lateinit var focusSquare: View
-    private lateinit var balanceButton: Button
-    private lateinit var highlightsBar: SeekBar
-    private lateinit var shadowsBar: SeekBar
-    private lateinit var strengthBar: SeekBar
-    private lateinit var saturationBar: SeekBar
-    private lateinit var vibranceBar: SeekBar
-    private lateinit var exposureSlider: ExposureSlider
+    internal lateinit var priorityPanel: LinearLayout
+        private set
+    private lateinit var ui: CameraUi
+    /** Style of the shared panels (priority limits, focus bar), set by [buildUi]. */
+    internal lateinit var kit: UiKit
+        private set
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -194,7 +228,8 @@ class CameraActivity : Activity() {
         if (Manifest.permission.CAMERA !in missing) findLensesThenStart()
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) audioOn = false
-        handleCommands(intent)
+        // A recreate (layout switch) keeps the launching intent; its adb commands already ran.
+        if (savedInstanceState == null) handleCommands(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -206,13 +241,31 @@ class CameraActivity : Activity() {
 
     private fun loadPrefs() {
         simple = prefs.getBoolean("simple", true)
+        classicUi = prefs.getString("uiStyle", "glass") == "classic"
         profile = runCatching { LogProfile.valueOf(prefs.getString("profile", null)!!) }.getOrDefault(LogProfile.APPLE_LOG)
         codec = runCatching { VideoCodec.valueOf(prefs.getString("codec", null)!!) }.getOrDefault(VideoCodec.HEVC_10)
         bitrateMbps = prefs.getInt("bitrate", 150)
         bakeLut = prefs.getBoolean("recordLook", true)
         cleanup = prefs.getInt("cleanup", 2)
-        toneHighlights = prefs.getInt("toneHi", 0)
-        toneShadows = prefs.getInt("toneLo", 0)
+        if (prefs.contains("edrOn")) {
+            edrOn = prefs.getBoolean("edrOn", false)
+            edrHighlights = prefs.getInt("edrHi", EDR_HIGHLIGHTS)
+            edrShadows = prefs.getInt("edrLo", EDR_SHADOWS)
+        } else {
+            // 0.2.2's "Balance" (toneHi / toneLo); its old default becomes eDR's slightly stronger one.
+            val hi = prefs.getInt("toneHi", 0)
+            val lo = prefs.getInt("toneLo", 0)
+            edrOn = hi != 0 || lo != 0
+            if (edrOn && !(hi == -60 && lo == 30)) {
+                edrHighlights = hi
+                edrShadows = lo
+            }
+        }
+        lutStrength = prefs.getInt("lutStrength", 100)
+        saturationPct = prefs.getInt("saturation", 100)
+        vibrancePct = prefs.getInt("vibrance", 0)
+        wbWarmth = prefs.getInt("wbWarm", 0)
+        wbTint = prefs.getInt("wbTint", 0)
         superpixel = prefs.getBoolean("superpixel", false)
         audioOn = prefs.getBoolean("audio", true)
         capture = capture.copy(fps = prefs.getInt("fps", 30))
@@ -227,13 +280,22 @@ class CameraActivity : Activity() {
     private fun savePrefs() {
         prefs.edit()
             .putBoolean("simple", simple)
+            .putString("uiStyle", if (classicUi) "classic" else "glass")
             .putString("profile", profile.name)
             .putString("codec", codec.name)
             .putInt("bitrate", bitrateMbps)
             .putBoolean("recordLook", bakeLut)
             .putInt("cleanup", cleanup)
-            .putInt("toneHi", toneHighlights)
-            .putInt("toneLo", toneShadows)
+            .putBoolean("edrOn", edrOn)
+            .putInt("edrHi", edrHighlights)
+            .putInt("edrLo", edrShadows)
+            .remove("toneHi")
+            .remove("toneLo")
+            .putInt("lutStrength", lutStrength)
+            .putInt("saturation", saturationPct)
+            .putInt("vibrance", vibrancePct)
+            .putInt("wbWarm", wbWarmth)
+            .putInt("wbTint", wbTint)
             .putBoolean("superpixel", superpixel)
             .putBoolean("audio", audioOn)
             .putInt("fps", capture.fps)
@@ -249,34 +311,13 @@ class CameraActivity : Activity() {
 
     // ---- UI ----
 
-    /** "− value +" control. */
-    private inner class Stepper(onStep: (Int) -> Unit) {
-        val minus = smallButton("−") { onStep(-1) }
-        val value = smallButton("") { }.apply { isClickable = false }
-        val plus = smallButton("+") { onStep(1) }
-        val views = listOf(minus, value, plus)
-        var visible: Boolean = true
-            set(v) {
-                field = v
-                views.forEach { it.visibility = if (v) View.VISIBLE else View.GONE }
-            }
-    }
-
-    private fun smallButton(text: String, onClick: () -> Unit) = Button(this).apply {
-        this.text = text
-        isAllCaps = false
-        textSize = 12f
-        minWidth = 0
-        minimumWidth = 0
-        // Compact: the default 48 dp minimum height makes the side columns collide on landscape phones.
-        minHeight = 0
-        minimumHeight = 0
-        setPadding(28, 28, 28, 28)
-        setOnClickListener { onClick() }
-    }
-
+    /**
+     * Builds the views both layouts share (preview with its gestures, info text, focus square,
+     * EV slider, manual focus bar, priority limits), then the chosen layout around them.
+     */
     private fun buildUi() {
-        val surfaceView = SurfaceView(this)
+        kit = UiKit(this, glass = !classicUi)
+        surfaceView = SurfaceView(this)
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) = Unit
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -301,192 +342,24 @@ class CameraActivity : Activity() {
         info = TextView(this).apply {
             setTextColor(Color.WHITE)
             setShadowLayer(4f, 0f, 0f, Color.BLACK)
-            textSize = 12f
+            textSize = if (classicUi) 12f else 11.5f
         }
         focusSquare = View(this).apply {
             background = GradientDrawable().apply { setStroke(4, Color.WHITE) }
             visibility = View.GONE
         }
-
-        recButton = smallButton("") { toggleRecording() }.apply { textSize = 16f }
-        modeSwitch = smallButton("") { setSimple(!simple) }
-        lensButton = smallButton("") { showLensMenu() }
-        profileButton = smallButton("") { cycleProfile() }
-        viewButton = smallButton("") { showViewMenu() }
-        val importButton = smallButton("+ LUT") { pickLut() }
-        balanceButton = smallButton("") {
-            if (toneHighlights == 0 && toneShadows == 0) setTone(BALANCE_HIGHLIGHTS, BALANCE_SHADOWS) else setTone(0, 0)
-        }
-        val lookButton = smallButton("Adjust") {
-            lookPanel.visibility = if (lookPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        }
-        fpsButton = smallButton("") { setCapture(capture.copy(fps = when (capture.fps) { 24 -> 25; 25 -> 30; else -> 24 })) }
-        codecButton = smallButton("") { codec = VideoCodec.entries[(codec.ordinal + 1) % VideoCodec.entries.size]; settingsChanged() }
-        bitrateButton = smallButton("") { bitrateMbps = when (bitrateMbps) { 50 -> 100; 100 -> 150; else -> 50 }; settingsChanged() }
-        resButton = smallButton("") { setSuperpixel(!superpixel) }
-        audioButton = smallButton("") { toggleAudio() }
-        bakeButton = smallButton("") { bakeLut = !bakeLut; settingsChanged() }
-        cleanButton = smallButton("") {
-            cleanup = (cleanup + 1) % 4
-            renderer?.cleanup = cleanup
-            settingsChanged()
-        }
-        prioGear = smallButton("⚙") { priorityPanelOpen = !priorityPanelOpen; updateUi() }
-        aeButton = smallButton("") { cycleAe() }.apply {
-            // Long-press in Priority mode opens the limits.
-            setOnLongClickListener {
-                if (capture.ae == AeMode.PRIORITY) { priorityPanelOpen = !priorityPanelOpen; updateUi() }
-                true
-            }
-        }
-        afButton = smallButton("") { cycleAf() }
-        wbButton = smallButton("") { setCapture(capture.copy(awbLock = !capture.awbLock)) }
-        evGroup = Stepper { stepEv(it) }
-        isoGroup = Stepper { stepIso(it) }
-        shutterGroup = Stepper { stepShutter(it) }
-        lookPanel = buildLookPanel()
-        priorityPanel = buildPriorityPanel()
+        exposureSlider = ExposureSlider(this, glass = !classicUi) { ev -> setExposureEv(ev, fromSlider = true) }
         focusBar = buildFocusBar()
-        exposureSlider = ExposureSlider(this) { ev -> setExposureEv(ev, fromSlider = true) }
+        priorityPanel = buildPriorityPanel()
 
-        fun column(vararg views: View) = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
-        }
-        val exposureBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(aeButton)
-            addView(prioGear)
-            (evGroup.views + isoGroup.views + shutterGroup.views).forEach { addView(it) }
-            addView(afButton)
-            addView(wbButton)
-            addView(fpsButton)
-        }
-        val left = column(profileButton, viewButton, importButton, lookButton, balanceButton)
-        val right = column(recButton, codecButton, bitrateButton, resButton, audioButton, bakeButton, cleanButton)
-        right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
-            val lp = exposureSlider.layoutParams as FrameLayout.LayoutParams
-            val margin = v.width + 48 + 12
-            if (lp.rightMargin != margin) { lp.rightMargin = margin; exposureSlider.requestLayout() }
-        }
-
-        proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, exposureBar)
-        lockedWhileRecording = listOf(profileButton, fpsButton, codecButton, bitrateButton, resButton, audioButton, bakeButton, importButton, modeSwitch, lensButton)
-
-        setContentView(FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-            addView(surfaceView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
-            addView(focusSquare, FrameLayout.LayoutParams(140, 140))
-            addView(info, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
-                setMargins(48, 32, 0, 0)
-            })
-            addView(LinearLayout(this@CameraActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                addView(lensButton)
-                addView(modeSwitch)
-            }, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
-                setMargins(0, 24, 130, 0) // clear of the system's camera-in-use indicator
-            })
-            addView(left, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER_VERTICAL or Gravity.START).apply {
-                setMargins(48, 0, 0, 0)
-            })
-            addView(right, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
-                setMargins(0, 170, 48, 0) // below the lens / mode buttons
-            })
-            addView(exposureBar, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                setMargins(0, 0, 0, 24)
-            })
-            addView(focusBar, FrameLayout.LayoutParams(900, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                setMargins(0, 0, 0, 170)
-            })
-            addView(lookPanel, FrameLayout.LayoutParams(900, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                setMargins(0, 0, 0, 170)
-            })
-            // Beside the right-hand buttons, in the black margin next to the 4:3 image.
-            addView(exposureSlider, FrameLayout.LayoutParams(170, (resources.displayMetrics.heightPixels * 0.62f).toInt(),
-                Gravity.CENTER_VERTICAL or Gravity.END))
-            addView(priorityPanel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                setMargins(0, 0, 0, 170)
-            })
-        })
+        ui = if (classicUi) ClassicUi(this) else GlassUi(this)
+        setContentView(ui.root)
         updateUi()
     }
 
-    private fun buildLookPanel(): LinearLayout {
-        fun slider(label: String, max: Int, initial: Int, format: (Int) -> String, onChange: (Int) -> Unit): Pair<LinearLayout, SeekBar> {
-            val text = TextView(this).apply {
-                setTextColor(Color.WHITE)
-                textSize = 12f
-                minWidth = 260
-            }
-            val bar = SeekBar(this).apply {
-                this.max = max
-                progress = initial
-                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
-                        text.text = "$label ${format(p)}"
-                        onChange(p)
-                    }
-                    override fun onStartTrackingTouch(sb: SeekBar) = Unit
-                    override fun onStopTrackingTouch(sb: SeekBar) = Unit
-                })
-            }
-            text.text = "$label ${format(initial)}"
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                addView(text)
-                addView(bar, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            }
-            return row to bar
-        }
-        val (hiRow, hi) = slider("Highlights", 200, toneHighlights + 100, { "%+d".format(it - 100) }) {
-            if (it - 100 != toneHighlights) setTone(it - 100, toneShadows)
-        }
-        val (loRow, lo) = slider("Shadows", 200, toneShadows + 100, { "%+d".format(it - 100) }) {
-            if (it - 100 != toneShadows) setTone(toneHighlights, it - 100)
-        }
-        highlightsBar = hi
-        shadowsBar = lo
-        val (strengthRow, s) = slider("LUT strength", 100, 100, { "$it%" }) { renderer?.lutStrength = it / 100f }
-        val (satRow, sat) = slider("Saturation", 200, 100, { "$it%" }) { renderer?.saturation = it / 100f }
-        val (vibRow, vib) = slider("Vibrance", 200, 100, { "%+d".format(it - 100) }) { renderer?.vibrance = (it - 100) / 100f }
-        strengthBar = s
-        saturationBar = sat
-        vibranceBar = vib
-        val buttons = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(smallButton("Reset") {
-                setTone(0, 0)
-                strengthBar.progress = 100
-                saturationBar.progress = 100
-                vibranceBar.progress = 100
-            })
-            addView(smallButton("Edit look / make LUT…") { openLookEditor() })
-        }
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xB0000000.toInt())
-            setPadding(32, 16, 32, 16)
-            visibility = View.GONE
-            addView(hiRow)
-            addView(loRow)
-            addView(strengthRow)
-            addView(satRow)
-            addView(vibRow)
-            addView(buttons)
-        }
-    }
-
     private fun buildFocusBar(): LinearLayout {
-        focusLabel = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            minWidth = 200
-        }
-        focusSeek = SeekBar(this).apply {
-            max = 1000
+        focusLabel = kit.label(size = 12f).apply { minWidth = dp(76) }
+        focusSeek = kit.seekBar(1000, 0).apply {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
                     if (!fromUser) return
@@ -499,18 +372,17 @@ class CameraActivity : Activity() {
                 override fun onStopTrackingTouch(sb: SeekBar) = Unit
             })
         }
-        return LinearLayout(this).apply {
+        return kit.panel().apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(0xB0000000.toInt())
-            setPadding(32, 8, 32, 8)
+            if (classicUi) setPadding(32, 8, 32, 8)
             addView(focusLabel)
             addView(focusSeek, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
     }
 
-    private fun setExposureEv(ev: Float, fromSlider: Boolean = false) {
-        exposureEv = (Math.round(ev * 10) / 10f).coerceIn(-5f, 5f)
+    internal fun setExposureEv(ev: Float, fromSlider: Boolean = false) {
+        exposureEv = (Math.round(ev * 10) / 10f).coerceIn(-EV_RANGE, EV_RANGE)
         applyExposure()
         updateUi()
         // While dragging, save once the finger has settled.
@@ -520,21 +392,70 @@ class CameraActivity : Activity() {
 
     private val saveSoon = Runnable { savePrefs() }
 
-    /** Tone balance of the view (both -100..100); the Balance button and the Adjust sliders. */
-    private fun setTone(highlights: Int, shadows: Int) {
-        toneHighlights = highlights.coerceIn(-100, 100)
-        toneShadows = shadows.coerceIn(-100, 100)
-        applyTone()
-        if (highlightsBar.progress != toneHighlights + 100) highlightsBar.progress = toneHighlights + 100
-        if (shadowsBar.progress != toneShadows + 100) shadowsBar.progress = toneShadows + 100
-        updateUi()
+    /** Saves a second after the last change (sliders send many). */
+    private fun saveSoon() {
         info.removeCallbacks(saveSoon)
         info.postDelayed(saveSoon, 1000)
     }
 
+    /** eDR on/off with the current curve. */
+    internal fun setEdr(on: Boolean) {
+        edrOn = on
+        applyTone()
+        updateUi()
+        saveSoon()
+    }
+
+    /** Shapes the eDR curve (both −100..100) and switches it on. */
+    internal fun setEdrCurve(highlights: Int, shadows: Int) {
+        edrHighlights = highlights.coerceIn(-100, 100)
+        edrShadows = shadows.coerceIn(-100, 100)
+        edrOn = true
+        applyTone()
+        updateUi()
+        saveSoon()
+    }
+
+    internal fun resetEdrCurve() = setEdrCurve(EDR_HIGHLIGHTS, EDR_SHADOWS)
+
     private fun applyTone() {
-        renderer?.toneHighlights = toneHighlights / 100f
-        renderer?.toneShadows = toneShadows / 100f
+        renderer?.toneHighlights = if (edrOn) edrHighlights / 100f else 0f
+        renderer?.toneShadows = if (edrOn) edrShadows / 100f else 0f
+    }
+
+    /** LUT strength (0..100 %), saturation (0..200 %), vibrance (−100..100) of the view. */
+    internal fun setLookAdjust(strength: Int = lutStrength, saturation: Int = saturationPct, vibrance: Int = vibrancePct) {
+        lutStrength = strength.coerceIn(0, 100)
+        saturationPct = saturation.coerceIn(0, 200)
+        vibrancePct = vibrance.coerceIn(-100, 100)
+        applyLookAdjust()
+        updateUi()
+        saveSoon()
+    }
+
+    private fun applyLookAdjust() {
+        renderer?.lutStrength = lutStrength / 100f
+        renderer?.saturation = saturationPct / 100f
+        renderer?.vibrance = vibrancePct / 100f
+    }
+
+    /**
+     * White balance trim on top of the ISP's AWB (Xiaomi's leans green or magenta now and then):
+     * warmth ±100 = about ±0.5 EV between red and blue, tint ±100 = ±0.25 EV of green (+ = magenta).
+     * Applied like the ISP's own gains, so it's in the recorded log as well.
+     */
+    internal fun setWbShift(warmth: Int, tint: Int) {
+        wbWarmth = warmth.coerceIn(-100, 100)
+        wbTint = tint.coerceIn(-100, 100)
+        applyWbShift()
+        updateUi()
+        saveSoon()
+    }
+
+    private fun applyWbShift() {
+        val w = Math.pow(2.0, wbWarmth / 100.0 * 0.25).toFloat()
+        val g = Math.pow(2.0, -wbTint / 100.0 * 0.25).toFloat()
+        renderer?.wbShift = floatArrayOf(w, g, g, 1f / w)
     }
 
     /** Routes [exposureEv] to sensor exposure or digital gain depending on the AE mode. */
@@ -562,69 +483,41 @@ class CameraActivity : Activity() {
         focusLabel.text = "MF  " + if (d < 0.05f) "∞" else "%.2f m".format(1 / d)
     }
 
-    private fun updateUi() {
-        val recording = recorder != null
-        recButton.text = when {
-            stopping -> "Saving…"
-            warmingUp -> "Starting…"
-            recording -> "■ STOP"
-            else -> "● REC"
-        }
-        recButton.setTextColor(if (recording) Color.RED else Color.WHITE)
-        recButton.isEnabled = !stopping
-        lockedWhileRecording.forEach { it.isEnabled = !recording && !stopping && !warmingUp }
-        proOnly.forEach { it.visibility = if (simple) View.GONE else View.VISIBLE }
-        modeSwitch.text = if (simple) "Pro ▸" else "Simple ▸"
-        // Always shown, even with one lens: its menu is also where Rescan and Send diagnostics live.
-        lensButton.text = lenses.getOrNull(lensIndex)?.label?.takeIf { it.isNotEmpty() } ?: "Lens"
+    internal fun hasAfLens() = (camera?.info?.minFocusDiopters ?: 1f) > 0f
 
-        profileButton.text = profile.label
-        viewButton.text = if (simple) "Look: ${views.getOrNull(viewIndex)?.label}" else "View: ${views.getOrNull(viewIndex)?.label}"
-        fpsButton.text = "${capture.fps} fps"
-        codecButton.text = codec.label
-        bitrateButton.text = "$bitrateMbps Mbps"
-        resButton.text = if (simple) (if (superpixel) "2K" else "4K") else if (superpixel) "Superpixel 2K" else "Open gate 4K"
-        audioButton.text = if (audioOn) "Audio: on" else "Audio: off"
-        balanceButton.text = when {
-            toneHighlights == 0 && toneShadows == 0 -> "Balance: off"
-            toneHighlights == BALANCE_HIGHLIGHTS && toneShadows == BALANCE_SHADOWS -> "Balance: on"
-            else -> "Balance: %+d / %+d".format(toneHighlights, toneShadows)
-        }
-        // It shapes looks and LUTs; the plain log view shows the log as recorded.
-        balanceButton.isEnabled = views.getOrNull(viewIndex) !is ViewEntry.LogView
-        bakeButton.text = if (bakeLut) "Record: Look" else "Record: Log"
-        cleanButton.text = when (cleanup) {
-            0 -> "Clean: off"
-            1 -> "Clean: pixels"
-            2 -> "Clean: + colour"
-            else -> "Clean: + colour+"
-        }
+    /** Manual focus (Pro, on a lens that can focus): the focus bar and peaking show. */
+    internal val manualFocus get() = capture.af == AfMode.MANUAL && !simple && hasAfLens()
 
-        aeButton.text = when (capture.ae) {
-            AeMode.AUTO -> "AE: Auto"
-            AeMode.LOCKED -> "AE: Locked"
-            AeMode.MANUAL -> "Manual"
-            AeMode.PRIORITY -> "AE: Priority"
-        }
-        afButton.text = when (capture.af) {
-            AfMode.CONTINUOUS -> "AF: Auto"
-            AfMode.TAP -> if (tapTracking) "AF: Auto" else "AF: Locked"
-            AfMode.MANUAL -> "MF"
-            AfMode.SOFTWARE -> if (softContinuous) "AF: Auto" else "AF: Locked"
-        }
-        wbButton.text = if (capture.awbLock) "WB: Locked" else "WB: Auto"
-        val manual = capture.ae == AeMode.MANUAL
-        evGroup.visible = capture.ae != AeMode.MANUAL
-        isoGroup.visible = manual
-        shutterGroup.visible = manual
-        evGroup.value.text = "EV %+.1f".format(exposureEv)
-        isoGroup.value.text = "ISO ${capture.iso}"
-        val denom = (1e9 / capture.exposureNs).toInt()
-        shutterGroup.value.text = "1/$denom" + if (abs(denom - 2 * capture.fps) <= 1) " (180°)" else ""
+    /** The AF state as the controls name it. */
+    internal fun afLabel() = when (capture.af) {
+        AfMode.CONTINUOUS -> "AF: Auto"
+        AfMode.TAP -> if (tapTracking) "AF: Auto" else "AF: Locked"
+        AfMode.MANUAL -> "MF"
+        AfMode.SOFTWARE -> if (softContinuous) "AF: Auto" else "AF: Locked"
+    }
 
-        val hasAf = (camera?.info?.minFocusDiopters ?: 1f) > 0f
-        afButton.visibility = if (hasAf && !simple) View.VISIBLE else View.GONE
-        val mf = capture.af == AfMode.MANUAL && !simple && hasAf
+    internal fun aeLabel() = when (capture.ae) {
+        AeMode.AUTO -> "AE: Auto"
+        AeMode.LOCKED -> "AE: Locked"
+        AeMode.MANUAL -> "Manual"
+        AeMode.PRIORITY -> "AE: Priority"
+    }
+
+    internal fun cleanupLabel() = when (cleanup) {
+        0 -> "Clean: off"
+        1 -> "Clean: pixels"
+        2 -> "Clean: + colour"
+        else -> "Clean: + colour+"
+    }
+
+    internal fun currentView() = views.getOrNull(viewIndex)
+
+    /** eDR shapes looks and LUTs; the plain log view shows the log as recorded. */
+    internal fun edrAvailable() = currentView() !is ViewEntry.LogView
+
+    internal fun updateUi() {
+        if (!::ui.isInitialized) return
+        val mf = manualFocus
         focusBar.visibility = if (mf) View.VISIBLE else View.GONE
         if (mf) {
             val min = camera?.info?.minFocusDiopters ?: 0f
@@ -636,36 +529,62 @@ class CameraActivity : Activity() {
         exposureSlider.setValue(exposureEv)
         exposureSlider.sensorRange = when (capture.ae) {
             // Beyond the AE compensation range the rest is digital gain.
-            AeMode.AUTO, AeMode.LOCKED -> camera?.info?.let { it.evRange.lower * it.evStep..it.evRange.upper * it.evStep } ?: -5f..5f
-            AeMode.PRIORITY -> -5f..5f
+            AeMode.AUTO, AeMode.LOCKED -> camera?.info?.let { it.evRange.lower * it.evStep..it.evRange.upper * it.evStep } ?: -EV_RANGE..EV_RANGE
+            AeMode.PRIORITY -> -EV_RANGE..EV_RANGE
             AeMode.MANUAL -> 0f..0f // all digital gain: ISO and shutter are set by hand
         }
-        (lookPanel.layoutParams as FrameLayout.LayoutParams).bottomMargin = if (simple) 120 else 170
-        lookPanel.requestLayout()
         priorityPanel.visibility = if (!simple && capture.ae == AeMode.PRIORITY && priorityPanelOpen) View.VISIBLE else View.GONE
-        prioGear.visibility = if (capture.ae == AeMode.PRIORITY) View.VISIBLE else View.GONE
         updatePriorityPanel()
+        ui.update()
     }
 
-    private fun settingsChanged() {
+    internal fun settingsChanged() {
         savePrefs()
         updateUi()
     }
 
-    private fun setSimple(on: Boolean) {
+    internal fun setSimple(on: Boolean) {
         simple = on
         // Simple mode is fully automatic.
         if (on) setCapture(capture.copy(ae = AeMode.AUTO, af = AfMode.CONTINUOUS, focusPoint = null, evSteps = 0, awbLock = false))
         settingsChanged()
     }
 
+    /** Switches between the Glass and Classic layouts (the screen is rebuilt; the camera reopens). */
+    internal fun setClassicUi(on: Boolean) {
+        if (on == classicUi || recording) return
+        classicUi = on
+        savePrefs()
+        recreate()
+    }
+
+    internal fun cycleFps() = setCapture(capture.copy(fps = when (capture.fps) { 24 -> 25; 25 -> 30; else -> 24 }))
+    internal fun setFps(fps: Int) = setCapture(capture.copy(fps = fps))
+    internal fun cycleCodec() = setCodec(VideoCodec.entries[(codec.ordinal + 1) % VideoCodec.entries.size])
+    internal fun setCodec(c: VideoCodec) { codec = c; settingsChanged() }
+    internal fun cycleBitrate() = setBitrate(when (bitrateMbps) { 50 -> 100; 100 -> 150; else -> 50 })
+    internal fun setBitrate(mbps: Int) { bitrateMbps = mbps; settingsChanged() }
+    internal fun setBake(on: Boolean) { bakeLut = on; settingsChanged() }
+    internal fun cycleCleanup() = setCleanup((cleanup + 1) % 4)
+    internal fun setCleanup(level: Int) {
+        cleanup = level.coerceIn(0, 3)
+        renderer?.cleanup = cleanup
+        settingsChanged()
+    }
+    internal fun toggleAwbLock() = setCapture(capture.copy(awbLock = !capture.awbLock))
+    internal fun togglePriorityPanel() {
+        priorityPanelOpen = !priorityPanelOpen
+        updateUi()
+    }
+
+
     // ---- Focus ----
 
     private fun onPreviewTap(x: Float, y: Float, lock: Boolean) {
         // A tap on the image first dismisses any open panel.
-        if (priorityPanelOpen || lookPanel.visibility == View.VISIBLE) {
+        val closed = ui.dismissPanels()
+        if (priorityPanelOpen || closed) {
             priorityPanelOpen = false
-            lookPanel.visibility = View.GONE
             updateUi()
             return
         }
@@ -702,7 +621,7 @@ class CameraActivity : Activity() {
         window.decorView.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
 
     /** Double-tap: focus (and metering) back to the whole scene, automatic. */
-    private fun resetFocusToAuto() {
+    internal fun resetFocusToAuto() {
         focusSquare.visibility = View.GONE
         if (capture.af == AfMode.MANUAL && !simple) return
         stopSpotWatch()
@@ -851,7 +770,7 @@ class CameraActivity : Activity() {
     }
 
     /** Auto ⇄ MF (a tap anywhere gives Tap). Same on every lens, whoever runs the autofocus. */
-    private fun cycleAf() {
+    internal fun cycleAf() {
         val soft = usesSoftwareAf()
         Log.d(TAG, "cycleAf from ${capture.af} soft=$soft continuous=$softContinuous")
         focusSquare.visibility = View.GONE
@@ -887,7 +806,7 @@ class CameraActivity : Activity() {
 
     // ---- Exposure ----
 
-    private fun setCapture(newSettings: CaptureSettings, updateUiNow: Boolean = true) {
+    internal fun setCapture(newSettings: CaptureSettings, updateUiNow: Boolean = true) {
         var settings = newSettings
         val fpsChanged = settings.fps != capture.fps
         val priorityStarted = settings.ae == AeMode.PRIORITY && capture.ae != AeMode.PRIORITY
@@ -912,13 +831,15 @@ class CameraActivity : Activity() {
         if (updateUiNow) updateUi()
     }
 
-    private fun cycleAe() {
-        val next = when (capture.ae) {
-            AeMode.AUTO -> AeMode.PRIORITY
-            AeMode.PRIORITY -> AeMode.LOCKED
-            AeMode.LOCKED -> AeMode.MANUAL
-            AeMode.MANUAL -> AeMode.AUTO
-        }
+    internal fun cycleAe() = setAe(when (capture.ae) {
+        AeMode.AUTO -> AeMode.PRIORITY
+        AeMode.PRIORITY -> AeMode.LOCKED
+        AeMode.LOCKED -> AeMode.MANUAL
+        AeMode.MANUAL -> AeMode.AUTO
+    })
+
+    internal fun setAe(next: AeMode) {
+        if (next == capture.ae) return
         if (next == AeMode.MANUAL) {
             // Start manual from what auto exposure was just doing, snapped to the nearest stops.
             val meta = camera?.latestMeta
@@ -928,6 +849,18 @@ class CameraActivity : Activity() {
         } else {
             setCapture(capture.copy(ae = next))
         }
+    }
+
+    /** ISO by hand (the Glass ISO dial): manual exposure, keeping the shutter auto exposure chose. */
+    internal fun setManualIso(iso: Int) {
+        setAe(AeMode.MANUAL)
+        setCapture(capture.copy(iso = iso))
+    }
+
+    /** Shutter by hand (the Glass shutter dial): manual exposure, keeping the ISO auto exposure chose. */
+    internal fun setManualShutter(ns: Long) {
+        setAe(AeMode.MANUAL)
+        setCapture(capture.copy(exposureNs = ns))
     }
 
     // ---- AE: Priority (our own exposure loop inside user limits) ----
@@ -962,8 +895,7 @@ class CameraActivity : Activity() {
 
     private var priorityTarget = DEFAULT_PRIORITY_TARGET
     private var priorityAtLimit = false
-    private var priorityPanelOpen = false
-    private lateinit var prioGear: Button
+    internal var priorityPanelOpen = false
 
     /** Exposure (ISO × ns) → (ISO, shutter ns) inside [limits] (and the sensor's own range). */
     private fun splitExposure(e: Double): Pair<Int, Long> {
@@ -990,7 +922,6 @@ class CameraActivity : Activity() {
         return iso.toInt() to t.toLong()
     }
 
-    private lateinit var priorityPanel: LinearLayout
     private lateinit var prioFast: Stepper
     private lateinit var prioSlow: Stepper
     private lateinit var prioIsoMin: Stepper
@@ -1008,49 +939,47 @@ class CameraActivity : Activity() {
             val i = stops.indexOfFirst { it >= current }.let { if (it < 0) stops.lastIndex else it }
             return stops[(i + dir).coerceIn(0, stops.lastIndex)]
         }
-        prioFast = Stepper { d ->
+        prioFast = Stepper(kit) { d ->
             val v = stepShutterLimit(limits.fastestNs, d)
             limits = limits.copy(fastestNs = v, slowestNs = maxOf(limits.slowestNs, v))
             limitsChanged()
         }
-        prioSlow = Stepper { d ->
+        prioSlow = Stepper(kit) { d ->
             val v = stepShutterLimit(limits.slowestNs, d)
             limits = limits.copy(slowestNs = v, fastestNs = minOf(limits.fastestNs, v))
             limitsChanged()
         }
-        prioIsoMin = Stepper { d ->
+        prioIsoMin = Stepper(kit) { d ->
             val v = stepIsoLimit(limits.isoMin, d)
             limits = limits.copy(isoMin = v, isoMax = maxOf(limits.isoMax, v))
             limitsChanged()
         }
-        prioIsoMax = Stepper { d ->
+        prioIsoMax = Stepper(kit) { d ->
             val v = stepIsoLimit(limits.isoMax, d)
             limits = limits.copy(isoMax = v, isoMin = minOf(limits.isoMin, v))
             limitsChanged()
         }
-        prioPrefer = smallButton("") {
+        prioPrefer = kit.button("") {
             limits = limits.copy(preferLowIso = !limits.preferLowIso)
             limitsChanged()
         }
         fun row(label: String, a: Stepper, b: Stepper) = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(TextView(this@CameraActivity).apply { text = label; setTextColor(Color.WHITE); textSize = 12f; minWidth = 150 })
-            a.views.forEach { addView(it) }
-            addView(TextView(this@CameraActivity).apply { text = "  to  "; setTextColor(Color.LTGRAY); textSize = 12f })
-            b.views.forEach { addView(it) }
+            addView(kit.label(label).apply { minWidth = dp(56) })
+            a.addTo(this)
+            addView(kit.label("  to  ", dim = true))
+            b.addTo(this)
         }
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xB0000000.toInt())
-            setPadding(24, 12, 24, 12)
+        return kit.panel().apply {
+            if (classicUi) setPadding(24, 12, 24, 12)
             visibility = View.GONE
             addView(row("Shutter", prioFast, prioSlow))
             addView(row("ISO", prioIsoMin, prioIsoMax))
             addView(LinearLayout(this@CameraActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 addView(prioPrefer)
-                addView(smallButton("✕ Done") { priorityPanelOpen = false; updateUi() })
+                addView(kit.button("✕ Done") { priorityPanelOpen = false; updateUi() })
             })
         }
     }
@@ -1061,7 +990,7 @@ class CameraActivity : Activity() {
     }
 
     private fun updatePriorityPanel() {
-        if (!::priorityPanel.isInitialized) return
+        if (!::prioPrefer.isInitialized) return
         prioFast.value.text = "1/${(1e9 / limits.fastestNs).roundToInt()}"
         prioSlow.value.text = "1/${(1e9 / limits.slowestNs).roundToInt()}"
         prioIsoMin.value.text = "${limits.isoMin}"
@@ -1076,32 +1005,32 @@ class CameraActivity : Activity() {
             .map { 1_000_000_000L / it }.filter { it <= frameNs }.distinct().sortedDescending()
     }
 
-    private fun stepEv(dir: Int) {
+    internal fun stepEv(dir: Int) {
         val step = camera?.info?.evStep ?: (1f / 3)
         setExposureEv(exposureEv + dir * step)
     }
 
-    private fun stepIso(dir: Int) {
+    internal fun stepIso(dir: Int) {
         val stops = isoStops()
         val i = stops.indexOfFirst { it >= capture.iso }.let { if (it < 0) stops.lastIndex else it }
         setCapture(capture.copy(iso = stops[(i + dir).coerceIn(0, stops.lastIndex)]))
     }
 
     /** dir +1 = faster shutter. */
-    private fun stepShutter(dir: Int) {
+    internal fun stepShutter(dir: Int) {
         val stops = shutterStops() // longest first
         val i = stops.indexOfFirst { it <= capture.exposureNs }.let { if (it < 0) stops.lastIndex else it }
         setCapture(capture.copy(exposureNs = stops[(i + dir).coerceIn(0, stops.lastIndex)]))
     }
 
-    private fun isoStops(): List<Int> {
+    internal fun isoStops(): List<Int> {
         val range = camera?.info?.isoRange ?: return listOf(capture.iso)
         val stops = listOf(50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400)
         return (stops.filter { it in range.lower..range.upper } + range.upper).distinct().sorted()
     }
 
     /** Shutter times that fit in one frame at the current fps, longest first; includes 180° (1/2fps). */
-    private fun shutterStops(): List<Long> {
+    internal fun shutterStops(): List<Long> {
         val frameNs = 1_000_000_000L / capture.fps
         val minNs = camera?.info?.exposureRangeNs?.lower ?: 100_000L
         val denoms = (listOf(24, 25, 30, 48, 50, 60, 100, 120, 125, 250, 500, 1000, 2000, 4000, 8000) + 2 * capture.fps).distinct()
@@ -1147,7 +1076,7 @@ class CameraActivity : Activity() {
                 selectSavedLens()
                 cameraFailures = 0
                 sessionVariant = 0
-                lastResult = "Found ${found.size} lens${if (found.size == 1) "" else "es"}: " + found.joinToString { it.label }
+                note("Found ${found.size} lens${if (found.size == 1) "" else "es"}: " + found.joinToString { it.label })
                 setupPipeline()
                 if (resumed) camera?.open(capture)
                 updateUi()
@@ -1177,7 +1106,7 @@ class CameraActivity : Activity() {
     }
 
     /** Backups only show in the menu while their native route has failed (or they're in use). */
-    private fun inMenu(i: Int): Boolean {
+    internal fun inMenu(i: Int): Boolean {
         val l = lenses[i]
         val native = twinOf(l)?.takeIf { l.zoomRatio == 1f } ?: return true
         return i == lensIndex || native.key in nativeFailed
@@ -1196,10 +1125,13 @@ class CameraActivity : Activity() {
         return true
     }
 
+    /** Lenses in menu order: back lenses by focal length, front last. */
+    internal fun lensOrder(): List<Int> = lenses.indices.sortedWith(compareBy({ lenses[it].front }, { lenses[it].equivFocalMm })).filter { inMenu(it) }
+
     /** Drop-down of all working lenses (back lenses in zoom order, front last) plus a rescan. */
-    private fun showLensMenu() {
+    internal fun showLensMenu(anchor: View = ui.lensAnchor) {
         if (recorder != null || stopping) return
-        val menu = android.widget.PopupMenu(this, lensButton)
+        val menu = android.widget.PopupMenu(this, anchor)
         // Lenses can't be switched mid-scan, but a report can always be sent.
         val order = if (scanning) emptyList() else lenses.indices.sortedWith(compareBy({ lenses[it].front }, { lenses[it].equivFocalMm }))
         order.filter { inMenu(it) }.forEachIndexed { pos, i ->
@@ -1210,14 +1142,13 @@ class CameraActivity : Activity() {
         if (!scanning) menu.menu.add(1, RESCAN_ITEM, order.size, "Rescan lenses")
         menu.menu.add(1, DIAGNOSTICS_ITEM, order.size + 1, "Send diagnostics…")
         if (!scanning) menu.menu.add(1, BENCH_ITEM, order.size + 2, "Run capability bench")
+        menu.menu.add(1, STYLE_ITEM, order.size + 3, if (classicUi) "Switch to the Glass layout" else "Switch to the Classic layout")
         menu.setOnMenuItemClickListener { item ->
             when {
                 item.itemId == RESCAN_ITEM -> rescanLenses()
-                item.itemId == DIAGNOSTICS_ITEM -> Thread {
-                    runCatching { Diagnostics.share(this) }
-                        .onFailure { e -> runOnUiThread { lastResult = "Diagnostics failed: ${e.message}" } }
-                }.start()
-                item.itemId == BENCH_ITEM -> startActivity(Intent(this, com.authrec.bench.BenchActivity::class.java))
+                item.itemId == DIAGNOSTICS_ITEM -> sendDiagnostics()
+                item.itemId == BENCH_ITEM -> openBench()
+                item.itemId == STYLE_ITEM -> setClassicUi(!classicUi)
                 item.itemId != lensIndex -> {
                     nativeFailed -= lenses[item.itemId].key
                     switchLens(item.itemId)
@@ -1228,9 +1159,16 @@ class CameraActivity : Activity() {
         menu.show()
     }
 
+    internal fun sendDiagnostics() = Thread {
+        runCatching { Diagnostics.share(this) }
+            .onFailure { e -> runOnUiThread { lastResult = "Diagnostics failed: ${e.message}" } }
+    }.start()
+
+    internal fun openBench() = startActivity(Intent(this, com.authrec.bench.BenchActivity::class.java))
+
     /** Drop-down of every look and LUT. */
-    private fun showViewMenu() {
-        val menu = android.widget.PopupMenu(this, viewButton)
+    internal fun showViewMenu(anchor: View = ui.lookAnchor) {
+        val menu = android.widget.PopupMenu(this, anchor)
         views.forEachIndexed { i, v ->
             if (simple && v is ViewEntry.LogView) return@forEachIndexed
             val group = when (v) {
@@ -1249,9 +1187,11 @@ class CameraActivity : Activity() {
             sub.add(5, LUT_INPUT_BASE, 0, (if (current == null) "● " else "") + "Our log as is (no conversion)")
             LogProfile.entries.forEach { p -> sub.add(5, LUT_INPUT_BASE + 1 + p.ordinal, p.ordinal + 1, (if (current == p) "● " else "") + p.label) }
         }
+        if (!simple) menu.menu.add(6, IMPORT_ITEM, views.size + 1, "Import a .cube LUT…")
         menu.setOnMenuItemClickListener { item ->
             when {
                 item.itemId == LUT_INPUT_MENU -> return@setOnMenuItemClickListener false // opens the submenu
+                item.itemId == IMPORT_ITEM -> pickLut()
                 item.itemId >= LUT_INPUT_BASE -> {
                     val p = LogProfile.entries.getOrNull(item.itemId - LUT_INPUT_BASE - 1)
                     prefs.edit().putString("lutInput:${cube?.file?.name}", p?.name ?: "NONE").apply()
@@ -1285,7 +1225,7 @@ class CameraActivity : Activity() {
         }
     }
 
-    private fun rescanLenses() {
+    internal fun rescanLenses() {
         if (recorder != null || scanning) return
         EventLog.log("Rescan requested")
         teardownPipeline()
@@ -1293,7 +1233,7 @@ class CameraActivity : Activity() {
     }
 
     /** Switches to lens [index] with a fresh start (failure count, session layout). */
-    private fun switchLens(index: Int, remember: Boolean = true) {
+    internal fun switchLens(index: Int, remember: Boolean = true) {
         val l = lenses.getOrNull(index) ?: return
         EventLog.log("Switching to ${l.label} (${l.key})")
         lensIndex = index
@@ -1380,6 +1320,16 @@ class CameraActivity : Activity() {
         showMessage("Camera failed: $reason. Lens button → Rescan lenses, or Send diagnostics")
     }
 
+    /**
+     * A passing status line (clip saved, lenses found): Glass lets it go after a few seconds, the
+     * classic layout keeps it until the next one, as it always did.
+     */
+    private fun note(msg: String) {
+        lastResult = msg
+        // The stats line redraws every second while frames flow, which drops it from view.
+        if (!classicUi) info.postDelayed({ if (lastResult == msg) lastResult = null }, 8000)
+    }
+
     /** Shows [msg] now (the stats line, which normally carries it, only updates while frames flow). */
     private fun showMessage(msg: String) {
         lastResult = msg
@@ -1406,11 +1356,14 @@ class CameraActivity : Activity() {
         r.profile = profile
         r.superpixel = superpixel
         r.cleanup = cleanup
-        r.toneHighlights = toneHighlights / 100f
-        r.toneShadows = toneShadows / 100f
-        applyExposure()
         camera = cam
         renderer = r
+        // After the swap: these write to the current renderer (exposure was lost on lens switches
+        // when it ran before it, e.g. Manual's digital EV).
+        applyTone()
+        applyLookAdjust()
+        applyWbShift()
+        applyExposure()
         refreshViews(selectLabel = prefs.getString("view", null))
         applyView()
         attachSurface()
@@ -1451,8 +1404,10 @@ class CameraActivity : Activity() {
                 when {
                     // Frames of this open have arrived and then stopped.
                     last >= cam.openRequestedMs && now - last > 2500 -> onCameraFailure(cam, "no frames for 2.5 s")
-                    // None yet since the (re)open.
-                    last < cam.openRequestedMs && now - cam.openRequestedMs > 6000 -> onCameraFailure(cam, "no frames after opening")
+                    // None yet since the (re)open. Logical cameras can take seconds to switch to a zoom
+                    // route's lens (15 Ultra periscope: 4.2 s).
+                    last < cam.openRequestedMs && now - cam.openRequestedMs > (if (cam.zoomRouted) 10_000 else 6000) ->
+                        onCameraFailure(cam, "no frames after opening")
                     cameraFailures > 0 && last >= cam.openRequestedMs && now - cam.openRequestedMs > 5000 && now - last < 500 -> {
                         EventLog.log("Lens ${lenses.getOrNull(lensIndex)?.key} streaming again (layout $sessionVariant)")
                         cameraFailures = 0
@@ -1497,13 +1452,13 @@ class CameraActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun setSuperpixel(on: Boolean) {
+    internal fun setSuperpixel(on: Boolean) {
         superpixel = on
         renderer?.superpixel = on
         settingsChanged()
     }
 
-    private fun toggleAudio() {
+    internal fun toggleAudio() {
         if (!audioOn && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_PERMISSIONS)
             return
@@ -1564,10 +1519,11 @@ class CameraActivity : Activity() {
 
     // ---- Recording ----
 
-    private fun toggleRecording() = if (recorder == null && !warmingUp) startRecording() else stopRecording()
+    internal fun toggleRecording() = if (recorder == null && !warmingUp) startRecording() else stopRecording()
 
     /** Between pressing REC and the first recorded frame while the pipeline warms up at full resolution. */
-    private var warmingUp = false
+    internal var warmingUp = false
+        private set
     private val startAfterWarmUp = Runnable {
         if (warmingUp) {
             warmingUp = false
@@ -1607,7 +1563,8 @@ class CameraActivity : Activity() {
         recordStartMs = SystemClock.elapsedRealtime()
         lastResult = null
         EventLog.log("Recording ${w}x$h ${codec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
-            "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, tone $toneHighlights/$toneShadows, " +
+            "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, " +
+            "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, WB shift $wbWarmth/$wbTint, " +
             "battery %.1f °C".format(batteryTempC))
         // In simple mode the recording is what you see, so bake the look in.
         r.startRecording(rec, capture.fps, bakeLut || simple) { err ->
@@ -1643,7 +1600,7 @@ class CameraActivity : Activity() {
                 EventLog.log("Recording: $msg → ${result.uri}")
                 runOnUiThread {
                     stopping = false
-                    lastResult = msg
+                    if (why != null || result.error != null) lastResult = msg else note(msg)
                     updateUi()
                 }
             }
@@ -1674,7 +1631,7 @@ class CameraActivity : Activity() {
         viewIndex = views.indexOfFirst { it.label == selectLabel }.takeIf { it >= 0 } ?: 1
     }
 
-    private fun pickLut() {
+    internal fun pickLut() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*" // .cube has no registered MIME type
@@ -1682,7 +1639,7 @@ class CameraActivity : Activity() {
     }
 
     /** Grabs the live log frame and opens the editor on the current look. */
-    private fun openLookEditor() {
+    internal fun openLookEditor() {
         val r = renderer ?: return
         val sample = File(cacheDir, "look-sample.png")
         r.captureLogFrame(1000) { bmp ->
@@ -1731,12 +1688,14 @@ class CameraActivity : Activity() {
         }
         refreshViews(selectLabel = ViewEntry.CubeFile(target).label)
         applyView()
-        lastResult = "Imported ${target.nameWithoutExtension}"
+        note("Imported ${target.nameWithoutExtension}")
         settingsChanged()
     }
 
-    private fun cycleProfile() {
-        profile = LogProfile.entries[(profile.ordinal + 1) % LogProfile.entries.size]
+    internal fun cycleProfile() = setProfile(LogProfile.entries[(profile.ordinal + 1) % LogProfile.entries.size])
+
+    internal fun setProfile(p: LogProfile) {
+        profile = p
         renderer?.profile = profile
         applyView()
         settingsChanged()
@@ -1765,6 +1724,10 @@ class CameraActivity : Activity() {
         val gainEv = renderer?.totalGainEv ?: 0f
         val effectiveIso = m?.iso?.let { (it * Math.pow(2.0, gainEv.toDouble())).roundToInt() }
         exposureSlider.warn = (effectiveIso ?: 0) >= NOISY_ISO
+        droppedFrames = stats.droppedWhileRecording
+        lastEffectiveIso = effectiveIso
+        maybeSuggestEdr()
+        ui.onStats()
         info.text = buildString {
             heatNote()?.let { append(it) }
             if (!simple) {
@@ -1775,9 +1738,11 @@ class CameraActivity : Activity() {
                 renderer?.lutInput?.takeIf { it != profile && views.getOrNull(viewIndex) is ViewEntry.CubeFile }
                     ?.let { append("\nLUT expects ${it.label}: converting from ${profile.label}") }
                 if (capture.ae == AeMode.PRIORITY && priorityAtLimit) append("\n⚠ priority limits reached: image darker than target")
+                renderer?.recoverableClipFraction?.takeIf { it > 0.01f && !edrOn && edrAvailable() }
+                    ?.let { append("\n%.0f%% of the view blown out; eDR can bring it back".format(it * 100)) }
                 if (m != null && m.shading == null) append("\nno lens shading map")
             }
-            recorder?.let {
+            recorder?.takeIf { classicUi || !simple }?.let {
                 val secs = (SystemClock.elapsedRealtime() - recordStartMs) / 1000
                 if (isNotEmpty()) append("\n")
                 append("● REC %d:%02d · %s".format(secs / 60, secs % 60, if (bakeLut || simple) "look baked in" else "clean log"))
@@ -1786,6 +1751,33 @@ class CameraActivity : Activity() {
             lastResult?.let { if (isNotEmpty()) append("\n"); append(it) }
         }
     }
+
+    /** Sensor ISO × the digital gain before the log curve, as of the last stats update. */
+    internal var lastEffectiveIso: Int? = null
+        private set
+
+    /** Seconds in a row the view has shown blown highlights that the RAW still holds. */
+    private var clipSeconds = 0
+
+    /**
+     * Simple mode, once ever: when bright parts stay blown out in the view although the RAW holds
+     * them (what eDR fixes), suggest eDR and say what it does.
+     */
+    private fun maybeSuggestEdr() {
+        val r = renderer ?: return
+        if (!simple || edrOn || recorder != null || !edrAvailable() || prefs.getBoolean("edrHintShown", false)) {
+            clipSeconds = 0
+            return
+        }
+        clipSeconds = if (r.recoverableClipFraction > EDR_HINT_CLIP) clipSeconds + 1 else 0
+        if (clipSeconds < 3) return
+        prefs.edit().putBoolean("edrHintShown", true).apply()
+        EventLog.log("Suggested eDR (%.0f%% of the view blown out, recoverable)".format(r.recoverableClipFraction * 100))
+        showEdrHint()
+    }
+
+    private fun showEdrHint() = ui.showHint("Bright parts are blowing out. eDR brings them back and lifts the shadows a little.",
+        "Turn on eDR", onAction = { setEdr(true) })
 
     /**
      * adb control, for testing without touching the phone
@@ -1804,7 +1796,11 @@ class CameraActivity : Activity() {
      * lock focus there), afreset = true (as a double-tap), fullpreview = true|false (full-res preview),
      * fakeheat = °C (pretend battery temperature, until the next real reading) after fakeheatdelay ms,
      * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects),
-     * tonehi / tonelo = -100..100 (tone balance: highlights / shadows).
+     * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false,
+     * wbwarm / wbtint = -100..100 (white balance trim), ui = glass | classic (rebuilds the screen),
+     * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
+     * recdebug = split | dropkey | off (encoder output handling: deliver frames in pieces / lose
+     * the first key frame; see Recorder).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -1870,21 +1866,34 @@ class CameraActivity : Activity() {
             applyView()
         }
         if (extras.containsKey("tonehi") || extras.containsKey("tonelo")) {
-            setTone(extras.getInt("tonehi", toneHighlights), extras.getInt("tonelo", toneShadows))
+            setEdrCurve(extras.getInt("tonehi", edrHighlights), extras.getInt("tonelo", edrShadows))
         }
-        if (extras.containsKey("strength")) strengthBar.progress = extras.getInt("strength")
-        if (extras.containsKey("sat")) saturationBar.progress = extras.getInt("sat")
-        if (extras.containsKey("vib")) vibranceBar.progress = extras.getInt("vib") + 100
+        if (extras.containsKey("edr")) setEdr(extras.getBoolean("edr"))
+        when (extras.getString("edrhint")) {
+            "reset" -> prefs.edit().remove("edrHintShown").apply()
+            "show" -> showEdrHint()
+        }
+        if (extras.containsKey("wbwarm") || extras.containsKey("wbtint")) {
+            setWbShift(extras.getInt("wbwarm", wbWarmth), extras.getInt("wbtint", wbTint))
+        }
+        if (extras.containsKey("strength") || extras.containsKey("sat") || extras.containsKey("vib")) {
+            setLookAdjust(extras.getInt("strength", lutStrength), extras.getInt("sat", saturationPct), extras.getInt("vib", vibrancePct))
+        }
         if (extras.containsKey("afverbose")) camera?.afVerbose = extras.getBoolean("afverbose")
         extras.getString("tap")?.split(",")?.map { it.toFloat() }?.let { (u, v) -> focusAt(u, v, lock = extras.getBoolean("lock", false)) }
         if (extras.getBoolean("afreset", false)) resetFocusToAuto()
         if (extras.containsKey("fullpreview")) renderer?.previewFullRes = extras.getBoolean("fullpreview")
+        extras.getString("recdebug")?.let {
+            Recorder.debugSplitFrames = it == "split"
+            Recorder.debugDropFirstKey = it == "dropkey"
+        }
         // Debug: pretend the battery is this hot (until the next real reading), e.g. fakeheat=47.5.
         if (extras.containsKey("fakeheat")) {
             info.postDelayed({ onHeat(extras.getFloat("fakeheat"), thermalStatus) }, extras.getInt("fakeheatdelay", 500).toLong())
         }
         savePrefs()
         updateUi()
+        extras.getString("ui")?.let { setClassicUi(it == "classic") }
         when (extras.getString("cmd")) {
             // Give the camera a moment to start when launched and told to record in one go.
             "rec" -> info.postDelayed({ if (recorder == null) startRecording() }, 1500)
@@ -1937,9 +1946,13 @@ class CameraActivity : Activity() {
         private const val WARM_C = 43f
         private const val HOT_WARN_C = 45f
         private const val HOT_STOP_C = 47f
-        /** What the Balance button sets: highlights down, shadows up a little. */
-        private const val BALANCE_HIGHLIGHTS = -60
-        private const val BALANCE_SHADOWS = 30
+        /** eDR's default curve: highlights well down, shadows up a little. */
+        const val EDR_HIGHLIGHTS = -75
+        const val EDR_SHADOWS = 30
+        /** Share of the view blown out (but held by the RAW) that makes Simple suggest eDR. */
+        private const val EDR_HINT_CLIP = 0.04f
+        /** ± range of the EV slider. */
+        const val EV_RANGE = 8f
         /** Effective ISO from which the exposure slider's value turns amber. */
         private const val NOISY_ISO = 3200
         /** Full-resolution processing before a 4K recording starts (see [startRecording]). */
@@ -1949,5 +1962,7 @@ class CameraActivity : Activity() {
         private const val RESCAN_ITEM = 10_000
         private const val DIAGNOSTICS_ITEM = 10_001
         private const val BENCH_ITEM = 10_002
+        private const val STYLE_ITEM = 10_003
+        private const val IMPORT_ITEM = 10_004
     }
 }

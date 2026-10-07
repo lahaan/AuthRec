@@ -22,6 +22,7 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
+import com.authrec.EventLog
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -51,6 +52,13 @@ data class RecordConfig(
  * Timeline: video pts = frame timestamp − first frame timestamp (the renderer reports the
  * first one through [onFirstVideoFrame]); audio is timestamped on the same clock and anything
  * captured before the first video frame is dropped, so both tracks start together.
+ *
+ * The file always starts on a key frame, and frames the encoder hands over in several pieces
+ * (BUFFER_FLAG_PARTIAL_FRAME) are joined back into one sample. Clips from the Xiaomi 15 Ultra
+ * started with up to a second of green blocks, the look of a decoder that never got a whole
+ * first key frame; the X14's encoder delivers its 4.6 MB first frame in one buffer, so it never
+ * showed there. If leading frames have to be dropped, both tracks are shifted to start at the
+ * first key frame so sound stays in sync.
  */
 class Recorder(context: Context, val config: RecordConfig, width: Int, height: Int) {
 
@@ -86,6 +94,23 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
 
     data class Result(val uri: Uri, val frames: Int, val bytes: Long, val audio: Boolean, val error: String?)
 
+    private val codecName: String
+    private val hevc = config.codec.mime == MediaFormat.MIMETYPE_VIDEO_HEVC
+    /** Pieces of a frame delivered in several buffers, joined on the encoder thread. */
+    private var partial: ByteBuffer? = null
+    private var partialFlags = 0
+    private var partialPieces = 0
+    /** Encoder pts of the first key frame written; both tracks are shifted so it lands at 0. */
+    private var startUs = -1L
+    /** What the encoder did, for the event log (Send diagnostics). */
+    private var outputsSeen = 0
+    private val firstOutputs = StringBuilder()
+    private var outputCapacity = 0
+    private var framesJoined = 0
+    private var leadingDropped = 0
+    private var configWithSlices = 0
+    private var syncRequested = false
+
     private val videoCallback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) = Unit // surface input
 
@@ -96,11 +121,12 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
 
         override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
             if (finished) return
-            val isConfig = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
-            if (!isConfig && info.size > 0) {
-                writeSample(video = true, codec.getOutputBuffer(index)!!, info)
-                framesWritten++
+            val buf = codec.getOutputBuffer(index)
+            if (outputsSeen++ < 4) {
+                outputCapacity = maxOf(outputCapacity, buf?.capacity() ?: 0)
+                firstOutputs.append(" [${flagNames(info.flags)} ${info.size / 1024} KB]")
             }
+            if (buf != null && info.size > 0) onVideoData(buf, info)
             codec.releaseOutputBuffer(index, false)
             if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                 videoDone = true
@@ -140,6 +166,7 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
         }
+        codecName = info.name
         videoCodec = MediaCodec.createByCodecName(info.name)
         videoCodec.setCallback(videoCallback, handler)
         videoCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -179,21 +206,93 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
         handler.postDelayed({ finish("encoder didn't finish in time") }, 4000)
     }
 
+    /**
+     * One encoder output buffer with data (encoder thread). Joins partial frames, skips parameter
+     * sets (the muxer has them from the output format) and anything before the first key frame.
+     */
+    private fun onVideoData(buf: ByteBuffer, info: MediaCodec.BufferInfo) {
+        var flags = info.flags
+        if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+            // Normally just VPS/SPS/PPS; an encoder that tucks the first frame in with them would
+            // otherwise lose it.
+            if (!Nal.hasSlice(buf, info.offset, info.size, hevc)) return
+            configWithSlices++
+            flags = flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG.inv()
+        }
+        if (debugSplitFrames && flags and MediaCodec.BUFFER_FLAG_PARTIAL_FRAME == 0 && info.size > 1) {
+            // Debug: pretend the encoder delivered this frame in two pieces.
+            val half = info.size / 2
+            onVideoPiece(buf, info.offset, half, flags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME, info.presentationTimeUs)
+            onVideoPiece(buf, info.offset + half, info.size - half, flags, info.presentationTimeUs)
+            return
+        }
+        onVideoPiece(buf, info.offset, info.size, flags, info.presentationTimeUs)
+    }
+
+    private fun onVideoPiece(buf: ByteBuffer, offset: Int, size: Int, pieceFlags: Int, ptsUs: Long) {
+        var flags = pieceFlags
+        var data = buf
+        var dataOffset = offset
+        var dataSize = size
+        if (flags and MediaCodec.BUFFER_FLAG_PARTIAL_FRAME != 0 || partial != null) {
+            partial = append(partial, buf, offset, size)
+            partialFlags = partialFlags or flags
+            partialPieces++
+            if (flags and MediaCodec.BUFFER_FLAG_PARTIAL_FRAME != 0) return // more to come
+            val whole = partial!!.also { it.flip() }
+            flags = partialFlags and MediaCodec.BUFFER_FLAG_PARTIAL_FRAME.inv()
+            if (partialPieces > 1) framesJoined++
+            partial = null
+            partialFlags = 0
+            partialPieces = 0
+            data = whole
+            dataOffset = 0
+            dataSize = whole.remaining()
+        }
+        if (startUs < 0) {
+            val key = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 || Nal.isKeyFrame(data, dataOffset, dataSize, hevc)
+            if (key) flags = flags or MediaCodec.BUFFER_FLAG_KEY_FRAME // the muxer marks sync samples by this flag
+            if (debugDropFirstKey && key && leadingDropped == 0) {
+                leadingDropped++ // debug: as if the first key frame had been lost
+                return
+            }
+            // An encoder that never flags key frames shouldn't cost the whole recording.
+            if (!key && leadingDropped < 3 * config.fps) {
+                leadingDropped++
+                if (!syncRequested) {
+                    syncRequested = true
+                    runCatching { videoCodec.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
+                }
+                return
+            }
+            startUs = ptsUs
+            maybeStartMuxer()
+        }
+        writeSample(video = true, data, MediaCodec.BufferInfo().apply {
+            set(dataOffset, dataSize, ptsUs, flags and MediaCodec.BUFFER_FLAG_KEY_FRAME)
+        })
+        framesWritten++
+    }
+
     private fun maybeStartMuxer() {
-        if (muxerStarted || videoTrack < 0 || (audio != null && audioTrack < 0)) return
+        if (muxerStarted || videoTrack < 0 || (audio != null && audioTrack < 0) || startUs < 0) return
         muxer.start()
         muxerStarted = true
         pending.forEach { (video, buf, info) -> writeSample(video, buf, info) }
         pending.clear()
     }
 
+    /** Samples carry encoder pts; the muxer gets them shifted so the first key frame is at 0. */
     private fun writeSample(video: Boolean, buf: ByteBuffer, info: MediaCodec.BufferInfo) {
         if (!muxerStarted) {
             // Keep a copy; the codec reuses its buffer once released.
             pending += Triple(video, copyOf(buf, info), MediaCodec.BufferInfo().apply { set(0, info.size, info.presentationTimeUs, info.flags) })
             return
         }
-        muxer.writeSampleData(if (video) videoTrack else audioTrack, buf, info)
+        val pts = info.presentationTimeUs - startUs
+        if (pts < 0) return // sound from before the first key frame
+        muxer.writeSampleData(if (video) videoTrack else audioTrack, buf,
+            MediaCodec.BufferInfo().apply { set(info.offset, info.size, pts, info.flags) })
         bytesWritten += info.size
     }
 
@@ -212,9 +311,19 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
         val muxError = runCatching { if (muxerStarted) muxer.stop() }.exceptionOrNull()
         runCatching { muxer.release() }
         pfd.close()
-        resolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
-        val err = error ?: muxError?.let { "muxer: ${it.message}" }
+        // Nothing usable was written (no frames, or no key frame): don't leave an empty clip in the gallery.
+        if (muxerStarted) {
+            resolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
+        } else {
+            runCatching { resolver.delete(uri, null, null) }
+        }
+        val err = error ?: muxError?.let { "muxer: ${it.message}" } ?: if (!muxerStarted) "no video was recorded" else null
         Log.i(TAG, "Recording finished: $framesWritten frames, ${bytesWritten / 1_000_000} MB${err?.let { ", error: $it" } ?: ""}")
+        EventLog.log("Encoder $codecName: first outputs$firstOutputs, output buffers ${outputCapacity / 1024} KB" +
+            (if (framesJoined > 0) ", $framesJoined frames joined from pieces" else "") +
+            (if (leadingDropped > 0) ", $leadingDropped frames before the first key frame dropped" else "") +
+            (if (configWithSlices > 0) ", $configWithSlices config buffers held picture data" else "") +
+            (if (startUs < 0) ", no key frame seen" else ""))
         val r = Result(uri, framesWritten, bytesWritten, audio != null, err)
         result = r
         onFinished?.let {
@@ -341,12 +450,81 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
 
     companion object {
         private const val TAG = "AuthRec"
+        /** Debug (adb recdebug=split): deliver every encoded frame to the muxer path in two pieces. */
+        @Volatile var debugSplitFrames = false
+        /** Debug (adb recdebug=dropkey): lose the first key frame, as a broken encoder start would. */
+        @Volatile var debugDropFirstKey = false
 
         private fun copyOf(buf: ByteBuffer, info: MediaCodec.BufferInfo): ByteBuffer {
             val src = buf.duplicate()
+            src.clear()
             src.position(info.offset)
             src.limit(info.offset + info.size)
             return ByteBuffer.allocateDirect(info.size).put(src).also { it.flip() }
         }
+
+        /** [acc] (written up to its position) plus [size] bytes of [src] from [offset]; grows as needed. */
+        private fun append(acc: ByteBuffer?, src: ByteBuffer, offset: Int, size: Int): ByteBuffer {
+            val needed = (acc?.position() ?: 0) + size
+            val out = if (acc != null && acc.capacity() >= needed) acc else {
+                ByteBuffer.allocateDirect(maxOf(needed, (acc?.capacity() ?: 0) * 2)).also { n -> acc?.let { it.flip(); n.put(it) } }
+            }
+            val s = src.duplicate()
+            s.clear()
+            s.position(offset)
+            s.limit(offset + size)
+            out.put(s)
+            return out
+        }
+
+        private fun flagNames(flags: Int) = buildList {
+            if (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) add("key")
+            if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) add("config")
+            if (flags and MediaCodec.BUFFER_FLAG_PARTIAL_FRAME != 0) add("partial")
+            if (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) add("eos")
+        }.ifEmpty { listOf("frame") }.joinToString("+")
+    }
+}
+
+/**
+ * Just enough Annex-B parsing (H.264 / HEVC, start-code delimited NAL units as encoders output
+ * them) to tell picture data from parameter sets and key frames from the rest, for encoders that
+ * don't flag their buffers the way the docs say.
+ */
+internal object Nal {
+
+    /** Calls [visit] with each NAL unit type until it returns true; true if one did. */
+    private inline fun scan(buf: ByteBuffer, offset: Int, size: Int, hevc: Boolean, visit: (Int) -> Boolean): Boolean {
+        val end = offset + size
+        var zeros = 0
+        var i = offset
+        while (i < end - 1) {
+            val b = buf.get(i).toInt() and 0xFF
+            if (b == 1 && zeros >= 2) {
+                val h = buf.get(i + 1).toInt() and 0xFF
+                if (visit(if (hevc) (h shr 1) and 0x3F else h and 0x1F)) return true
+            }
+            zeros = if (b == 0) zeros + 1 else 0
+            i++
+        }
+        return false
+    }
+
+    private fun isSlice(type: Int, hevc: Boolean) = if (hevc) type <= 31 else type in 1..5
+
+    fun hasSlice(buf: ByteBuffer, offset: Int, size: Int, hevc: Boolean) = scan(buf, offset, size, hevc) { isSlice(it, hevc) }
+
+    /** Judged by the first slice: IDR/CRA/BLA (HEVC 16–23) or IDR (H.264 5). */
+    fun isKeyFrame(buf: ByteBuffer, offset: Int, size: Int, hevc: Boolean): Boolean {
+        var key = false
+        scan(buf, offset, size, hevc) { type ->
+            if (isSlice(type, hevc)) {
+                key = if (hevc) type in 16..23 else type == 5
+                true
+            } else {
+                false
+            }
+        }
+        return key
     }
 }

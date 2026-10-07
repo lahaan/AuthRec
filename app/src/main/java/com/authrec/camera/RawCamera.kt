@@ -627,14 +627,22 @@ class RawCamera(
             }
             // A physical lens's own white balance, matrix and shading arrive in its physical result.
             val physical = lens?.physicalId?.let { result.physicalCameraTotalResults[it] }
+            // Without one, the logical result describes whichever lens it calls active, which on the
+            // 15 Ultra's periscope route was the 3x: worth knowing when colours look off.
+            val origin = when {
+                loggedSources || lens?.physicalId == null -> "" // only the first frame's is logged
+                physical != null -> ", from lens ${lens.physicalId}'s own result"
+                else -> ", from the logical camera's result (active lens ${result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)})"
+            }
             // Odd metadata from an unusual lens must never take the app down; keep the last good frame's.
-            runCatching { toMeta(physical ?: result) }
+            runCatching { toMeta(physical ?: result, origin) }
                 .onSuccess { latestMeta = it }
                 .onFailure { Log.w(TAG, "bad metadata from lens ${lens?.key}", it) }
         }
     }
 
-    private fun toMeta(result: CaptureResult): FrameMeta {
+    /** [origin]: where the metadata came from, for the event log line about the first frame. */
+    private fun toMeta(result: CaptureResult, origin: String = ""): FrameMeta {
         // Not every lens reports the ISP's colour decisions (Xiaomi's hidden/front lenses may not),
         // so fall back step by step: ISP gains → scene neutral → daylight; ISP matrix → sensor calibration.
         val neutral = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.map { it.toDouble() }?.toDoubleArray()
@@ -660,10 +668,14 @@ class RawCamera(
         }
         if (!loggedSources) {
             loggedSources = true
-            Log.i(TAG, "Lens ${lens?.key ?: info.cameraId} colour sources: " +
-                "white balance=${if (ispGains != null) "ISP" else if (neutral != null) "scene neutral" else if (sceneNeutral != null) "daylight default" else "none"}, " +
-                "matrix=${if (ispCcm != null) "ISP" else if (sceneNeutral != null && calibration != null) "sensor calibration" else "none"}, " +
-                "lens shading=${if (shadingMap != null) "yes" else "no"}")
+            fun f(v: Number) = "%.3f".format(v.toDouble())
+            EventLog.log("$name colour: white balance " +
+                "${if (ispGains != null) "ISP" else if (neutral != null) "scene neutral" else if (sceneNeutral != null) "daylight default" else "none"} " +
+                "${gains.joinToString(" ", "[", "]") { f(it) }}, matrix " +
+                "${if (ispCcm != null) "ISP" else if (sceneNeutral != null && calibration != null) "sensor calibration" else "none"} " +
+                "${ccm.joinToString(" ", "[", "]") { f(it) }}, black ${black.joinToString("/") { "%.1f".format(it) }}, white ${"%.0f".format(white)}, " +
+                "lens shading ${shadingMap?.let { "${it.columnCount}x${it.rowCount}" } ?: "none"}, " +
+                "ISO ${result.get(CaptureResult.SENSOR_SENSITIVITY)} at 1/${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { (1e9 / it).toInt() }}$origin")
         }
 
         return FrameMeta(

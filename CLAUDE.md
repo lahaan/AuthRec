@@ -32,9 +32,12 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 
 | File | Role |
 |---|---|
-| `CameraActivity.kt` | The whole UI (plain Views, landscape), settings/prefs, lens selection & fallback, camera failure recovery (`onCameraFailure`: retries, session layouts, fallback to 1x) + watchdog, AF modes (tap = one-shot AF + spot watch, contrast-AF hookup), AE: Priority loop, exposure routing, heat guard, recording start/stop (4K warm-up), looks list, adb hooks (`handleCommands`) |
+| `CameraActivity.kt` | State and actions behind the screen (landscape): settings/prefs, the views both layouts share (preview + gestures, info text, EV slider, focus bar, priority limits), lens selection & fallback, camera failure recovery (`onCameraFailure`: retries, session layouts, fallback to 1x) + watchdog, AF modes (tap = one-shot AF + spot watch, contrast-AF hookup), AE: Priority loop, exposure routing, eDR / WB trim / view adjustments, eDR suggestion, heat guard, recording start/stop (4K warm-up), looks list, adb hooks (`handleCommands`) |
+| `ui/GlassUi.kt` | Default layout: lens chips + big record button + flip on the right, mode/look/eDR/Adjust/Settings on the left, Pro bar (exposure, ISO and shutter dials, WB, focus, fps), Adjust panel with the eDR curve, settings sheet, REC pill, hint banner |
+| `ui/ClassicUi.kt` | The original layout (buttons in two columns, exposure bar), Settings → Layout → Classic; its ⚙ (top right) switches back to Glass and has the lens tools |
+| `ui/Glass.kt`, `RecordButton`, `ValueDial`, `ToneCurveView`, `CameraUi` | Glass drawable + `UiKit` (controls in either style), the record button, the ISO/shutter ruler, the eDR curve graph, the layout interface and `Stepper` |
 | `camera/RawCamera.kt` | Camera2 session (all device/session work on the camera thread): RAW_SENSOR stream + tiny YUV "metering" stream, session layouts 0–2 (`variant`), request building (AE/AF/AWB/zoom routing/regions), per-frame `FrameMeta` with colour-metadata fallbacks, failure reporting, reference-shot capture |
-| `camera/LensProbe.kt` | Finds every RAW-capable lens (listed ids, hidden ids 0–31, zoom routes, physical sub-cameras), test-streams each with HAL-recovery waits, keeps listed cameras, caches per firmware (`VERSION`), labels 0.6x/1x/2.6x |
+| `camera/LensProbe.kt` | Finds every RAW-capable lens (listed ids, hidden ids 0–31, zoom routes, physical sub-cameras), test-streams each with HAL-recovery waits, keeps listed cameras and lenses the previous scan found, skips routes that took the camera service down, caches per firmware (`VERSION`), labels 0.6x/1x/2.6x |
 | `EventLog.kt` | Persistent event log (`files/events.log`: opens, layouts, failures, retries, scans, recordings, heat, crashes); part of Send diagnostics |
 | `ExposureSlider.kt` | The vertical EV slider (relative drag, double-tap = 0, amber where it's digital gain) |
 | `gl/Renderer.kt` | GL thread: RAW upload, 3 compute passes, preview draw, encoder-surface draw (2nd shared EGL context, 10-bit config), auto gain, sharpness metric for contrast AF, stall stats |
@@ -45,7 +48,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 | `color/*` | `LogProfile` (Apple Log, S-Log3, LogC3 encode/decode), `ColorMath` (primaries → matrices), `Look`/`Looks` (grading params, film-style presets, bake to LUT), `CubeLut` (.cube parse/write, CPU tetra/trilinear apply), `ColorCalibration` (DNG forward-matrix route) |
 | `LookEditorActivity.kt` | Look editor on a captured log frame; saves `*.look.json` + exports `.cube` to `Download/AuthRec` |
 | `Diagnostics.kt` | Text report (device, every camera id, lens scan, prefs, own logcat) → share sheet |
-| `bench/*` | Capability bench (RAW fps, GPU timing, encoder probes); opened from the lens menu |
+| `bench/*` | Capability bench (RAW fps, GPU timing, encoder probes); opened from the lens menu (Glass: long-press a lens chip, or Settings → Lenses…) |
 
 ## Pipeline facts worth knowing before changing things
 
@@ -90,18 +93,32 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 - The preview uses the superpixel path between recordings (≈4 ms vs ≈15–25 ms a frame); 4K
   recording first runs 1 s at full resolution (jumping straight in dropped frames while the GPU
   clocked up). The finish pass only writes the full-size log image when something uses it.
-- **Tone balance** ("Balance" button, Adjust → Highlights/Shadows, prefs `toneHi`/`toneLo`):
-  a luminance-based curve in stops around middle grey (highlights above +1 stop compressed, shadows
-  below −1 stop lifted, half-stop soft knees) applied before the look/LUT. It answers Xiaomi's AE
-  exposing for the sky (the ISP then tone-maps locally; our single global gain leaves the sky white
-  in the view while the log keeps it). View and baked recordings only; the clean log never gets it.
+- **eDR** (was "Balance"; prefs `edrOn`/`edrHi`/`edrLo`, default −75/+30, migrated from 0.2.2's
+  `toneHi`/`toneLo`): a luminance-based curve in stops around middle grey (highlights above +1 stop
+  compressed, shadows below −1 stop lifted, half-stop soft knees) applied before the look/LUT. It
+  answers Xiaomi's AE exposing for the sky (the ISP then tone-maps locally; our single global gain
+  leaves the sky white in the view while the log keeps it). View and baked recordings only; the
+  clean log never gets it. Simple: on/off; Pro: the curve graph in Adjust (`ToneCurveView` draws
+  the shader's own function). Simple suggests it once ever (`edrHintShown`) when >4 % of the view
+  stays blown for 3 s while the RAW still holds it (`Renderer.recoverableClipFraction`).
+- **WB trim** (Warmth/Tint, prefs `wbWarm`/`wbTint`): channel gains multiplied into the ISP's WB
+  gains in the prep pass, so the recorded log gets them too (like a camera's WB shift).
+- **Recorder**: the file always starts on a key frame (leading frames dropped, a sync frame
+  requested, both tracks shifted to start at it) and `BUFFER_FLAG_PARTIAL_FRAME` pieces are joined
+  into one sample. Each recording logs `Encoder <name>: first outputs [...] , output buffers N KB`
+  to the event log (X14: c2.qti.hevc.encoder, first key frame ~3.9 MB in 7.6 MB buffers).
+  `recdebug=split|dropkey` exercises both paths.
 - `LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID` can name the main sensor while a physical stream of
   another sensor still delivers (X14 `5/4`), so it's only a hint.
 - **Xiaomi 15 Ultra (HyperOS 2)**: hidden ids opened directly fail at configure with
-  `Function not implemented (-38)`; a RAW-only physical stream of a non-active lens on logical 0
-  crashed its camera HAL (every later call: `unknown device`). Zoom routes (logical 0 +
-  CONTROL_ZOOM_RATIO, physical RAW + logical YUV) are the expected way in; unverified until the
-  friend's next diagnostics.
+  `Function not implemented (-38)`. Zoom routes (logical 0 + CONTROL_ZOOM_RATIO, physical RAW +
+  logical YUV) work for the 3x (`0/4 @3.01`, every scan) and the periscope (`0/5 @4.12`, first
+  frame after 0.4–4.2 s, so scans used to miss it; zoom routes now get 6.5 s in the scan and 10 s
+  in the watchdog). The ultrawide's route `0/3 @0.61` (like 0.2.1's RAW-only physical stream)
+  takes the camera service down every time: `LensProbe` now remembers such routes per firmware
+  (`crashedRoutes`) and never tries them again. A lens a rescan misses is kept from the previous
+  scan of the same firmware. The first frame of every open logs the colour metadata it uses and,
+  on physical routes, whether it came from the lens's own result.
 
 ## Conventions
 
@@ -111,19 +128,23 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   `LensProbe.VERSION` when probing logic changes so devices rescan).
 - Anything that can fail on an unknown phone (lens routes, metadata, session config) must fail
   soft: catch, log under tag `AuthRec`, show a message or fall back. Never crash on HAL quirks.
-- UI strings are short; Simple mode stays minimal (look, adjust, exposure, 4K/2K, record).
+- UI strings are short; Simple mode stays minimal (look, eDR, adjust, exposure, 4K/2K, record).
+- Two layouts over the same state and actions (`ui/CameraUi`): Glass (default) and Classic. A
+  new setting needs a place in both (Classic: a cycling button or a menu item) or it's
+  unreachable for whoever picked the other layout. Glass sizes are in dp; Classic keeps its px.
 
 ## Testing on the phone
 
 - adb hooks: `adb shell am start -n com.authrec/.CameraActivity --es cmd rec --es codec HEVC_10 …`
   (full list in the KDoc of `CameraActivity.handleCommands`; `lens=5/4`, `tap=0.5,0.5`, `ev=-1.0`,
   `clean=3`, `afverbose=true` (`--ez`), `cmd=dumpcams|refshot|edit|rescan|failcam`, `layout=0..2`,
-  `fakeheat=47.5`, `lutinput=SLOG3`, `fullpreview=true`).
+  `fakeheat=47.5`, `lutinput=SLOG3`, `fullpreview=true`, `edr=true`, `tonehi=-75 tonelo=30`,
+  `wbwarm/wbtint`, `ui=glass|classic`, `edrhint=reset|show`, `recdebug=split|dropkey|off`).
   **Every `am start` pauses and resumes the activity, i.e. closes and reopens the camera**, so
   state that lives in the session (AF, a recording) is reset by the next command; hooks that must
   act on a running session post themselves (`failcam` after 2 s, `fakeheatdelay`). For taps use
   real input instead: `adb shell input tap X Y` (the 4:3 image spans x 535–2135 on the X14),
-  long-press `adb shell input swipe X Y X Y 900`.
+  long-press `adb shell input swipe X Y X Y 900`. Glass control bounds: `uiautomator dump` (below).
 - Event log: `adb shell run-as com.authrec cat files/events.log` (debug build).
 - **Mind the heat while testing**: the app runs the camera whenever it's in front. Go back to the
   home screen (or YouTube) between tests and watch `adb shell dumpsys battery | grep temperature`

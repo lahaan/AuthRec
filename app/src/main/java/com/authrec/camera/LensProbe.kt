@@ -85,7 +85,13 @@ data class Lens(
  * disconnected) is, once. Listed cameras are never dropped because of a failed test: losing the
  * main camera to a bad moment would leave the app useless.
  *
- * Results are cached per firmware. A route that takes the app itself down twice is skipped.
+ * Results are cached per firmware. A route that takes the app itself down twice is skipped, and
+ * so is one that took the camera service down (on this firmware): the 15 Ultra's 0.6x route did
+ * that on every scan, costing seconds and leaving the HAL shaky for the tests after it. A lens an
+ * earlier scan of the same firmware found is kept when a rescan misses it: a slow lens (the
+ * 15 Ultra's periscope needed 0.4–4.2 s for its first frame) shouldn't vanish from the menu
+ * because of one unlucky test; if it really doesn't work, the camera's own failure handling
+ * falls back to the main lens.
  */
 class LensProbe(private val context: Context) {
 
@@ -123,6 +129,17 @@ class LensProbe(private val context: Context) {
             EventLog.log("Lens scan: the test of $it never finished last time (strike ${strikes.optInt(it)})")
         }
 
+        // Routes that took the camera service down, and what the last scan found, on this firmware.
+        val crashed = if (prefs.getString("crashedFingerprint", null) == Build.FINGERPRINT) {
+            JSONArray(prefs.getString("crashedRoutes", null) ?: "[]").let { a -> (0 until a.length()).map { a.getString(it) }.toMutableSet() }
+        } else mutableSetOf()
+        // Saved at once: a scan abandoned halfway must not forget it.
+        fun saveCrashed() = prefs.edit().putString("crashedRoutes", JSONArray(crashed.toList()).toString())
+            .putString("crashedFingerprint", Build.FINGERPRINT).commit()
+        val previous = if (prefs.getString("fingerprint", null) == Build.FINGERPRINT) runCatching {
+            JSONArray(prefs.getString("lenses", null) ?: "[]").let { a -> List(a.length()) { Lens.fromJson(a.getJSONObject(it)) } }
+        }.getOrDefault(emptyList()) else emptyList()
+
         val thread = HandlerThread("lens-probe").apply { start() }
         val handler = Handler(thread.looper)
         val availability = Availability(handler)
@@ -132,7 +149,7 @@ class LensProbe(private val context: Context) {
             availability.waitFor(listed, 5000).takeIf { it > 300 }?.let { EventLog.log("Lens scan: waited $it ms for the cameras to be free") }
 
             val all = candidates(listed)
-            val candidates = all.filter { it.kind == Kind.LISTED || strikes.optInt(it.lens.key) < 2 }
+            val candidates = all.filter { it.kind == Kind.LISTED || (strikes.optInt(it.lens.key) < 2 && it.lens.key !in crashed) }
             EventLog.log("Lens scan: ${candidates.size} candidates: " + candidates.joinToString { "${it.lens.key}${zoomNote(it.lens)} ${it.kind}" })
             progress("Finding lenses: ${candidates.size} candidates")
             val working = mutableListOf<Lens>()
@@ -140,7 +157,10 @@ class LensProbe(private val context: Context) {
             val workingSensors = mutableSetOf<String>()
             // Every candidate's outcome, kept for Send diagnostics (the scan's log may be gone by then).
             val results = JSONArray()
-            all.filter { it !in candidates }.forEach { results.put("${it.lens.key}: skipped (the app died during its test twice)") }
+            all.filter { it !in candidates }.forEach {
+                results.put("${it.lens.key}: skipped (" +
+                    (if (it.lens.key in crashed) "took the camera service down in an earlier scan" else "the app died during its test twice") + ")")
+            }
 
             for ((i, c) in candidates.withIndex()) {
                 if (!keepGoing()) {
@@ -165,9 +185,10 @@ class LensProbe(private val context: Context) {
                     val waited = availability.waitFor(ids, 10_000)
                     if (waited !in 0..500) {
                         // The cameras vanished after this test: the route itself took the HAL down, and
-                        // trying it again would only do that again.
+                        // trying it again would only do that again (in later scans too).
                         outcome = Outcome(false, "${outcome.message} (camera service restarted after this test, " +
-                            (if (waited < 0) "not back after 10 s" else "back after $waited ms") + ")")
+                            (if (waited < 0) "not back after 10 s" else "back after $waited ms") + "; not tried again on this firmware)")
+                        if (c.kind != Kind.LISTED && crashed.add(lens.key)) saveCrashed()
                     } else if (outcome.transient) {
                         // Busy or briefly unavailable: worth one more go.
                         EventLog.log("Lens ${lens.key} failed (${outcome.message}); retrying")
@@ -196,6 +217,14 @@ class LensProbe(private val context: Context) {
                 working += keep
                 results.put("${keep.key}: kept although its test failed (listed camera)")
                 EventLog.log("Lens scan: keeping listed camera ${keep.key} although its test failed")
+            }
+            // Lenses the last scan of this firmware found, missed this time (but not crash routes).
+            for (old in previous) {
+                if (working.any { it.key == old.key || sensorKey(it) == sensorKey(old) } || old.key in crashed) continue
+                if (all.none { it.lens.key == old.key }) continue // the phone no longer offers that route
+                working += old.copy(label = "")
+                results.put("${old.key}: kept from the previous scan (its test failed this time)")
+                EventLog.log("Lens scan: keeping ${old.key} from the previous scan although its test failed")
             }
             label(working)
             results.put("scan took ${stamp()}")
@@ -268,9 +297,10 @@ class LensProbe(private val context: Context) {
     private fun sensorKey(l: Lens) = "${l.front}/${"%.0f".format(l.equivFocalMm)}/${l.rawWidth}x${l.rawHeight}"
 
     /**
-     * Opens the lens, streams RAW for up to ~2.5 s and checks the frames. On a zoom route whose
-     * RAW stays silent while the logical camera reports another lens active, the zoom is stepped
-     * up a little (the switch-over point isn't always the focal-length ratio).
+     * Opens the lens, streams RAW for up to ~2.5 s (6.5 s for the first frame on zoom routes) and
+     * checks the frames. On a zoom route whose RAW stays silent while the logical camera reports
+     * another lens active, the zoom is stepped up a little (the switch-over point isn't always the
+     * focal-length ratio).
      */
     @SuppressLint("MissingPermission")
     private fun test(lens: Lens, handler: Handler, logicalStream: Boolean): Outcome {
@@ -370,17 +400,26 @@ class LensProbe(private val context: Context) {
                     stream()
                     val maxZoom = cm.getCameraCharacteristics(lens.openId).get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper ?: zoom
                     var bumps = 0
-                    var deadline = SystemClock.elapsedRealtime() + 2500
-                    while (SystemClock.elapsedRealtime() < deadline && stats.get() == null) {
+                    // A logical camera can take seconds to switch to a lens (15 Ultra periscope: first
+                    // frame after 0.4 s in one scan, nothing within 2.5 s in another, 4.2 s in use).
+                    var waitUntil = t0 + if (lens.zoomRatio != 1f) 6500L else 2500L
+                    while (stats.get() == null) {
                         SystemClock.sleep(50)
+                        val now = SystemClock.elapsedRealtime()
+                        if (frames.get() > 0) {
+                            // Once frames flow, 8 of them shouldn't take long.
+                            if (now - t0 - firstFrameMs.get() > 2500) break
+                            continue
+                        }
+                        if (now > waitUntil) break
                         val active = activeId.get()
-                        if (frames.get() == 0 && zoom > 1f && lens.physicalId != null && active != null && active != lens.physicalId &&
-                            SystemClock.elapsedRealtime() - t0 > 1200L * (bumps + 1) && bumps < 3 && zoom < maxZoom) {
+                        if (zoom > 1f && lens.physicalId != null && active != null && active != lens.physicalId &&
+                            now - t0 > 2500L + 1500L * bumps && bumps < 3 && zoom < maxZoom) {
                             zoom = (zoom * 1.08f).coerceAtMost(maxZoom)
                             bumps++
                             EventLog.log("Lens ${lens.key}: lens $active still active, trying zoom %.2f".format(zoom))
                             stream()
-                            deadline = SystemClock.elapsedRealtime() + 2500
+                            waitUntil = maxOf(waitUntil, now + 2500)
                         }
                     }
                     runCatching { s.stopRepeating() }
@@ -491,7 +530,7 @@ class LensProbe(private val context: Context) {
 
     companion object {
         /** Bump to force a rescan after changing how lenses are found. */
-        private const val VERSION = 7
+        private const val VERSION = 8
         private const val ERROR_CAMERA_DISABLED = CameraDevice.StateCallback.ERROR_CAMERA_DISABLED
 
         /** RAW size closest to 4096×3072 (binned open gate). */
