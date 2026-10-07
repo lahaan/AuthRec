@@ -40,6 +40,13 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     /** Width of each black margin beside the 4:3 image (the preview letterboxes to it). */
     private val side = ((screenW - screenH * 4f / 3f) / 2f).roundToInt().coerceAtLeast(0)
     private val imageW = screenW - 2 * side
+    /** Right margin: the EV slider against the image, then a column with lenses / record / flip. */
+    private val sliderW = a.dp(64)
+    private val rightColumnW = (side - sliderW).coerceAtLeast(a.dp(96))
+    private val recSize = a.dp(78)
+    /** The record button sits a little below the middle, where the right thumb rests. */
+    private val recTop = screenH / 2 + a.dp(24) - recSize / 2
+    private val lensTop = a.dp(14)
     /** Width of the ISO / shutter dials (declared before the panels that use it). */
     private val dialWidth = minOf(a.dp(520), imageW - a.dp(60))
 
@@ -238,18 +245,15 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         })
 
         // Right margin: the EV slider against the image, then the lens column / record / flip.
-        val sliderW = a.dp(64)
-        val rightColumnW = (side - sliderW).coerceAtLeast(a.dp(96))
         addView(a.exposureSlider, FrameLayout.LayoutParams(sliderW, (screenH * 0.66f).toInt(), Gravity.CENTER_VERTICAL or Gravity.END).apply {
             marginEnd = rightColumnW
         })
-        val recSize = a.dp(78)
-        addView(recordButton, FrameLayout.LayoutParams(recSize, recSize, Gravity.CENTER_VERTICAL or Gravity.END).apply {
+        addView(recordButton, FrameLayout.LayoutParams(recSize, recSize, Gravity.TOP or Gravity.END).apply {
             marginEnd = (rightColumnW - recSize) / 2
-            topMargin = a.dp(24)
+            topMargin = recTop
         })
         addView(lensColumn, FrameLayout.LayoutParams(rightColumnW, WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
-            topMargin = a.dp(14)
+            topMargin = lensTop
         })
         addView(flipButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
             setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18))
@@ -429,14 +433,24 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         lensKeys = keys
         lensColumn.removeAllViews()
         lensChips.clear()
-        // Fit the column between the top edge and the record button (just below the middle).
-        val room = screenH / 2 + a.dp(24) - a.dp(39) - a.dp(14) - a.dp(8)
-        val size = minOf(a.dp(44), room / order.size.coerceAtLeast(1) - a.dp(7))
-        for (i in order) {
-            val chip = roundChip(lensChipText(a.lenses[i].label)) { if (i != a.lensIndex) a.switchLens(i) }
-            chip.setOnLongClickListener { a.showLensMenu(it); true }
-            lensChips[i] = chip
-            lensColumn.addView(chip, LinearLayout.LayoutParams(size, size).apply { bottomMargin = a.dp(7) })
+        // The chips fit between the top edge and the record button, keeping a clear gap above it so
+        // a lens tap can't land on record. A short screen (15 Ultra: ~384 dp tall) or a fourth back
+        // lens would squeeze one column below a comfortable size, so then they go two abreast.
+        val gap = a.dp(7)
+        val room = recTop - a.dp(16) - lensTop
+        val n = order.size.coerceAtLeast(1)
+        val cols = if (n == 1 || room / n - gap >= a.dp(40)) 1 else 2
+        val rows = (n + cols - 1) / cols
+        val size = minOf(a.dp(44), room / rows - gap, (rightColumnW - gap) / cols - gap)
+        order.chunked(cols).forEach { rowLenses ->
+            val row = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
+            rowLenses.forEachIndexed { k, i ->
+                val chip = roundChip(lensChipText(a.lenses[i].label)) { if (i != a.lensIndex) a.switchLens(i) }
+                chip.setOnLongClickListener { a.showLensMenu(it); true }
+                lensChips[i] = chip
+                row.addView(chip, LinearLayout.LayoutParams(size, size).apply { if (k > 0) marginStart = gap })
+            }
+            lensColumn.addView(row, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { bottomMargin = gap })
         }
         if (order.isEmpty()) {
             lensColumn.addView(kit.button("Lens") { a.showLensMenu(lensColumn) })
