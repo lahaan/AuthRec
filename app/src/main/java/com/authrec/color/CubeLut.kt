@@ -61,6 +61,55 @@ class CubeLut(val name: String, val size: Int, val rgb: FloatArray) {
         }
     }
 
+    /**
+     * Tetrahedral interpolation at ([r], [g], [b]) (clamped to 0..1) into [out], the same split
+     * into tetrahedra as the pipeline shader's `lutTetra`, so a LUT baked from this one on the CPU
+     * matches what the GPU would show.
+     */
+    fun sampleTetra(r: Float, g: Float, b: Float, out: FloatArray) {
+        val n = size - 1
+        val pr = r.coerceIn(0f, 1f) * n
+        val pg = g.coerceIn(0f, 1f) * n
+        val pb = b.coerceIn(0f, 1f) * n
+        val r0 = minOf(pr.toInt(), n - 1)
+        val g0 = minOf(pg.toInt(), n - 1)
+        val b0 = minOf(pb.toInt(), n - 1)
+        val fr = pr - r0
+        val fg = pg - g0
+        val fb = pb - b0
+        val r1 = r0 + 1
+        val g1 = g0 + 1
+        val b1 = b0 + 1
+        for (c in 0..2) {
+            fun at(ri: Int, gi: Int, bi: Int) = rgb[((bi * size + gi) * size + ri) * 3 + c]
+            val c000 = at(r0, g0, b0)
+            val c111 = at(r1, g1, b1)
+            out[c] = if (fr > fg) {
+                if (fg > fb) {
+                    val c100 = at(r1, g0, b0); val c110 = at(r1, g1, b0)
+                    c000 + fr * (c100 - c000) + fg * (c110 - c100) + fb * (c111 - c110)
+                } else if (fr > fb) {
+                    val c100 = at(r1, g0, b0); val c101 = at(r1, g0, b1)
+                    c000 + fr * (c100 - c000) + fb * (c101 - c100) + fg * (c111 - c101)
+                } else {
+                    val c001 = at(r0, g0, b1); val c101 = at(r1, g0, b1)
+                    c000 + fb * (c001 - c000) + fr * (c101 - c001) + fg * (c111 - c101)
+                }
+            } else {
+                if (fb > fg) {
+                    val c001 = at(r0, g0, b1); val c011 = at(r0, g1, b1)
+                    c000 + fb * (c001 - c000) + fg * (c011 - c001) + fr * (c111 - c011)
+                } else if (fb > fr) {
+                    val c010 = at(r0, g1, b0); val c011 = at(r0, g1, b1)
+                    c000 + fg * (c010 - c000) + fb * (c011 - c010) + fr * (c111 - c011)
+                } else {
+                    val c010 = at(r0, g1, b0); val c110 = at(r1, g1, b0)
+                    c000 + fg * (c010 - c000) + fr * (c110 - c010) + fb * (c111 - c110)
+                }
+            }
+        }
+    }
+
     companion object {
 
         /** Parses an Adobe/Resolve .cube file (3D only). */

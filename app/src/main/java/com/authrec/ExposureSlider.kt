@@ -55,6 +55,9 @@ class ExposureSlider(context: Context, private val glass: Boolean = false, priva
     private val trackX get() = width - 44f
     private fun yOf(v: Float) = height - pad - (v + range) / (2 * range) * (height - 2 * pad)
 
+    /** The glass capsule in view coordinates (for the backdrop blur), or null in the classic style. */
+    fun glassBox(): RectF? = if (glass && width > 0) RectF(trackX - 30f, 4f, trackX + 30f, height - 4f) else null
+
     private val capsule = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3f }
     private val knobGloss = Paint(Paint.ANTI_ALIAS_FLAG)

@@ -19,6 +19,7 @@ import com.authrec.CameraActivity
 import com.authrec.camera.AeMode
 import com.authrec.camera.AfMode
 import com.authrec.color.LogProfile
+import com.authrec.gl.GlassRect
 import com.authrec.record.VideoCodec
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -280,6 +281,54 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         addView(settingsSheet, FrameLayout.LayoutParams(minOf(a.dp(560), imageW - a.dp(24)), MATCH_PARENT, Gravity.CENTER_HORIZONTAL).apply {
             setMargins(0, a.dp(12), 0, a.dp(12))
         })
+        // Before every UI frame: tell the renderer where the glass is, for the blur behind it.
+        viewTreeObserver.addOnPreDrawListener {
+            publishGlass()
+            true
+        }
+    }
+
+    // ---- Backdrop blur ----
+
+    private var publishedGlass: List<GlassRect> = emptyList()
+    private val loc = IntArray(2)
+    private val origin = IntArray(2)
+
+    /** Every visible glass shape (capsules, the record button, the EV slider) in surface pixels. */
+    private fun publishGlass() {
+        val out = ArrayList<GlassRect>(48)
+        a.surfaceView.getLocationInWindow(origin)
+        collectGlass(root, 1f, out)
+        val same = out.size == publishedGlass.size && out.indices.all { i ->
+            val p = out[i]
+            val q = publishedGlass[i]
+            p.left == q.left && p.top == q.top && p.right == q.right && p.bottom == q.bottom && p.alpha == q.alpha
+        }
+        if (same) return
+        publishedGlass = out
+        a.setGlassRects(out)
+    }
+
+    private fun collectGlass(v: View, parentAlpha: Float, out: MutableList<GlassRect>) {
+        if (v.visibility != View.VISIBLE) return
+        val alpha = parentAlpha * v.alpha
+        if (alpha < 0.02f) return
+        val box: android.graphics.RectF?
+        val radius: Float
+        when {
+            v === recordButton -> { box = android.graphics.RectF(0f, 0f, v.width.toFloat(), v.height.toFloat()); radius = v.width / 2f }
+            v === a.exposureSlider -> { box = a.exposureSlider.glassBox(); radius = 30f }
+            v.background is GlassDrawable -> { box = android.graphics.RectF(0f, 0f, v.width.toFloat(), v.height.toFloat()); radius = (v.background as GlassDrawable).radius }
+            else -> { box = null; radius = 0f }
+        }
+        if (box != null && v.width > 0) {
+            v.getLocationInWindow(loc)
+            val x = (loc[0] - origin[0]).toFloat()
+            val y = (loc[1] - origin[1]).toFloat()
+            out += GlassRect(x + box.left * v.scaleX, y + box.top * v.scaleY, x + box.right * v.scaleX, y + box.bottom * v.scaleY,
+                radius * v.scaleX, alpha)
+        }
+        if (v is android.view.ViewGroup) for (i in 0 until v.childCount) collectGlass(v.getChildAt(i), alpha, out)
     }
 
     // ---- Building blocks ----
@@ -388,6 +437,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         })
         choice("Mode", false, listOf("Simple" to true, "Pro" to false), { a.simple }) { a.setSimple(it) }
         choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), { a.superpixel }) { a.setSuperpixel(it) }
+        choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
         choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
         choice("Codec", true, VideoCodec.entries.map { it.label to it }, { a.codec }) { a.setCodec(it) }
         choice("Bitrate", true, listOf("50" to 50, "100" to 100, "150 Mbps" to 150), { a.bitrateMbps }) { a.setBitrate(it) }
@@ -414,7 +464,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             setPadding(0, a.dp(12), 0, 0)
         })
         return ScrollView(a).apply {
-            background = GlassDrawable(a.dp(24).toFloat(), solid = true).apply { baseColor = 0xE6101418.toInt() }
+            background = GlassDrawable(a.dp(24).toFloat(), solid = true).apply { baseColor = 0xB8101418.toInt() }
             setPadding(a.dp(20), a.dp(14), a.dp(20), a.dp(14))
             isVerticalScrollBarEnabled = false
             visibility = View.GONE

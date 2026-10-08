@@ -19,6 +19,7 @@ import com.authrec.camera.SensorInfo
 import com.authrec.color.ColorMath
 import com.authrec.color.CubeLut
 import com.authrec.color.LogProfile
+import com.authrec.color.ViewLut
 import com.authrec.color.Primaries
 import com.authrec.record.Recorder
 import java.nio.ByteBuffer
@@ -116,17 +117,48 @@ class Renderer(
      * the same and keeps the phone cooler; recording always runs at the recorded resolution.
      */
     @Volatile var previewFullRes: Boolean = false
-    /**
-     * Full resolution ahead of a recording: jumping from the light preview straight into 4K
-     * recording dropped frames for ~1 s while the GPU clocked up, so the activity sets this,
-     * waits a moment, then starts recording.
-     */
-    @Volatile var warmingUp: Boolean = false
-    /** 0 off, 1 fix defect pixels, 2 + chroma NR low, 3 + chroma NR high. */
+    /** 0 off, 1 fix defect pixels, 2 + temporal colour NR, 3 + stronger temporal colour NR. */
     @Volatile var cleanup: Int = 2
 
     /** Red focus-peaking overlay on the preview (never recorded). */
     @Volatile var peaking: Boolean = false
+    /**
+     * Share of the image's height a cropped frame keeps (16:9 from 4:3 = 0.75; 1 = open gate): the
+     * preview darkens the rest so the framing shows while what's coming in stays visible.
+     */
+    @Volatile var frameCrop: Float = 1f
+    /** Glass controls over the preview: drawn with a blurred copy of it behind them (see [GlassBackdrop]). */
+    @Volatile var glassRects: List<GlassRect> = emptyList()
+    /**
+     * Debug (adb pipetiming=true): glFinish after every stage of [processFrame] and log the
+     * average time of each, so the GPU's share of each pass shows. Slows everything down a little.
+     */
+    @Volatile var pipeTiming = false
+    private val stageNs = LongArray(6)
+    private var stageFrames = 0
+    private var stageMark = 0L
+
+    private fun stage(i: Int) {
+        if (!pipeTiming) return
+        GLES30.glFinish()
+        val now = SystemClock.elapsedRealtimeNanos()
+        if (i >= 0) stageNs[i] += now - stageMark
+        stageMark = now
+    }
+
+    private fun logStages() {
+        if (!pipeTiming || ++stageFrames < 60) return
+        android.util.Log.i("AuthRec", "pipeline %s%s%s: CPU reads %.1f, upload %.1f, prep %.1f, develop %.1f, encode %.1f ms".format(
+            if (activeSuperpixel()) "superpixel" else "full size", if (recording != null) " recording" else "",
+            if (cleanup >= 2) " colour NR" else "",
+            *stageNs.filterIndexed { i, _ -> i != 4 }.map { it / 60 / 1e6 }.toTypedArray()))
+        stageNs.fill(0)
+        stageFrames = 0
+    }
+
+    /** Debug: log what the glass backdrop costs (adb glasstiming=true). */
+    @Volatile var glassTiming = false
+    private var backdrop: GlassBackdrop? = null
     /**
      * The log encoding the current LUT expects, when it isn't ours: the view converts to it before
      * the lookup (the recorded log stays in [profile]). null = apply the LUT to our log as is.
@@ -151,10 +183,6 @@ class Renderer(
     private var linearTex = 0
     private var viewTex = 0
     private var logTex = 0
-    /** Develop output before the finish pass (chroma NR, LUT). */
-    private var logRawTex = 0
-    private var spLogRawTex = 0
-    private var finishProgram = 0
     private var spViewTex = 0
     private var spLogTex = 0
     private var shadingTex = 0
@@ -173,13 +201,35 @@ class Renderer(
         val bakeLut: Boolean,
         val superpixel: Boolean,
         val quarterTurns: Int,
+        /** Encoder frame size and the part of the image (texture x, y, width, height) it shows. */
+        val outW: Int,
+        val outH: Int,
+        val crop: FloatArray,
         val context: EGLContext,
         val surface: EGLSurface,
         val frameNs: Long,
     ) {
+        /** Frames go to the encoder but don't count yet (see Recorder.commit). */
+        @Volatile var preroll = true
+        var commitPending = false
+        var prerollSlowestMs = 0.0
+        /** Sensor time of the first frame given to the encoder (its pts 0, also the audio's origin). */
+        var originNs = -1L
+        /** Sensor time of the clip's first frame (the commit); lost frames and timing count from it. */
         var firstTimestamp = -1L
         var lastTimestamp = -1L
         var dropped = 0
+        // Where time went, for the drops some clips start with (see timingSummary).
+        var slowestFrameMs = 0.0
+        var slowestFrameAt = 0.0
+        var slowestSwapMs = 0.0
+        val gaps = StringBuilder()
+
+        /** One line for the event log: when frames were lost and what the GL thread was doing. */
+        fun timingSummary() = "Recording timing: $dropped frames lost" +
+            (if (gaps.isNotEmpty()) " (at$gaps)" else "") +
+            ", slowest frame %.0f ms at %.2f s, slowest encoder hand-over %.0f ms, slowest pre-roll frame %.0f ms"
+                .format(slowestFrameMs, slowestFrameAt, slowestSwapMs, prerollSlowestMs)
     }
 
     private var frameCount = 0
@@ -207,12 +257,51 @@ class Renderer(
 
     /** null shows the plain log image. */
     fun setLut(lut: CubeLut?) {
+        sourceLut = lut
         pendingLut = lut
         lutEnabled = lut != null
     }
 
-    /** Starts feeding [recorder]; [onFailed] runs on the GL thread if the encoder surface can't be set up. */
-    fun startRecording(recorder: Recorder, fps: Int, bakeLut: Boolean, onFailed: (String) -> Unit) = handler.post {
+    // ---- The view LUT with eDR, the LUT's input conversion and strength folded in (ViewLut) ----
+
+    /** What a baked view LUT was made from; it's used only while all of this still holds. */
+    private data class ViewKey(val source: CubeLut, val profile: LogProfile, val lutInput: LogProfile?,
+                               val hi: Float, val lo: Float, val strength: Float)
+
+    @Volatile private var sourceLut: CubeLut? = null
+    /** Debug (adb bakedview=false): always compute the view per pixel, to compare. */
+    @Volatile var bakeViewLut = true
+    private val bakeThread = HandlerThread("view-lut").apply { start() }
+    private val bakeHandler = Handler(bakeThread.looper)
+    @Volatile private var bakeWanted: ViewKey? = null
+    @Volatile private var pendingBaked: Pair<ViewKey, CubeLut>? = null
+    private var bakedKey: ViewKey? = null
+    private var bakedTex = 0
+    private var bakedSize = 0
+
+    private fun currentViewKey(): ViewKey? = sourceLut?.let {
+        ViewKey(it, profile, lutInput, toneHighlights, toneShadows, lutStrength)
+    }
+
+    /** Bakes [key] on the bake thread (only the newest request is worked on). */
+    private fun requestBake(key: ViewKey) {
+        if (bakeWanted == key) return
+        bakeWanted = key
+        bakeHandler.post {
+            if (bakeWanted != key) return@post // a newer request follows
+            val lut = runCatching { ViewLut.bake(key.source, key.profile, key.lutInput, key.hi, key.lo, key.strength) }.getOrNull()
+                ?: return@post
+            pendingBaked = key to lut
+        }
+    }
+
+    /**
+     * Starts feeding [recorder] with frames of [outW]×[outH], the image's centre band of [cropHeight]
+     * (share of its height; 1 = open gate), as pre-roll until [commitRecording]. [onFailed] runs on
+     * the GL thread if the encoder surface can't be set up.
+     */
+    fun startRecording(recorder: Recorder, fps: Int, bakeLut: Boolean, outW: Int, outH: Int, cropHeight: Float,
+                       onFailed: (String) -> Unit) = handler.post {
         try {
             val tenBit = recorder.config.codec.tenBit
             val config = egl.chooseConfig(tenBit = tenBit, recordable = true)
@@ -220,21 +309,29 @@ class Renderer(
             val ctx = egl.createContext(config, egl.mainContext)
             val surface = egl.createWindowSurface(recorder.inputSurface, config)
             // Half turns can be baked in at the same frame size (front camera is upside down in landscape).
-            recording = Recording(recorder, bakeLut, superpixel, if (rotation == 2) 2 else 0, ctx, surface, 1_000_000_000L / fps)
+            recording = Recording(recorder, bakeLut, superpixel, if (rotation == 2) 2 else 0, outW, outH,
+                floatArrayOf(0f, (1f - cropHeight) / 2f, 1f, cropHeight), ctx, surface, 1_000_000_000L / fps)
         } catch (e: Exception) {
             onFailed(e.message ?: e.javaClass.simpleName)
         }
     }
 
-    /** Stops feeding the encoder; [onStopped] runs on the GL thread once no more frames will be drawn. */
-    fun stopRecording(onStopped: () -> Unit) = handler.post {
-        recording?.let {
+    /** Ends the pre-roll: the next frame is where the clip starts (its key frame follows soon after). */
+    fun commitRecording() = handler.post { recording?.commitPending = true }
+
+    /**
+     * Stops feeding the encoder; [onStopped] runs on the GL thread once no more frames will be drawn,
+     * with a line about the recording's frame timing (see [Recording.timingSummary]).
+     */
+    fun stopRecording(onStopped: (String?) -> Unit) = handler.post {
+        val summary = recording?.let {
             egl.makeCurrent(EGL14.EGL_NO_SURFACE)
             egl.destroySurface(it.surface)
             egl.destroyContext(it.context)
+            it.timingSummary()
         }
         recording = null
-        onStopped()
+        onStopped(summary)
     }
 
     /** Blocks (briefly) until GL is torn down, so a new renderer can take over the same Surface. */
@@ -246,9 +343,13 @@ class Renderer(
                 egl.destroyContext(it.context)
             }
             recording = null
+            backdrop?.release()
+            backdrop = null
+            releaseHistory()
             releaseWindowSurface()
             egl.release()
             thread.quitSafely()
+            bakeThread.quitSafely()
             done.countDown()
         }
         done.await(2, java.util.concurrent.TimeUnit.SECONDS)
@@ -259,15 +360,13 @@ class Renderer(
         prepProgram = Gl.computeProgram(PipelineShaders.prep)
         developProgram = Gl.computeProgram(PipelineShaders.develop)
         superpixelProgram = Gl.computeProgram(PipelineShaders.developSuperpixel)
-        finishProgram = Gl.computeProgram(PipelineShaders.finish)
         displayProgram = Gl.renderProgram(PipelineShaders.displayVertex, PipelineShaders.displayFragment)
 
         rawTex = Gl.texture2D(GLES30.GL_R16UI, w, h, linear = false)
         linearTex = Gl.texture2D(GLES30.GL_R32F, w, h, linear = false)
         viewTex = Gl.texture2D(GLES30.GL_RGBA16F, w, h, linear = true)
         logTex = Gl.texture2D(GLES30.GL_RGBA16F, w, h, linear = true)
-        logRawTex = Gl.texture2D(GLES30.GL_RGBA16F, w, h, linear = false)
-        spLogRawTex = Gl.texture2D(GLES30.GL_RGBA16F, w / 2, h / 2, linear = false)
+        noHistory = Gl.texture2D(GLES30.GL_RGBA16F, 1, 1, linear = false)
         spViewTex = Gl.texture2D(GLES30.GL_RGBA16F, w / 2, h / 2, linear = true)
         spLogTex = Gl.texture2D(GLES30.GL_RGBA16F, w / 2, h / 2, linear = true)
         uploadShading(floatArrayOf(1f, 1f, 1f, 1f), 1, 1)
@@ -280,12 +379,22 @@ class Renderer(
         val t0 = SystemClock.elapsedRealtimeNanos()
         var meta: FrameMeta? = null
         var processed = 0
-        if (recording != null) {
+        val rec = recording
+        if (rec != null) {
             // Every frame goes to the encoder, oldest first.
             while (true) {
                 val image = acquireNext() ?: break
+                val f0 = SystemClock.elapsedRealtimeNanos()
+                val ts = image.timestamp
                 meta = processFrame(image)
                 processed++
+                val ms = (SystemClock.elapsedRealtimeNanos() - f0) / 1e6
+                if (rec.preroll) {
+                    rec.prerollSlowestMs = maxOf(rec.prerollSlowestMs, ms)
+                } else if (ms > rec.slowestFrameMs) {
+                    rec.slowestFrameMs = ms
+                    rec.slowestFrameAt = (ts - rec.firstTimestamp) / 1e9
+                }
             }
         } else {
             reader.acquireLatestImage()?.let {
@@ -310,6 +419,7 @@ class Renderer(
 
     private fun processFrame(image: Image): FrameMeta? {
         egl.makeCurrent(windowSurface)
+        stage(-1)
         val timestamp = image.timestamp
         lastFrameMs = SystemClock.elapsedRealtime()
         val meta = metaSource()
@@ -319,13 +429,17 @@ class Renderer(
             sharpnessTimestamp = timestamp
         }
         frameCounter++
+        stage(0)
         image.use { uploadRaw(it) } // glTexSubImage2D copies the data before returning
         pendingLut?.let {
             uploadLut(it)
             pendingLut = null
         }
+        stage(1)
         runPipeline(meta)
         recording?.let { encodeFrame(it, timestamp) }
+        stage(5)
+        logStages()
         pendingLogCapture?.let { (width, onFrame) ->
             pendingLogCapture = null
             deliverLogCapture(width, onFrame)
@@ -334,13 +448,24 @@ class Renderer(
     }
 
     private fun encodeFrame(rec: Recording, timestamp: Long) {
-        if (rec.firstTimestamp < 0) {
-            rec.firstTimestamp = timestamp
+        if (rec.originNs < 0) {
+            rec.originNs = timestamp
             rec.recorder.onFirstVideoFrame(timestamp)
         }
-        if (rec.lastTimestamp >= 0) {
-            val gap = (timestamp - rec.lastTimestamp).toDouble() / rec.frameNs
-            rec.dropped += (gap.roundToInt() - 1).coerceAtLeast(0)
+        if (rec.commitPending) {
+            // The clip starts here: timing and lost frames count from this frame on.
+            rec.commitPending = false
+            rec.preroll = false
+            rec.recorder.commit(timestamp)
+            rec.firstTimestamp = timestamp
+            rec.lastTimestamp = -1L
+        }
+        if (!rec.preroll && rec.lastTimestamp >= 0) {
+            val lost = ((timestamp - rec.lastTimestamp).toDouble() / rec.frameNs).roundToInt() - 1
+            if (lost > 0) {
+                rec.dropped += lost
+                if (rec.gaps.length < 120) rec.gaps.append(" %.2f s ×%d".format((timestamp - rec.firstTimestamp) / 1e9, lost))
+            }
         }
         rec.lastTimestamp = timestamp
 
@@ -352,16 +477,22 @@ class Renderer(
         GLES30.glDeleteSync(fence)
 
         val sp = rec.superpixel
-        GLES30.glViewport(0, 0, if (sp) w / 2 else w, if (sp) h / 2 else h)
+        GLES30.glViewport(0, 0, rec.outW, rec.outH)
         drawTexture(
             when {
                 rec.bakeLut -> if (sp) spViewTex else viewTex
                 else -> if (sp) spLogTex else logTex
             },
             rotationQuarterTurns = rec.quarterTurns,
+            crop = rec.crop,
         )
-        EGLExt.eglPresentationTimeANDROID(egl.display, rec.surface, timestamp - rec.firstTimestamp)
+        if (Recorder.debugBars) drawTestBars(rec.outW, rec.outH)
+        EGLExt.eglPresentationTimeANDROID(egl.display, rec.surface, timestamp - rec.originNs)
+        val s0 = SystemClock.elapsedRealtimeNanos()
+        // Blocks when the encoder hasn't taken the previous frames yet.
         EGL14.eglSwapBuffers(egl.display, rec.surface)
+        val swapMs = (SystemClock.elapsedRealtimeNanos() - s0) / 1e6
+        if (!rec.preroll) rec.slowestSwapMs = maxOf(rec.slowestSwapMs, swapMs)
         egl.makeCurrent(windowSurface)
     }
 
@@ -398,6 +529,10 @@ class Renderer(
      * mean, which cancels small exposure changes without amplifying noise in dark areas the way
      * dividing by the squared mean does. At most ~200×200 blocks.
      *
+     * Weighted towards the region's centre (Gaussian, the edges count ~15 %): a tapped subject sits
+     * in the middle, and with every block counted equally a smooth subject (a berry, a face) lost
+     * to busy, out-of-focus background around it, which has far more texture once it's sharp.
+     *
      * Runs on the GL thread for every frame while AF or a tapped spot is being watched, so the
      * rows are copied out in bulk: reading pixel by pixel through the ByteBuffer cost ~20 ms a frame.
      */
@@ -415,11 +550,22 @@ class Renderer(
         val x0 = bx0 * 2
         val len = (bx1 - bx0 + 2) * 2
         if (rows.size != 4 || rows[0].size < len) rows = Array(4) { ShortArray(len) }
+        // Separable Gaussian weights, sigma = 0.55 of the half-size on each axis.
+        val cols = (bx1 - bx0 + step - 1) / step
+        if (colWeights.size < cols) colWeights = FloatArray(cols)
+        val halfX = (bx1 - bx0) / 2f
+        for (k in 0 until cols) {
+            val t = (k * step - halfX) / (0.55f * halfX)
+            colWeights[k] = kotlin.math.exp(-0.5f * t * t)
+        }
+        val halfY = (by1 - by0) / 2f
         var energy = 0.0
         var level = 0.0
-        var n = 0
+        var n = 0.0
         var by = by0
         while (by < by1) {
+            val ty = (by - by0 - halfY) / (0.55f * halfY)
+            val wy = kotlin.math.exp(-0.5f * ty * ty)
             for (k in 0 until 4) {
                 pixels.position((by * 2 + k) * strideShorts + x0)
                 pixels.get(rows[k], 0, len)
@@ -431,14 +577,17 @@ class Renderer(
                 return (ge + go) * 0.5f
             }
             var i = 0
+            var k = 0
             while (i < bx1 - bx0) {
                 val c = g(i, 0)
                 val dx = g(i + 1, 0) - c
                 val dy = g(i, 1) - c
-                energy += dx * dx + dy * dy
-                level += c
-                n++
+                val wgt = wy * colWeights[k]
+                energy += wgt * (dx * dx + dy * dy)
+                level += wgt * c
+                n += wgt
                 i += step
+                k++
             }
             by += step
         }
@@ -447,6 +596,7 @@ class Renderer(
     }
 
     private var rows = arrayOf<ShortArray>()
+    private var colWeights = FloatArray(0)
 
     private fun updateAutoGain(raw: Float) {
         if (autoGainFrozen) return
@@ -493,83 +643,248 @@ class Renderer(
         GLES30.glUniform1i(Gl.uniform(prepProgram, "uFixDefects"), if (cleanup >= 1) 1 else 0)
         GLES31.glDispatchCompute(groupsX, groupsY, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+        stage(2)
 
-        // Pass 2: demosaic, colour, log, LUT.
+        // Pass 2: demosaic, colour noise reduction, colour, log, the view (and the clean log).
         val p = profile
         val ccm = meta?.ccm ?: doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
         val camToTarget = ColorMath.multiply(ColorMath.convert(Primaries.REC709, p.primaries), ccm)
         val prog = if (sp) superpixelProgram else developProgram
+        val outW = if (sp) w / 2 else w
+        val outH = if (sp) h / 2 else h
         GLES30.glUseProgram(prog)
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, linearTex)
-        GLES31.glBindImageTexture(0, if (sp) spLogRawTex else logRawTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(0, if (sp) spViewTex else viewTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(1, if (sp) spLogTex else logTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        setViewUniforms(prog, p)
+        setColourNr(prog, meta, outW, outH, p)
         GLES30.glUniform2i(Gl.uniform(prog, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
         GLES30.glUniformMatrix3fv(Gl.uniform(prog, "uCamToTarget"), 1, false, ColorMath.toGlColumnMajor(camToTarget), 0)
         GLES30.glUniform1f(Gl.uniform(prog, "uExposure"), currentGain())
         GLES30.glUniform1i(Gl.uniform(prog, "uCurve"), p.shaderId)
-        val outGroupsX = if (sp) (w / 2 + 15) / 16 else groupsX
-        val outGroupsY = if (sp) (h / 2 + 15) / 16 else groupsY
-        GLES31.glDispatchCompute(outGroupsX, outGroupsY, 1)
-        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+        GLES31.glDispatchCompute((outW + 15) / 16, (outH + 15) / 16, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+        stage(3)
+    }
 
-        // Pass 3: chroma NR, then the clean log and the LUT/look view.
-        GLES30.glUseProgram(finishProgram)
-        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, if (sp) spLogRawTex else logRawTex)
-        Gl.bindTexture(1, GLES30.GL_TEXTURE_3D, lutTex)
-        GLES31.glBindImageTexture(0, if (sp) spViewTex else viewTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
-        GLES31.glBindImageTexture(1, if (sp) spLogTex else logTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uChromaNr"), (cleanup - 1).coerceIn(0, 2))
+    // ---- Temporal colour noise reduction (see PipelineShaders.developBase) ----
+
+    /** Two history images (read one, write the other, swap) at the develop output's size. */
+    private val history = IntArray(2)
+    private var historyW = 0
+    private var historyH = 0
+    private var historyRead = 0
+    private var historyFresh = true
+    private var historyProfile: LogProfile? = null
+    private var historyOnLog = false
+    /** 1×1 stand-in bound while colour NR is off, so the shader never sees an empty unit. */
+    private var noHistory = 0
+
+    private fun setColourNr(prog: Int, meta: FrameMeta?, outW: Int, outH: Int, p: LogProfile) {
+        if (cleanup < 2) {
+            releaseHistory()
+            Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, noHistory)
+            GLES31.glBindImageTexture(2, noHistory, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+            GLES30.glUniform1i(Gl.uniform(prog, "uTnr"), 0)
+            GLES30.glUniform1i(Gl.uniform(prog, "uTnrOnLog"), 0)
+            return
+        }
+        if (historyW != outW || historyH != outH) {
+            releaseHistory()
+            for (i in 0..1) history[i] = Gl.texture2D(GLES30.GL_RGBA16F, outW, outH, linear = false)
+            historyW = outW
+            historyH = outH
+            historyFresh = true
+        }
+        // The history holds the colour of what's recorded: the clean log when recording log,
+        // else the view (preview, baked recordings). Another target or profile: start over.
+        val onLog = recording?.bakeLut == false
+        if (historyProfile != p || historyOnLog != onLog) {
+            historyProfile = p
+            historyOnLog = onLog
+            historyFresh = true
+        }
+        GLES30.glUniform1i(Gl.uniform(prog, "uTnrOnLog"), if (onLog) 1 else 0)
+        Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, history[historyRead])
+        GLES31.glBindImageTexture(2, history[1 - historyRead], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES30.glUniform1i(Gl.uniform(prog, "uTnr"), if (historyFresh) 2 else 1)
+        historyFresh = false
+        historyRead = 1 - historyRead
+        GLES30.glUniform1f(Gl.uniform(prog, "uTnrAlpha"), if (cleanup >= 3) TNR_STRONG else TNR_NORMAL)
+        // Sensor noise for normalised RAW (S·x + O), carried through the prep pass's white
+        // balance and shading gains (~1.8 on average: variance scales by gain × S and gain² × O).
+        val (ns, no) = meta?.noise?.let { it[0] to it[1] } ?: fallbackNoise(meta?.iso ?: 400)
+        GLES30.glUniform2f(Gl.uniform(prog, "uNoise"), ns * NR_GAIN, no * NR_GAIN * NR_GAIN)
+    }
+
+    /** For a lens that doesn't report SENSOR_NOISE_PROFILE: roughly the X14 main camera's, by ISO. */
+    private fun fallbackNoise(iso: Int): Pair<Float, Float> = (iso * 6.6e-7f) to (iso * iso * 1.2e-12f)
+
+    private fun releaseHistory() {
+        if (historyW == 0) return
+        GLES30.glDeleteTextures(2, history, 0)
+        historyW = 0
+        historyH = 0
+    }
+
+    /**
+     * Binds the LUT (texture unit 1) and sets the view half's uniforms (PipelineShaders.viewCommon)
+     * for [prog], with our log profile [p]: the baked view LUT when one matches the settings, else
+     * the source LUT with eDR / conversion / strength done per pixel (while a bake catches up).
+     */
+    private fun setViewUniforms(prog: Int, p: LogProfile) {
+        pendingBaked?.let { (key, lut) ->
+            pendingBaked = null
+            bakedTex = uploadLutTexture(lut, bakedTex)
+            bakedSize = lut.size
+            bakedKey = key
+        }
+        val key = currentViewKey()?.takeIf { bakeViewLut }
+        val baked = key != null && key == bakedKey
+        if (key != null && !baked) requestBake(key)
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_3D, if (baked) bakedTex else lutTex)
         // Writing the full-size log image costs ~100 MB of memory traffic a frame; skip it unless used.
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uWriteLog"), if (recording?.bakeLut == false || pendingLogCapture != null) 1 else 0)
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uUseLut"), if (lutEnabled) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(prog, "uWriteLog"), if (recording?.bakeLut == false || pendingLogCapture != null) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(prog, "uUseLut"), if (lutEnabled) 1 else 0)
+        if (baked) {
+            GLES30.glUniform1i(Gl.uniform(prog, "uLutConvert"), 0)
+            GLES30.glUniform1i(Gl.uniform(prog, "uTone"), 0)
+            GLES30.glUniform1f(Gl.uniform(prog, "uLutSize"), bakedSize.toFloat())
+            GLES30.glUniform1f(Gl.uniform(prog, "uLutStrength"), 1f)
+            GLES30.glUniform1f(Gl.uniform(prog, "uSaturation"), saturation)
+            GLES30.glUniform1f(Gl.uniform(prog, "uVibrance"), vibrance)
+            return
+        }
         val lutIn = lutInput?.takeIf { it != p }
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uLutConvert"), if (lutIn != null) 1 else 0)
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uCurve"), p.shaderId)
+        GLES30.glUniform1i(Gl.uniform(prog, "uLutConvert"), if (lutIn != null) 1 else 0)
         if (lutIn != null) {
-            GLES30.glUniform1i(Gl.uniform(finishProgram, "uLutCurve"), lutIn.shaderId)
-            GLES30.glUniformMatrix3fv(Gl.uniform(finishProgram, "uLutGamut"), 1, false,
+            GLES30.glUniform1i(Gl.uniform(prog, "uLutCurve"), lutIn.shaderId)
+            GLES30.glUniformMatrix3fv(Gl.uniform(prog, "uLutGamut"), 1, false,
                 ColorMath.toGlColumnMajor(ColorMath.convert(p.primaries, lutIn.primaries)), 0)
         }
         val toneOn = abs(toneHighlights) > 0.001f || abs(toneShadows) > 0.001f
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uTone"), if (toneOn) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(prog, "uTone"), if (toneOn) 1 else 0)
         if (toneOn) {
-            GLES30.glUniform1f(Gl.uniform(finishProgram, "uToneHi"), toneHighlights)
-            GLES30.glUniform1f(Gl.uniform(finishProgram, "uToneLo"), toneShadows)
+            GLES30.glUniform1f(Gl.uniform(prog, "uToneHi"), toneHighlights)
+            GLES30.glUniform1f(Gl.uniform(prog, "uToneLo"), toneShadows)
             val toXyz = ColorMath.rgbToXyz(p.primaries)
-            GLES30.glUniform3f(Gl.uniform(finishProgram, "uLumaW"), toXyz[3].toFloat(), toXyz[4].toFloat(), toXyz[5].toFloat())
+            GLES30.glUniform3f(Gl.uniform(prog, "uLumaW"), toXyz[3].toFloat(), toXyz[4].toFloat(), toXyz[5].toFloat())
         }
-        GLES30.glUniform1f(Gl.uniform(finishProgram, "uLutSize"), lutSize.toFloat())
-        GLES30.glUniform1f(Gl.uniform(finishProgram, "uLutStrength"), lutStrength)
-        GLES30.glUniform1f(Gl.uniform(finishProgram, "uSaturation"), saturation)
-        GLES30.glUniform1f(Gl.uniform(finishProgram, "uVibrance"), vibrance)
-        GLES31.glDispatchCompute(outGroupsX, outGroupsY, 1)
-        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+        GLES30.glUniform1f(Gl.uniform(prog, "uLutSize"), lutSize.toFloat())
+        GLES30.glUniform1f(Gl.uniform(prog, "uLutStrength"), lutStrength)
+        GLES30.glUniform1f(Gl.uniform(prog, "uSaturation"), saturation)
+        GLES30.glUniform1f(Gl.uniform(prog, "uVibrance"), vibrance)
     }
 
     private fun drawToScreen() {
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-        GLES30.glViewport(0, 0, viewW, viewH)
-        GLES30.glClearColor(0f, 0f, 0f, 1f)
-        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
-
         // Letterbox the (possibly rotated) image into the view.
         val quarter = rotation % 2 == 1
         val imgAspect = if (quarter) h.toFloat() / w else w.toFloat() / h
         val viewAspect = viewW.toFloat() / viewH
         val (vw, vh) = if (viewAspect > imgAspect) (viewH * imgAspect).toInt() to viewH else viewW to (viewW / imgAspect).toInt()
-        GLES30.glViewport((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
         val sp = activeSuperpixel()
-        drawTexture(if (sp) spViewTex else viewTex, rotation, peakingTexel = if (peaking) (if (sp) 2f else 1f) else 0f)
+        val tex = if (sp) spViewTex else viewTex
+        val letterbox = intArrayOf((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
+        val rects = glassRects
+        val glass = if (rects.isNotEmpty()) (backdrop ?: GlassBackdrop().also { backdrop = it }) else null
+        val timingStart = if (glassTiming && glass == null) { GLES30.glFinish(); SystemClock.elapsedRealtimeNanos() } else 0L
+        // The glass's offscreen passes go first so the window's render pass stays in one piece. While
+        // recording, a fresh blur every third frame is plenty behind the controls.
+        glass?.let {
+            it.timing = glassTiming
+            it.prepare(tex, if (sp) w / 2 else w, if (sp) h / 2 else h, rotation, letterbox, viewW, viewH,
+                refresh = recording == null || frameCounter % 3 == 0L)
+        }
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glViewport(0, 0, viewW, viewH)
+        GLES30.glClearColor(0f, 0f, 0f, 1f)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        GLES30.glViewport(letterbox[0], letterbox[1], vw, vh)
+        drawTexture(tex, rotation, peakingTexel = if (peaking) (if (sp) 2f else 1f) else 0f)
+        drawFrameMask(letterbox[0], letterbox[1], vw, vh)
+        glass?.drawShapes(rects, viewW, viewH)
+        if (timingStart > 0) {
+            GLES30.glFinish()
+            screenNs += SystemClock.elapsedRealtimeNanos() - timingStart
+            if (++screenFrames == 90) {
+                android.util.Log.i("AuthRec", "screen draw without glass: %.2f ms a frame".format(screenNs / 90 / 1e6))
+                screenFrames = 0
+                screenNs = 0
+            }
+        }
+    }
+
+    private var screenFrames = 0
+    private var screenNs = 0L
+
+    private var maskProgram = 0
+
+    /**
+     * Darkens what a cropped frame leaves out (above and below its band of the image at
+     * x, y, w, h on screen) and draws thin frame lines at its edges.
+     */
+    private fun drawFrameMask(x: Int, y: Int, w: Int, h: Int) {
+        val keep = frameCrop
+        if (keep >= 0.999f) return
+        if (maskProgram == 0) maskProgram = Gl.renderProgram(PipelineShaders.displayVertex, PipelineShaders.solidFragment)
+        // The band runs along the screen's long side unless the image is shown turned a quarter.
+        val horizontal = rotation % 2 == 0
+        val span = if (horizontal) h else w
+        val bar = ((1f - keep) / 2f * span).roundToInt()
+        GLES30.glUseProgram(maskProgram)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        GLES30.glEnable(GLES30.GL_SCISSOR_TEST)
+        val color = Gl.uniform(maskProgram, "uColor")
+        fun fill(sx: Int, sy: Int, sw: Int, sh: Int, r: Float, g: Float, b: Float, a: Float) {
+            GLES30.glScissor(sx, sy, sw, sh)
+            GLES30.glUniform4f(color, r, g, b, a)
+            GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+        }
+        val line = 3
+        if (horizontal) {
+            fill(x, y, w, bar, 0f, 0f, 0f, 0.62f)
+            fill(x, y + h - bar, w, bar, 0f, 0f, 0f, 0.62f)
+            fill(x, y + bar, w, line, 1f, 1f, 1f, 0.55f)
+            fill(x, y + h - bar - line, w, line, 1f, 1f, 1f, 0.55f)
+        } else {
+            fill(x, y, bar, h, 0f, 0f, 0f, 0.62f)
+            fill(x + w - bar, y, bar, h, 0f, 0f, 0f, 0.62f)
+            fill(x + bar, y, line, h, 1f, 1f, 1f, 0.55f)
+            fill(x + w - bar - line, y, line, h, 1f, 1f, 1f, 0.55f)
+        }
+        GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
+        GLES30.glDisable(GLES30.GL_BLEND)
+    }
+
+    /** Debug (Recorder.debugBars): red, green, blue, white, 50 % grey across the top third of a [w]×[h] frame. */
+    private fun drawTestBars(w: Int, h: Int) {
+        if (maskProgram == 0) maskProgram = Gl.renderProgram(PipelineShaders.displayVertex, PipelineShaders.solidFragment)
+        GLES30.glUseProgram(maskProgram)
+        GLES30.glEnable(GLES30.GL_SCISSOR_TEST)
+        val colours = arrayOf(floatArrayOf(1f, 0f, 0f), floatArrayOf(0f, 1f, 0f), floatArrayOf(0f, 0f, 1f),
+            floatArrayOf(1f, 1f, 1f), floatArrayOf(0.5f, 0.5f, 0.5f))
+        val bw = w / colours.size
+        for ((i, c) in colours.withIndex()) {
+            GLES30.glScissor(i * bw, h - h / 3, bw, h / 3)
+            GLES30.glUniform4f(Gl.uniform(maskProgram, "uColor"), c[0], c[1], c[2], 1f)
+            GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+        }
+        GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
     }
 
     /** Mid-recording the mode is fixed by what the encoder was set up for; between recordings see [previewFullRes]. */
-    private fun activeSuperpixel() = recording?.superpixel ?: (superpixel || !(previewFullRes || warmingUp))
+    private fun activeSuperpixel() = recording?.superpixel ?: (superpixel || !previewFullRes)
 
-    /** [peakingTexel] > 0 enables focus peaking, sampling that many full-res pixels apart. */
-    private fun drawTexture(tex: Int, rotationQuarterTurns: Int, peakingTexel: Float = 0f) {
+    /** [peakingTexel] > 0 enables focus peaking, sampling that many full-res pixels apart. [crop]: see Recording. */
+    private fun drawTexture(tex: Int, rotationQuarterTurns: Int, peakingTexel: Float = 0f, crop: FloatArray? = null) {
         GLES30.glUseProgram(displayProgram)
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, tex)
         GLES30.glUniform1i(Gl.uniform(displayProgram, "uImage"), 0)
         GLES30.glUniform1i(Gl.uniform(displayProgram, "uRotation"), rotationQuarterTurns)
+        val c = crop ?: FULL_FRAME
+        GLES30.glUniform4f(Gl.uniform(displayProgram, "uCrop"), c[0], c[1], c[2], c[3])
         GLES30.glUniform1i(Gl.uniform(displayProgram, "uPeaking"), if (peakingTexel > 0) 1 else 0)
         GLES30.glUniform2f(Gl.uniform(displayProgram, "uTexel"), peakingTexel / w, peakingTexel / h)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
@@ -624,7 +939,13 @@ class Renderer(
     }
 
     private fun uploadLut(lut: CubeLut) {
-        if (lutTex != 0) GLES30.glDeleteTextures(1, intArrayOf(lutTex), 0)
+        lutTex = uploadLutTexture(lut, lutTex)
+        lutSize = lut.size
+    }
+
+    /** [lut] as a new RGBA16F 3D texture (replacing [old], if any); returns the texture. */
+    private fun uploadLutTexture(lut: CubeLut, old: Int): Int {
+        if (old != 0) GLES30.glDeleteTextures(1, intArrayOf(old), 0)
         val n = lut.size
         val rgba = FloatArray(n * n * n * 4)
         for (i in 0 until n * n * n) {
@@ -635,8 +956,8 @@ class Renderer(
         }
         val buf = ByteBuffer.allocateDirect(rgba.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().put(rgba)
         buf.rewind()
-        lutTex = IntArray(1).also { GLES30.glGenTextures(1, it, 0) }[0]
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lutTex)
+        val tex = IntArray(1).also { GLES30.glGenTextures(1, it, 0) }[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, tex)
         GLES30.glTexStorage3D(GLES30.GL_TEXTURE_3D, 1, GLES30.GL_RGBA16F, n, n, n)
         GLES30.glTexSubImage3D(GLES30.GL_TEXTURE_3D, 0, 0, 0, 0, n, n, n, GLES30.GL_RGBA, GLES30.GL_FLOAT, buf)
         for (param in intArrayOf(GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_TEXTURE_MAG_FILTER)) {
@@ -645,7 +966,7 @@ class Renderer(
         for (param in intArrayOf(GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_TEXTURE_WRAP_R)) {
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, param, GLES30.GL_CLAMP_TO_EDGE)
         }
-        lutSize = n
+        return tex
     }
 
     private fun updateStats(msPerFrame: Double, meta: FrameMeta?, frames: Int) {
@@ -674,6 +995,12 @@ class Renderer(
         const val AUTO_BIAS_EV = 0.3f
         /** Until the first measurement arrives. */
         const val DEFAULT_GAIN_EV = 2f
+        /** History weight of colour NR where nothing moved: "+ Colour" / "+ Colour+". */
+        private const val TNR_NORMAL = 0.7f
+        private const val TNR_STRONG = 0.85f
+        /** Average white balance × shading gain between the RAW and the prep pass's output. */
+        private const val NR_GAIN = 1.8f
+        private val FULL_FRAME = floatArrayOf(0f, 0f, 1f, 1f)
     }
 
     private fun EglCore.swapWindow() = EGL14.eglSwapBuffers(display, windowSurface)

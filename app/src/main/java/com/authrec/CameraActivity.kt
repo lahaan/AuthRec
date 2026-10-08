@@ -133,6 +133,13 @@ class CameraActivity : Activity() {
         private set
     internal var wbTint = 0
         private set
+    /** Shape of the recorded frame: a centre crop of the 4:3 sensor image, or all of it. */
+    internal enum class FrameAspect(val label: String, val ratio: Float) {
+        OPEN_GATE("4:3", 4f / 3f), WIDE("16:9", 16f / 9f), UNIVISIUM("2:1", 2f), SCOPE("2.39:1", 2.39f)
+    }
+    internal var aspect = FrameAspect.OPEN_GATE
+        private set
+
     /** The original layout instead of Glass (Settings → Interface). */
     internal var classicUi = false
         private set
@@ -185,7 +192,8 @@ class CameraActivity : Activity() {
         private set
     private var lastResult: String? = null
 
-    internal val recording get() = recorder != null
+    /** A clip is being recorded (past the pre-roll that follows pressing REC, see [startRecording]). */
+    internal val recording get() = recorder != null && !warmingUp
     /** Frames lost while recording (from the renderer's stats). */
     internal var droppedFrames = 0
         private set
@@ -242,6 +250,7 @@ class CameraActivity : Activity() {
     private fun loadPrefs() {
         simple = prefs.getBoolean("simple", true)
         classicUi = prefs.getString("uiStyle", "glass") == "classic"
+        aspect = runCatching { FrameAspect.valueOf(prefs.getString("aspect", null)!!) }.getOrDefault(FrameAspect.OPEN_GATE)
         profile = runCatching { LogProfile.valueOf(prefs.getString("profile", null)!!) }.getOrDefault(LogProfile.APPLE_LOG)
         codec = runCatching { VideoCodec.valueOf(prefs.getString("codec", null)!!) }.getOrDefault(VideoCodec.HEVC_10)
         bitrateMbps = prefs.getInt("bitrate", 150)
@@ -281,6 +290,7 @@ class CameraActivity : Activity() {
         prefs.edit()
             .putBoolean("simple", simple)
             .putString("uiStyle", if (classicUi) "classic" else "glass")
+            .putString("aspect", aspect.name)
             .putString("profile", profile.name)
             .putString("codec", codec.name)
             .putInt("bitrate", bitrateMbps)
@@ -512,6 +522,14 @@ class CameraActivity : Activity() {
 
     internal fun currentView() = views.getOrNull(viewIndex)
 
+    /** Where the Glass layout's controls are (surface px), for the blurred backdrop behind them. */
+    private var glassRects: List<com.authrec.gl.GlassRect> = emptyList()
+
+    internal fun setGlassRects(rects: List<com.authrec.gl.GlassRect>) {
+        glassRects = rects
+        renderer?.glassRects = rects
+    }
+
     /** eDR shapes looks and LUTs; the plain log view shows the log as recorded. */
     internal fun edrAvailable() = currentView() !is ViewEntry.LogView
 
@@ -572,6 +590,29 @@ class CameraActivity : Activity() {
         settingsChanged()
     }
     internal fun toggleAwbLock() = setCapture(capture.copy(awbLock = !capture.awbLock))
+    internal fun cycleAspect() = setAspect(FrameAspect.entries[(aspect.ordinal + 1) % FrameAspect.entries.size])
+    internal fun setAspect(a: FrameAspect) {
+        aspect = a
+        applyAspect()
+        settingsChanged()
+    }
+
+    private fun applyAspect() {
+        val cam = camera ?: return
+        renderer?.frameCrop = frameSize(cam).third
+    }
+
+    /**
+     * Recorded frame for the current resolution and [aspect]: width, height (multiples of 16, which
+     * every encoder takes) and the share of the image's height it keeps.
+     */
+    internal fun frameSize(cam: RawCamera): Triple<Int, Int, Float> {
+        val w = if (superpixel) cam.info.size.width / 2 else cam.info.size.width
+        val h = if (superpixel) cam.info.size.height / 2 else cam.info.size.height
+        if (aspect.ratio <= w.toFloat() / h + 0.01f) return Triple(w, h, 1f)
+        val cropH = (Math.round(w / aspect.ratio / 16f) * 16).coerceAtMost(h)
+        return Triple(w, cropH, cropH.toFloat() / h)
+    }
     internal fun togglePriorityPanel() {
         priorityPanelOpen = !priorityPanelOpen
         updateUi()
@@ -758,14 +799,16 @@ class CameraActivity : Activity() {
         softAf?.cancel()
         softContinuous = continuous
         capture = capture.copy(af = AfMode.SOFTWARE, focusPoint = if (meter) PointF(u, v) else null)
-        // Centre AF looks at a bigger area so it isn't fooled by one small detail.
-        val half = if (continuous) 0.12f else 0.07f
+        // Centre AF looks at a bigger area so it isn't fooled by one small detail; a tapped spot
+        // a small one (it used to get the centre's 24 % box when following, so busy background
+        // around a small subject decided where focus went).
+        val half = if (meter) TAP_AF_HALF else 0.12f
         softAf = SoftwareAf(
             Handler(mainLooper), r, cam.info.minFocusDiopters,
             sensorClockNs = { if (cam.info.timestampsAreBoottime) SystemClock.elapsedRealtimeNanos() else System.nanoTime() },
             moveLens = { d -> capture = capture.copy(focusDiopters = d); cam.update(capture) },
             onLocked = { d -> Log.i(TAG, "contrast AF locked at %.2f diopters (%.2f m)".format(d, if (d > 0) 1 / d else Float.POSITIVE_INFINITY)) },
-        ).also { it.start(floatArrayOf(u - half, v - half, u + half, v + half), continuous) }
+        ).also { it.start(floatArrayOf(u - half, v - half, u + half, v + half), continuous, spot = meter) }
         updateUi()
     }
 
@@ -1364,6 +1407,8 @@ class CameraActivity : Activity() {
         applyLookAdjust()
         applyWbShift()
         applyExposure()
+        r.glassRects = glassRects
+        applyAspect()
         refreshViews(selectLabel = prefs.getString("view", null))
         applyView()
         attachSurface()
@@ -1455,6 +1500,7 @@ class CameraActivity : Activity() {
     internal fun setSuperpixel(on: Boolean) {
         superpixel = on
         renderer?.superpixel = on
+        applyAspect()
         settingsChanged()
     }
 
@@ -1519,16 +1565,21 @@ class CameraActivity : Activity() {
 
     // ---- Recording ----
 
-    internal fun toggleRecording() = if (recorder == null && !warmingUp) startRecording() else stopRecording()
+    internal fun toggleRecording() = if (recorder == null) startRecording() else stopRecording()
 
-    /** Between pressing REC and the first recorded frame while the pipeline warms up at full resolution. */
+    /**
+     * Pre-roll: between pressing REC and the clip's first frame. The encoder already runs (its
+     * frames are thrown away) while the GPU clocks up at full resolution and the encoder allocates
+     * its buffers; see Recorder. Jumping straight in lost frames in some clips' first seconds.
+     */
     internal var warmingUp = false
         private set
-    private val startAfterWarmUp = Runnable {
-        if (warmingUp) {
-            warmingUp = false
-            if (resumed) startRecording() else renderer?.warmingUp = false
-        }
+    private val commitRecording = Runnable {
+        if (!warmingUp || recorder == null) return@Runnable
+        warmingUp = false
+        renderer?.commitRecording()
+        recordStartMs = SystemClock.elapsedRealtime()
+        updateUi()
     }
 
     private fun startRecording() {
@@ -1539,17 +1590,7 @@ class CameraActivity : Activity() {
             showMessage("Phone too hot to record (%.1f °C); the system would close the app mid-recording".format(batteryTempC))
             return
         }
-        // The preview runs at half resolution to save power; jumping straight into 4K recording
-        // dropped frames for ~1 s while the GPU clocked up. Run full resolution for a moment first.
-        if (!superpixel && !r.previewFullRes && !r.warmingUp) {
-            r.warmingUp = true
-            warmingUp = true
-            updateUi()
-            info.postDelayed(startAfterWarmUp, WARM_UP_MS)
-            return
-        }
-        val w = if (superpixel) cam.info.size.width / 2 else cam.info.size.width
-        val h = if (superpixel) cam.info.size.height / 2 else cam.info.size.height
+        val (w, h, keep) = frameSize(cam)
         val config = RecordConfig(codec, bitrateMbps, capture.fps, audioOn, cam.info.timestampsAreBoottime)
         val rec = try {
             Recorder(this, config, w, h)
@@ -1560,38 +1601,49 @@ class CameraActivity : Activity() {
             return
         }
         recorder = rec
+        warmingUp = true
         recordStartMs = SystemClock.elapsedRealtime()
         lastResult = null
-        EventLog.log("Recording ${w}x$h ${codec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
+        EventLog.log("Recording ${w}x$h (${aspect.label}) ${codec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
             "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, " +
             "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, WB shift $wbWarmth/$wbTint, " +
             "battery %.1f °C".format(batteryTempC))
         // In simple mode the recording is what you see, so bake the look in.
-        r.startRecording(rec, capture.fps, bakeLut || simple) { err ->
+        r.startRecording(rec, capture.fps, bakeLut || simple, w, h, keep) { err ->
             runOnUiThread {
                 lastResult = "Encoder surface failed: $err"
                 stopRecording()
             }
         }
+        // The preview runs at half resolution between recordings to save power; the pre-roll runs
+        // at the recorded size so the GPU has clocked up before the clip starts.
+        info.postDelayed(commitRecording, if (superpixel) PRE_ROLL_2K_MS else PRE_ROLL_MS)
         updateUi()
     }
 
     /** [why]: shown with the result when something other than the user stopped the recording. */
     private fun stopRecording(why: String? = null) {
-        if (warmingUp) {
-            info.removeCallbacks(startAfterWarmUp)
-            warmingUp = false
-            renderer?.warmingUp = false
-            updateUi()
-        }
+        info.removeCallbacks(commitRecording)
+        // Stopped before the clip began: the encoder only ever had pre-roll, nothing to keep.
+        val cancelled = warmingUp
+        warmingUp = false
         val rec = recorder ?: return
         val r = renderer ?: return
-        r.warmingUp = false
         recorder = null
         stopping = true
         updateUi()
-        r.stopRecording {
+        r.stopRecording { timing ->
+            if (!cancelled) timing?.let { EventLog.log(it) }
             rec.stop { result ->
+                if (cancelled) {
+                    EventLog.log("Recording cancelled during the pre-roll" + (why?.let { ": $it" } ?: ""))
+                    runOnUiThread {
+                        stopping = false
+                        why?.let { lastResult = it }
+                        updateUi()
+                    }
+                    return@stop
+                }
                 val secs = (SystemClock.elapsedRealtime() - recordStartMs) / 1000.0
                 val msg = (why?.let { "$it. " } ?: "") + "Saved ${result.frames} frames, ${result.bytes / 1_000_000} MB, " +
                     "≈%.0f Mbps".format(result.bytes * 8 / secs / 1e6) +
@@ -1719,7 +1771,8 @@ class CameraActivity : Activity() {
         val cam = camera ?: return
         val m = stats.meta
         val shutter = if (m != null && m.exposureNs > 0) "1/${(1e9 / m.exposureNs).toInt()}" else "-"
-        val out = if (superpixel) "${cam.info.size.width / 2}×${cam.info.size.height / 2} superpixel" else "${cam.info.size.width}×${cam.info.size.height}"
+        val (fw, fh) = frameSize(cam)
+        val out = "$fw×$fh" + (if (aspect != FrameAspect.OPEN_GATE) " ${aspect.label}" else "") + if (superpixel) " superpixel" else ""
         // Sensor ISO times the digital gain before the log curve: what the noise looks like.
         val gainEv = renderer?.totalGainEv ?: 0f
         val effectiveIso = m?.iso?.let { (it * Math.pow(2.0, gainEv.toDouble())).roundToInt() }
@@ -1742,7 +1795,7 @@ class CameraActivity : Activity() {
                     ?.let { append("\n%.0f%% of the view blown out; eDR can bring it back".format(it * 100)) }
                 if (m != null && m.shading == null) append("\nno lens shading map")
             }
-            recorder?.takeIf { classicUi || !simple }?.let {
+            recorder?.takeIf { !warmingUp && (classicUi || !simple) }?.let {
                 val secs = (SystemClock.elapsedRealtime() - recordStartMs) / 1000
                 if (isNotEmpty()) append("\n")
                 append("● REC %d:%02d · %s".format(secs / 60, secs % 60, if (bakeLut || simple) "look baked in" else "clean log"))
@@ -1799,8 +1852,11 @@ class CameraActivity : Activity() {
      * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false,
      * wbwarm / wbtint = -100..100 (white balance trim), ui = glass | classic (rebuilds the screen),
      * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
-     * recdebug = split | dropkey | off (encoder output handling: deliver frames in pieces / lose
-     * the first key frame; see Recorder).
+     * aspect = 4:3 | 16:9 | 2:1 | 2.39:1 (recorded frame), glasstiming = true (log the backdrop's GPU time),
+     * pipetiming = true (log each pipeline stage's time, with glFinish between them),
+     * bakedview = false (view math per pixel instead of the baked view LUT, to compare),
+     * recdebug = split | dropkey | bars | off (encoder output handling: deliver frames in pieces /
+     * lose the first key frame; bars: colour bars in the recording; see Recorder).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -1883,9 +1939,13 @@ class CameraActivity : Activity() {
         extras.getString("tap")?.split(",")?.map { it.toFloat() }?.let { (u, v) -> focusAt(u, v, lock = extras.getBoolean("lock", false)) }
         if (extras.getBoolean("afreset", false)) resetFocusToAuto()
         if (extras.containsKey("fullpreview")) renderer?.previewFullRes = extras.getBoolean("fullpreview")
+        if (extras.containsKey("glasstiming")) renderer?.glassTiming = extras.getBoolean("glasstiming")
+        if (extras.containsKey("pipetiming")) renderer?.pipeTiming = extras.getBoolean("pipetiming")
+        if (extras.containsKey("bakedview")) renderer?.bakeViewLut = extras.getBoolean("bakedview")
         extras.getString("recdebug")?.let {
             Recorder.debugSplitFrames = it == "split"
             Recorder.debugDropFirstKey = it == "dropkey"
+            Recorder.debugBars = it == "bars"
         }
         // Debug: pretend the battery is this hot (until the next real reading), e.g. fakeheat=47.5.
         if (extras.containsKey("fakeheat")) {
@@ -1893,6 +1953,7 @@ class CameraActivity : Activity() {
         }
         savePrefs()
         updateUi()
+        extras.getString("aspect")?.let { v -> FrameAspect.entries.firstOrNull { it.label == v || it.name == v }?.let { setAspect(it) } }
         extras.getString("ui")?.let { setClassicUi(it == "classic") }
         when (extras.getString("cmd")) {
             // Give the camera a moment to start when launched and told to record in one go.
@@ -1953,10 +2014,13 @@ class CameraActivity : Activity() {
         private const val EDR_HINT_CLIP = 0.04f
         /** ± range of the EV slider. */
         const val EV_RANGE = 8f
+        /** Half-size of a tapped contrast-AF region (0..1 of the image; the measure weights its centre). */
+        private const val TAP_AF_HALF = 0.06f
         /** Effective ISO from which the exposure slider's value turns amber. */
         private const val NOISY_ISO = 3200
-        /** Full-resolution processing before a 4K recording starts (see [startRecording]). */
-        private const val WARM_UP_MS = 1000L
+        /** Pre-roll before a clip starts (see [warmingUp]): 4K, and 2K superpixel. */
+        private const val PRE_ROLL_MS = 1000L
+        private const val PRE_ROLL_2K_MS = 500L
         private const val LUT_INPUT_MENU = 9_000
         private const val LUT_INPUT_BASE = 9_001
         private const val RESCAN_ITEM = 10_000

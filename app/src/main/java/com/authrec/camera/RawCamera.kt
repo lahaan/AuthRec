@@ -107,6 +107,11 @@ class FrameMeta(
     val afState: Int,
     /** The lens reports it's still travelling to the requested focus position. */
     val lensMoving: Boolean,
+    /**
+     * Sensor noise for normalised RAW values x: variance = noise[0]·x + noise[1] (the greens'
+     * SENSOR_NOISE_PROFILE), or null if the lens doesn't report it. Drives colour NR's motion test.
+     */
+    val noise: FloatArray? = null,
 )
 
 /**
@@ -662,6 +667,11 @@ class RawCamera(
         val black = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL) ?: staticBlack
         val white = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)?.toFloat() ?: staticWhite
 
+        // Pairs in CFA channel order (R, G_even, G_odd, B); the greens carry most of the brightness.
+        val noise = result.get(CaptureResult.SENSOR_NOISE_PROFILE)?.takeIf { it.isNotEmpty() }?.let { pairs ->
+            val greens = if (pairs.size >= 3) listOf(pairs[1], pairs[2]) else pairs.toList()
+            floatArrayOf(greens.map { it.first }.average().toFloat(), greens.map { it.second }.average().toFloat())
+        }?.takeIf { n -> n.all { it.isFinite() && it >= 0f } }
         val shadingMap = result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
         val shading = shadingMap?.let { m ->
             FloatArray(m.gainFactorCount).also { m.copyGainFactors(it, 0) }
@@ -675,6 +685,7 @@ class RawCamera(
                 "${if (ispCcm != null) "ISP" else if (sceneNeutral != null && calibration != null) "sensor calibration" else "none"} " +
                 "${ccm.joinToString(" ", "[", "]") { f(it) }}, black ${black.joinToString("/") { "%.1f".format(it) }}, white ${"%.0f".format(white)}, " +
                 "lens shading ${shadingMap?.let { "${it.columnCount}x${it.rowCount}" } ?: "none"}, " +
+                "noise ${noise?.let { "%.2e·x + %.2e".format(it[0], it[1]) } ?: "not reported"}, " +
                 "ISO ${result.get(CaptureResult.SENSOR_SENSITIVITY)} at 1/${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { (1e9 / it).toInt() }}$origin")
         }
 
@@ -691,6 +702,7 @@ class RawCamera(
             focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f,
             afState = result.get(CaptureResult.CONTROL_AF_STATE) ?: 0,
             lensMoving = result.get(CaptureResult.LENS_STATE) == CaptureResult.LENS_STATE_MOVING,
+            noise = noise,
         )
     }
 

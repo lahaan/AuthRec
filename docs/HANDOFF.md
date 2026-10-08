@@ -72,15 +72,34 @@ Not verified:
 - Look editor "Clip frame" with 10-bit clips; LUT import of unusual .cube files (DOMAIN, 1D).
 - AE: Priority at its limits; "limits reached" warning.
 
+## After 0.3.0 (on main, 2026-10-08; not released)
+
+Owner's round after 0.3.0 (feedback/notes.md items 22–32), all tested on the X14 at night in a
+dark room (ISO 3200, magenta LEDs), so daylight behaviour is still to be seen:
+- Tap AF on contrast-AF lenses (zoom routes, backup telephoto): locked on a bottle at 0.25 m on
+  the 2.6x and held it 16 s. Needs the owner's bottle-and-background test in daylight.
+- Glass: real backdrop (blurred preview inside each control, refracting bevel), gloss fixed on
+  round buttons; ~1.5 ms a preview frame.
+- Frame 4:3 / 16:9 / 2:1 / 2.39:1: recorded 4096×2304 and 2048×864, clean decode.
+- Start-of-clip drops: pre-roll + lighter 4K pipeline (~19 ms a frame, was ~27); 4 clips, 0 lost.
+  Clean log recording checked. Baked view LUT matches the per-pixel view (block means within
+  1.5 levels between two frames).
+- Clean-up: 8-neighbour pixel fix; "+ Colour"/"+ Colour+" is now temporal colour-only NR on the
+  finished view (or the log when recording log), replacing the spatial chroma filter (blotchy,
+  crushed darks). ISO 3200, static scene: colour noise −55…−69 % on 1x and the ultrawide, levels
+  within ±0.5, recorded luma untouched (the files even keep ~10 % more luma grain at 150 Mbps, as
+  the encoder no longer spends its bits on colour noise). 4K cost ~+2 ms. Not tested: motion
+  (pans, moving coloured things) and daylight.
+
 ## Start here (next session)
 
-1. Read `feedback/notes.md` (items 15–21 are 0.3.0's), then anything new in `feedback/`.
+1. Read `feedback/notes.md` (items 22–32 are the newest), then anything new in `feedback/`.
 2. 0.3.0 is out (pre-release, same signing key as 0.2.2). From the friend's next diagnostics, check the `Encoder …` line of
    her recordings (partial frames? key frame first?), the `… colour:` lines (physical results on
    `0/4`, `0/5`?), and that the scan kept 4.1x and skipped `0/3` after one crash.
 3. The owner will send UI sketches for the Glass layout; layouts live in `ui/` (CLAUDE.md).
-4. Owner decisions pending (see "Ideas" below): noise (item 5: ETTR-style AE / gain off), whether
-   a 1 s REC warm-up is acceptable.
+4. Owner decisions pending (see "Ideas" below): ETTR (proposal below), whether the 1 s REC
+   pre-roll is fine (the clip starts 1 s after the press).
 
 ## After 0.2.2
 
@@ -111,12 +130,19 @@ Not verified:
   CONTROL_ZOOM_RATIO 0.6, using the active physical camera's CFA/levels per frame
   (`LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID`; the UW is GRBG, the main RGGB). Can be tried on the
   X14's logical camera first.
-- Real backdrop blur for Glass panels over the image (render a blurred copy in the GL display
-  pass); for now the panels use a dark translucent base.
-
-- **ETTR-style exposure** (for item 5's noise): drive sensor exposure from the RAW histogram and
-  lower the digital gain by the same amount; 2–3 EV more light in daylight, less highlight
-  headroom. The owner is fine with the noise for now and chose tone balance instead (above).
+- **ETTR exposure** (owner asked 2026-10-07; proposal): an "ETTR" switch for AE Auto. Measure
+  the RAW's highlights on a denser grid (99.5th percentile of green, ignoring clipped specks),
+  raise sensor exposure through AE compensation until they sit ~0.25 EV under white, and lower
+  the digital gain by exactly the compensation applied, so the view keeps its brightness while
+  the sensor gets more light. Gains only where Xiaomi's AE leaves headroom (daylight: it exposes
+  RAW 2–3 EV under its rendering, so up to ~2 EV less noise); none at night (already at max
+  ISO / 1/fps). Costs: highlight headroom, exposure that moves when bright things enter the
+  frame (smoothed, with a faster way down than up), and the auto gain can't keep learning while
+  compensation is applied (learn at comp 0, hold during ETTR, re-learn when it returns to 0).
+  Test in daylight with refshot (RAW clip point) before shipping.
+- Temporal NR beyond colour: the colour-only version is in (Clean "+ Colour"); luma stays as is
+  (owner doesn't mind grain). If pans or moving subjects smear, motion compensation is the next
+  step (MotionCam 5.0.9 aligns with optical flow in the Bayer domain before blending; item 32).
 - Lighter 4K pipeline for heat: prep pass into R16F isn't allowed as an image format in GLES 3.1;
   next candidates: compute the LUT view at half resolution while recording log, zero-copy RAW
   upload (AHardwareBuffer, needs NDK), fewer full-res RGBA16F passes.
@@ -130,5 +156,9 @@ Not verified:
 
 - One phone, over USB; it runs hot while the camera is open. See CLAUDE.md "Mind the heat".
 - `am start` hooks pause/resume the activity (camera reopens); use `adb shell input tap` for UI.
+- Right after an install, a `cmd=rec` in the intent that starts the app arrives before the camera
+  is open and is cancelled in the pre-roll ("no video was recorded"); `tools/rectest.sh` then
+  pulls the previous clip. Open the app once first.
+- The X14's HEVC encoder tops out at ~150 Mbps (`bitrate=400` records ~150).
 - The event log (`adb shell run-as com.authrec cat files/events.log`) is the quickest way to see
   what the camera did; it's also what testers send via Send diagnostics.

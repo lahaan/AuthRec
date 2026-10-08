@@ -20,6 +20,12 @@ import kotlin.math.sqrt
  * sharpness drops and stays down (subject or framing changed): a short local search first,
  * a full sweep only if the peak has moved outside it.
  *
+ * A tapped spot ([start] with spot = true) is handled as "this subject": of the coarse sweep's
+ * peaks it takes the nearest clear one rather than the strongest (a subject in front of busy
+ * background has the weaker peak: on the X14's 2.6x and the 15 Ultra's telephotos focus went to
+ * the leaves behind a tapped berry), and following it waits longer before refocusing and only
+ * ever searches near it, so a gust or a shaky hand can't send focus back to the background.
+ *
  * Positions are spaced evenly in sqrt(diopters), which puts more of them near infinity.
  */
 class SoftwareAf(
@@ -35,6 +41,9 @@ class SoftwareAf(
 
     private var phase = Phase.IDLE
     private var continuous = false
+    private var spot = false
+    /** Times a spot's local search has been moved along because its peak sat at the edge. */
+    private var localShifts = 0
     private var plan: List<Float> = emptyList()
     private val results = mutableListOf<Pair<Float, Float>>()
     private var step = 0
@@ -47,10 +56,11 @@ class SoftwareAf(
     /** Frames exposed before this (sensor clock) predate the current move and are ignored. */
     private var movedAtNs = 0L
 
-    /** [region]: left, top, right, bottom in 0..1 image coordinates. */
-    fun start(region: FloatArray, continuous: Boolean) {
+    /** [region]: left, top, right, bottom in 0..1 image coordinates. [spot]: a tapped subject. */
+    fun start(region: FloatArray, continuous: Boolean, spot: Boolean = false) {
         cancel()
         this.continuous = continuous
+        this.spot = spot
         renderer.sharpnessRegion = region
         sweep(Phase.COARSE, List(COARSE_STEPS) { i -> toDiopters(i / (COARSE_STEPS - 1f)) })
     }
@@ -110,26 +120,61 @@ class SoftwareAf(
             moveTo(plan[step])
             return
         }
-        android.util.Log.d("AuthRec", "contrast AF $phase: " + results.joinToString { (d, v) -> "%.2fD=%.6f".format(d, v) })
         val bestIndex = results.indices.maxBy { results[it].second }
-        val best = results[bestIndex].first
+        val chosen = if (phase == Phase.COARSE && spot) nearestPeak(bestIndex) else bestIndex
+        android.util.Log.d("AuthRec", "contrast AF $phase: " + results.joinToString { (d, v) -> "%.2fD=%.6f".format(d, v) } +
+            if (chosen != bestIndex) " → nearest clear peak %.2fD (strongest %.2fD)".format(results[chosen].first, results[bestIndex].first) else "")
         when (phase) {
             Phase.COARSE -> {
-                // ±1.5 coarse steps: wide enough that the coarse pass's lag can't hide the peak.
-                val u = toUnit(best)
-                val span = 1.5f / (COARSE_STEPS - 1)
-                sweep(Phase.FINE, List(FINE_STEPS) { i -> toDiopters((u - span + 2 * span * i / (FINE_STEPS - 1)).coerceIn(0f, 1f)) })
+                // The coarse pass runs far → near and reads each position before the lens has quite
+                // arrived, so its peak shows up about a step too near (X14 2.6x: 6.7 D coarse, 5.0 D
+                // fine). The fine window spans 3 coarse steps, two of them on the far side.
+                val u = toUnit(results[chosen].first)
+                val step = 1f / (COARSE_STEPS - 1)
+                val from = u - 2 * step
+                sweep(Phase.FINE, List(FINE_STEPS) { i -> toDiopters((from + 3 * step * i / (FINE_STEPS - 1)).coerceIn(0f, 1f)) })
             }
             Phase.LOCAL -> {
-                // Peak at the edge of the local window: it moved further, do a full sweep.
-                if (bestIndex == 0 || bestIndex == results.lastIndex) {
-                    sweep(Phase.COARSE, List(COARSE_STEPS) { i -> toDiopters(i / (COARSE_STEPS - 1f)) })
-                } else {
-                    lock(refine(bestIndex))
+                val atEdge = bestIndex == 0 || bestIndex == results.lastIndex
+                when {
+                    !atEdge -> lock(refine(bestIndex))
+                    // A followed spot: walk the window along towards its peak, never a full sweep
+                    // (that's what used to jump back to the background).
+                    spot && localShifts < MAX_LOCAL_SHIFTS -> {
+                        localShifts++
+                        localSearch(results[bestIndex].first)
+                    }
+                    spot -> lock(results[bestIndex].first)
+                    // Peak at the edge of the local window: it moved further, do a full sweep.
+                    else -> sweep(Phase.COARSE, List(COARSE_STEPS) { i -> toDiopters(i / (COARSE_STEPS - 1f)) })
                 }
             }
             else -> lock(refine(bestIndex))
         }
+    }
+
+    /**
+     * For a tapped spot: the nearest coarse position that is a real peak (a local maximum that is
+     * a good share of the strongest and stands clearly above the curve's floor), else the strongest.
+     * Positions run from infinity to the closest focus, so a later index is nearer.
+     */
+    private fun nearestPeak(strongest: Int): Int {
+        val max = results[strongest].second
+        val min = results.minOf { it.second }
+        for (i in results.indices.reversed()) {
+            val v = results[i].second
+            val left = results.getOrNull(i - 1)?.second ?: Float.NEGATIVE_INFINITY
+            val right = results.getOrNull(i + 1)?.second ?: Float.NEGATIVE_INFINITY
+            if (v >= left && v >= right && v >= max * NEAR_PEAK_SHARE && v - min >= (max - min) * NEAR_PEAK_PROMINENCE) return i
+        }
+        return strongest
+    }
+
+    /** A short sweep of ±1 coarse step around [d]. */
+    private fun localSearch(d: Float) {
+        val u = toUnit(d)
+        val span = 1f / (COARSE_STEPS - 1)
+        sweep(Phase.LOCAL, List(LOCAL_STEPS) { i -> toDiopters((u - span + 2 * span * i / (LOCAL_STEPS - 1)).coerceIn(0f, 1f)) })
     }
 
     /** Parabola through the best point and its neighbours (in sqrt-diopter space) for a sub-step peak. */
@@ -176,16 +221,16 @@ class SoftwareAf(
             baseline = s
             return
         }
-        // Slowly follow gentle changes (light, small movement) so only real defocus triggers.
-        if (s > baseline * REFOCUS_DROP) {
+        // Slowly follow gentle changes (light, small movement) so only real defocus triggers. A
+        // followed spot is more patient: leaves in the wind or a shaky hand dip it for a moment.
+        if (s > baseline * (if (spot) SPOT_REFOCUS_DROP else REFOCUS_DROP)) {
             baseline = baseline * 0.98f + s * 0.02f
             lowFrames = 0
             return
         }
-        if (++lowFrames < REFOCUS_FRAMES) return
-        val u = toUnit(locked)
-        val span = 1f / (COARSE_STEPS - 1)
-        sweep(Phase.LOCAL, List(LOCAL_STEPS) { i -> toDiopters((u - span + 2 * span * i / (LOCAL_STEPS - 1)).coerceIn(0f, 1f)) })
+        if (++lowFrames < (if (spot) SPOT_REFOCUS_FRAMES else REFOCUS_FRAMES)) return
+        localShifts = 0
+        localSearch(locked)
     }
 
     private fun toDiopters(u: Float) = minFocusDiopters * u * u
@@ -200,5 +245,12 @@ class SoftwareAf(
         private const val STEP_TIMEOUT_MS = 800L
         private const val REFOCUS_DROP = 0.6f
         private const val REFOCUS_FRAMES = 15
+        private const val SPOT_REFOCUS_DROP = 0.5f
+        private const val SPOT_REFOCUS_FRAMES = 30
+        private const val MAX_LOCAL_SHIFTS = 2
+        /** A spot's nearer peak wins if it reaches this share of the strongest one … */
+        private const val NEAR_PEAK_SHARE = 0.45f
+        /** … and rises this far (share of the curve's range) above its lowest point. */
+        private const val NEAR_PEAK_PROMINENCE = 0.35f
     }
 }

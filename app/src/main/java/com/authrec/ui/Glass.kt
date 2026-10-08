@@ -48,7 +48,8 @@ internal fun View.dp(v: Number): Int = context.dp(v)
  * the accent colour (a switch that is on, a selected option); pressed brightens it.
  */
 internal class GlassDrawable(
-    private val radius: Float,
+    /** Corner radius in px (also what the backdrop blur behind it uses). */
+    val radius: Float,
     var accent: Int? = null,
     /** Darker base for panels that sit over the image and hold small text. */
     private val solid: Boolean = false,
@@ -58,6 +59,7 @@ internal class GlassDrawable(
     private val gloss = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val r = RectF()
+    private val inner = RectF()
     private var pressed = false
     private var enabled = true
     /** Base colour under the gloss when there is no accent (null = the default for [solid]). */
@@ -68,13 +70,15 @@ internal class GlassDrawable(
         if (b.isEmpty) return
         val stroke = radius.coerceAtMost(3f).coerceAtLeast(2f)
         r.set(b.left + stroke / 2, b.top + stroke / 2, b.right - stroke / 2, b.bottom - stroke / 2)
-        val rad = radius.coerceAtMost(r.height() / 2)
+        val rad = radius.coerceAtMost(minOf(r.height(), r.width()) / 2)
         val top = r.top
         val bottom = r.bottom
         val a = if (enabled) 1f else 0.45f
 
         val tint = accent
-        base.color = tint ?: baseColor ?: if (solid) 0xA0101418.toInt() else 0x66101418
+        // The blurred image behind (GlassBackdrop) does most of the work; the dark base keeps
+        // white text readable over bright scenes.
+        base.color = tint ?: baseColor ?: if (solid) 0x80101418.toInt() else 0x4D101418
         base.alpha = (base.alpha * a).toInt()
         c.drawRoundRect(r, rad, rad, base)
 
@@ -84,13 +88,18 @@ internal class GlassDrawable(
             Color.argb((((if (tint != null) 0x08 else 0x10) + lift / 2) * a).toInt(), 255, 255, 255), Shader.TileMode.CLAMP)
         c.drawRoundRect(r, rad, rad, body)
 
-        // Specular gloss on the upper half, inset from the rim.
+        // Specular gloss on the upper half: the outline's own shape, inset, cut off below half way.
+        // (A separate shorter rounded rect had its corners squashed and poked out of round buttons.)
         val inset = stroke * 1.5f
-        val glossRect = RectF(r.left + inset, r.top + inset, r.right - inset, r.top + r.height() * 0.52f)
-        gloss.shader = LinearGradient(0f, glossRect.top, 0f, glossRect.bottom,
+        inner.set(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset)
+        val glossBottom = r.top + r.height() * 0.52f
+        gloss.shader = LinearGradient(0f, inner.top, 0f, glossBottom,
             Color.argb((0x70 * a).toInt(), 255, 255, 255), Color.argb(0, 255, 255, 255), Shader.TileMode.CLAMP)
         val gr = (rad - inset).coerceAtLeast(0f)
-        c.drawRoundRect(glossRect, gr, gr.coerceAtMost(glossRect.height()), gloss)
+        c.save()
+        c.clipRect(inner.left, inner.top, inner.right, glossBottom)
+        c.drawRoundRect(inner, gr, gr, gloss)
+        c.restore()
 
         rim.strokeWidth = stroke
         rim.shader = LinearGradient(0f, top, 0f, bottom,

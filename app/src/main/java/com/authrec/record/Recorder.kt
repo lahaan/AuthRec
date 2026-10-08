@@ -53,6 +53,12 @@ data class RecordConfig(
  * first one through [onFirstVideoFrame]); audio is timestamped on the same clock and anything
  * captured before the first video frame is dropped, so both tracks start together.
  *
+ * Pre-roll: the renderer feeds the encoder from the moment REC is pressed, but nothing is kept
+ * until [commit] (about a second later): the encoder's input buffers (~50 MB each at 4K) get
+ * allocated on first use and froze the GL thread for 100+ ms at a time, and its rate control
+ * starts with oversized frames, which together cost some clips 1–15 frames in their first
+ * seconds. All of that now happens before the clip begins.
+ *
  * The file always starts on a key frame, and frames the encoder hands over in several pieces
  * (BUFFER_FLAG_PARTIAL_FRAME) are joined back into one sample. Clips from the Xiaomi 15 Ultra
  * started with up to a second of green blocks, the look of a decoder that never got a whole
@@ -110,6 +116,9 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
     private var leadingDropped = 0
     private var configWithSlices = 0
     private var syncRequested = false
+    /** Encoder pts from which frames count (see [commit]); -1 while pre-rolling. */
+    private var commitUs = -1L
+    private var prerollFrames = 0
 
     private val videoCallback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) = Unit // surface input
@@ -192,6 +201,16 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
         firstVideoNs = timestampNs
     }
 
+    /**
+     * Ends the pre-roll: the clip starts at the first key frame from the frame with sensor time
+     * [timestampNs] on (one is requested now). Called from the GL thread before that frame is drawn.
+     */
+    fun commit(timestampNs: Long) = handler.post {
+        commitUs = ((timestampNs - firstVideoNs) / 1000).coerceAtLeast(0)
+        syncRequested = true
+        runCatching { videoCodec.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
+    }
+
     /** Call once the last frame has been drawn into [inputSurface]. */
     fun stop(onFinished: (Result) -> Unit) = handler.post {
         result?.let { // already ended by an encoder error
@@ -250,6 +269,10 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
             dataSize = whole.remaining()
         }
         if (startUs < 0) {
+            if (commitUs < 0 || ptsUs < commitUs) {
+                prerollFrames++ // encoded only to get the encoder (and GPU) going
+                return
+            }
             val key = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 || Nal.isKeyFrame(data, dataOffset, dataSize, hevc)
             if (key) flags = flags or MediaCodec.BUFFER_FLAG_KEY_FRAME // the muxer marks sync samples by this flag
             if (debugDropFirstKey && key && leadingDropped == 0) {
@@ -259,7 +282,9 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
             // An encoder that never flags key frames shouldn't cost the whole recording.
             if (!key && leadingDropped < 3 * config.fps) {
                 leadingDropped++
-                if (!syncRequested) {
+                // Ask for a key frame, and again every few frames: the X14's encoder sometimes let
+                // a request pass, and the clip then waited for the next scheduled one (a second).
+                if (!syncRequested || leadingDropped % SYNC_RETRY_FRAMES == 0) {
                     syncRequested = true
                     runCatching { videoCodec.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
                 }
@@ -319,7 +344,8 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
         }
         val err = error ?: muxError?.let { "muxer: ${it.message}" } ?: if (!muxerStarted) "no video was recorded" else null
         Log.i(TAG, "Recording finished: $framesWritten frames, ${bytesWritten / 1_000_000} MB${err?.let { ", error: $it" } ?: ""}")
-        EventLog.log("Encoder $codecName: first outputs$firstOutputs, output buffers ${outputCapacity / 1024} KB" +
+        EventLog.log("Encoder $codecName: first outputs$firstOutputs, output buffers ${outputCapacity / 1024} KB, " +
+            "$prerollFrames pre-roll frames" +
             (if (framesJoined > 0) ", $framesJoined frames joined from pieces" else "") +
             (if (leadingDropped > 0) ", $leadingDropped frames before the first key frame dropped" else "") +
             (if (configWithSlices > 0) ", $configWithSlices config buffers held picture data" else "") +
@@ -450,10 +476,17 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
 
     companion object {
         private const val TAG = "AuthRec"
+        /** While waiting for the first key frame, the sync request is repeated this often. */
+        private const val SYNC_RETRY_FRAMES = 4
         /** Debug (adb recdebug=split): deliver every encoded frame to the muxer path in two pieces. */
         @Volatile var debugSplitFrames = false
         /** Debug (adb recdebug=dropkey): lose the first key frame, as a broken encoder start would. */
         @Volatile var debugDropFirstKey = false
+        /**
+         * Debug (adb recdebug=bars): pure red, green, blue, white and a mid grey drawn over the top
+         * of every recorded frame, to read back which RGB → Y'CbCr matrix the encoder input applies.
+         */
+        @Volatile var debugBars = false
 
         private fun copyOf(buf: ByteBuffer, info: MediaCodec.BufferInfo): ByteBuffer {
             val src = buf.duplicate()

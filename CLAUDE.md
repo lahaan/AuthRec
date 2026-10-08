@@ -40,8 +40,10 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 | `camera/LensProbe.kt` | Finds every RAW-capable lens (listed ids, hidden ids 0–31, zoom routes, physical sub-cameras), test-streams each with HAL-recovery waits, keeps listed cameras and lenses the previous scan found, skips routes that took the camera service down, caches per firmware (`VERSION`), labels 0.6x/1x/2.6x |
 | `EventLog.kt` | Persistent event log (`files/events.log`: opens, layouts, failures, retries, scans, recordings, heat, crashes); part of Send diagnostics |
 | `ExposureSlider.kt` | The vertical EV slider (relative drag, double-tap = 0, amber where it's digital gain) |
-| `gl/Renderer.kt` | GL thread: RAW upload, 3 compute passes, preview draw, encoder-surface draw (2nd shared EGL context, 10-bit config), auto gain, sharpness metric for contrast AF, stall stats |
-| `gl/PipelineShaders.kt` | GLSL: prep (black/shading/WB/defect pixels) → develop (MHC demosaic or superpixel, matrix, log) → finish (chroma NR, clean log out, then for the view: tone balance, LUT input conversion, tetrahedral LUT, saturation/vibrance) + display (peaking) |
+| `gl/Renderer.kt` | GL thread: RAW upload, compute passes, preview draw (+ frame mask), encoder-surface draw (2nd shared EGL context, 10-bit config, crop for 16:9 etc., pre-roll), auto gain, sharpness metric for contrast AF (centre-weighted), baked view LUT, recording timing, debug timings |
+| `gl/PipelineShaders.kt` | GLSL: prep (black/shading/WB/defect pixels) → develop (MHC demosaic or superpixel, matrix, log, view, temporal colour NR, in one pass) + `viewCommon` (eDR, LUT input conversion, branch-free tetrahedral LUT, saturation/vibrance) + display (crop, peaking) |
+| `gl/GlassBackdrop.kt` | The Glass layout's backdrop: quarter-size blurred copies of the preview drawn inside each control's shape with a refracting bevel |
+| `color/ViewLut.kt` | Bakes eDR + LUT input conversion + LUT + strength into one 33³ LUT on a background thread |
 | `gl/GlUtil.kt` | EGL core (main + encoder contexts), GL helpers |
 | `record/Recorder.kt` | MediaCodec video (surface input) + AAC audio on the camera clock + MediaMuxer → MediaStore `Movies/AuthRec` |
 | `SoftwareAf.kt` | Contrast-detect AF (coarse/fine sweeps, warm-up step, parabola fit, continuous monitor) for lenses whose ISP AF doesn't work for us |
@@ -74,7 +76,12 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   (`vendor.camera.aux.packagelist`); MotionCam also uses vendor tags / session op modes.
 - **Contrast AF timing**: the HAL reports a new focus distance immediately but the lens needs
   ~4–5 frames; measuring early attributes the previous position's sharpness to the new one. Fine
-  pass waits 6 frames, every pass starts with a discarded warm-up step.
+  pass waits 6 frames, every pass starts with a discarded warm-up step; the coarse pass's peak
+  lags about one step nearer, so the fine window spans 2 coarse steps far / 1 near.
+- **Contrast AF taps** (zoom routes, backup telephoto): a 12 % region whose sharpness is
+  centre-weighted (Gaussian), the nearest clear peak wins over the strongest (a subject in front
+  of busy background), and following it is patient and local-only (never a full sweep, which
+  jumped back to the background). Taps used to get the 24 % centre-AF box.
 - Frame timestamps are boottime (`SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME`); audio is timestamped on
   the same clock and video pts = sensor ts − first frame ts.
 - Camera can only be opened while the activity is resumed (HyperOS refuses "background" opens).
@@ -90,9 +97,37 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   (`mAllowedKillBatteryTempThreshhold is 48`; Android's thermal status still reads 0). The app
   watches ACTION_BATTERY_CHANGED: banner from 43 °C, warning from 45 °C, recording stops (file
   saved) and won't start at 47 °C.
-- The preview uses the superpixel path between recordings (≈4 ms vs ≈15–25 ms a frame); 4K
-  recording first runs 1 s at full resolution (jumping straight in dropped frames while the GPU
-  clocked up). The finish pass only writes the full-size log image when something uses it.
+- The preview uses the superpixel path between recordings (≈4 ms vs ≈15–25 ms a frame).
+- **4K budget** (X14, `pipetiming`, glFinish between stages, so pessimistic): upload ~2, prep ~3.5,
+  develop+view ~12 ms (one merged pass); Clean's pixel fix adds ~3 to prep (2K too: prep always
+  runs on the full RAW), its colour NR ~2 to develop (2K: ~1). Was ~27 ms before 2026-10-08: a
+  separate finish pass re-read a full-size RGBA16F image, and the tetrahedral LUT's six branches
+  diverged across each GPU wave (now branch-free; ties broken with one strict comparison, or
+  greys came out wrong). The view's
+  eDR / LUT input conversion / strength are baked into one 33³ LUT on a thread (`ViewLut`)
+  whenever they change; until it matches the settings the per-pixel path runs.
+- **Colour NR** (Clean 2/3, "+ Colour"/"+ Colour+") is temporal and colour-only: each pixel's
+  colour (channels minus their Rec.709 mean) is blended with a ping-pong history where the
+  3×3-smoothed RAW brightness hasn't moved beyond the sensor's noise profile (EMA weight 0.7/0.85,
+  history reset on size/target change). It runs on the finished view (or on the log when
+  recording log): done before the view, eDR/LUT toes turned the missing noise into crushed darks;
+  split in linear light, luminance noise went into all three channels (+50 % grain). Recorded luma is untouched
+  (encoder input is exact BT.709 limited, `recdebug=bars`). X14 at ISO 3200: colour noise −55 to
+  −69 % on 1x and the ultrawide. The files show *more* luma grain with it (+10 % at 150 Mbps,
+  +31 % at 50 Mbps): with less colour noise to code, the encoder stops smoothing luma. The
+  spatial chroma filter it replaced left blotches and darkened noisy shadows. Motion is judged on
+  brightness only: something moving at the same brightness but another colour could smear.
+- **Recording pre-roll**: REC starts the encoder at once (frames discarded) and the clip begins
+  1 s later (2K: 0.5 s) at a requested key frame (re-requested every 4 frames; the X14 encoder
+  once ignored one). It absorbs the first-use allocation of the encoder's ~50 MB input buffers
+  and the GPU clock-up, which stalled single frames 100–200 ms and cost 10–20 % of clips 1–15
+  frames. Each recording logs `Recording timing:` (frames lost and when, slowest frame, slowest
+  encoder hand-over, slowest pre-roll frame).
+- **Frame** (`aspect`: 4:3, 16:9, 2:1, 2.39:1): the encoder gets a centre crop of the image
+  (height a multiple of 16, e.g. 4096×2304); the preview darkens the rest and draws frame lines.
+- **Glass backdrop** costs ~1.5 ms a preview frame (`glasstiming`), refreshed every third frame
+  while recording. Its blur passes run before the window's render pass: drawing them in between
+  made the tile GPU store and reload the whole screen (~2 ms).
 - **eDR** (was "Balance"; prefs `edrOn`/`edrHi`/`edrLo`, default −75/+30, migrated from 0.2.2's
   `toneHi`/`toneLo`): a luminance-based curve in stops around middle grey (highlights above +1 stop
   compressed, shadows below −1 stop lifted, half-stop soft knees) applied before the look/LUT. It
@@ -107,7 +142,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   requested, both tracks shifted to start at it) and `BUFFER_FLAG_PARTIAL_FRAME` pieces are joined
   into one sample. Each recording logs `Encoder <name>: first outputs [...] , output buffers N KB`
   to the event log (X14: c2.qti.hevc.encoder, first key frame ~3.9 MB in 7.6 MB buffers).
-  `recdebug=split|dropkey` exercises both paths.
+  `recdebug=split|dropkey` exercises both paths; `recdebug=bars` draws colour bars into the recording.
 - `LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID` can name the main sensor while a physical stream of
   another sensor still delivers (X14 `5/4`), so it's only a hint.
 - **Xiaomi 15 Ultra (HyperOS 2)**: hidden ids opened directly fail at configure with
@@ -139,7 +174,8 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   (full list in the KDoc of `CameraActivity.handleCommands`; `lens=5/4`, `tap=0.5,0.5`, `ev=-1.0`,
   `clean=3`, `afverbose=true` (`--ez`), `cmd=dumpcams|refshot|edit|rescan|failcam`, `layout=0..2`,
   `fakeheat=47.5`, `lutinput=SLOG3`, `fullpreview=true`, `edr=true`, `tonehi=-75 tonelo=30`,
-  `wbwarm/wbtint`, `ui=glass|classic`, `edrhint=reset|show`, `recdebug=split|dropkey|off`).
+  `wbwarm/wbtint`, `ui=glass|classic`, `edrhint=reset|show`, `recdebug=split|dropkey|bars|off`,
+  `aspect=16:9`, `glasstiming=true`, `pipetiming=true`, `bakedview=false`).
   **Every `am start` pauses and resumes the activity, i.e. closes and reopens the camera**, so
   state that lives in the session (AF, a recording) is reset by the next command; hooks that must
   act on a running session post themselves (`failcam` after 2 s, `fakeheatdelay`). For taps use

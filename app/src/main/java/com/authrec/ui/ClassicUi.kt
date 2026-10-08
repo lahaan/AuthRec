@@ -37,6 +37,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val codecButton = kit.button("") { a.cycleCodec() }
     private val bitrateButton = kit.button("") { a.cycleBitrate() }
     private val resButton = kit.button("") { a.setSuperpixel(!a.superpixel) }
+    private val aspectButton = kit.button("") { a.cycleAspect() }
     private val audioButton = kit.button("") { a.toggleAudio() }
     private val bakeButton = kit.button("") { a.setBake(!a.bakeLut) }
     private val cleanButton = kit.button("") { a.cycleCleanup() }
@@ -75,9 +76,10 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         addView(wbButton)
         addView(fpsButton)
     }
-    private val proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, exposureBar)
+    private val proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, exposureBar,
+        aspectButton)
     private val lockedWhileRecording = listOf(profileButton, fpsButton, codecButton, bitrateButton, resButton, audioButton, bakeButton,
-        importButton, modeSwitch, lensButton, settingsButton)
+        importButton, modeSwitch, lensButton, settingsButton, aspectButton)
 
     override val lensAnchor: View get() = lensButton
     override val lookAnchor: View get() = viewButton
@@ -88,7 +90,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
         }
         val left = column(profileButton, viewButton, importButton, adjustButton, edrButton)
-        val right = column(recButton, codecButton, bitrateButton, resButton, audioButton, bakeButton, cleanButton)
+        val right = column(recButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = a.exposureSlider.layoutParams as FrameLayout.LayoutParams
             val margin = v.width + 48 + 12
@@ -210,6 +212,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         bitrateButton.text = "${a.bitrateMbps} Mbps"
         resButton.text = if (a.simple) (if (a.superpixel) "2K" else "4K") else if (a.superpixel) "Superpixel 2K" else "Open gate 4K"
         audioButton.text = if (a.audioOn) "Audio: on" else "Audio: off"
+        aspectButton.text = "Frame: ${a.aspect.label}"
         edrButton.text = when {
             !a.edrOn -> "eDR: off"
             a.edrHighlights == CameraActivity.EDR_HIGHLIGHTS && a.edrShadows == CameraActivity.EDR_SHADOWS -> "eDR: on"
