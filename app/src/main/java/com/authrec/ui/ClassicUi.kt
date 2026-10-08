@@ -26,6 +26,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     // settings sheet, and the same items in the lens menu went unnoticed.
     private val settingsButton = kit.button("⚙") { showSettingsMenu() }
     private val lensButton = kit.button("") { a.showLensMenu() }
+    private val mirrorButton = kit.button("") { a.setMirrorFront(!a.mirrorFront) }
     private val profileButton = kit.button("") { a.cycleProfile() }
     private val viewButton = kit.button("") { a.showViewMenu() }
     private val importButton = kit.button("+ LUT") { a.pickLut() }
@@ -79,7 +80,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, exposureBar,
         aspectButton)
     private val lockedWhileRecording = listOf(profileButton, fpsButton, codecButton, bitrateButton, resButton, audioButton, bakeButton,
-        importButton, modeSwitch, lensButton, settingsButton, aspectButton)
+        importButton, modeSwitch, lensButton, settingsButton, aspectButton, mirrorButton)
 
     override val lensAnchor: View get() = lensButton
     override val lookAnchor: View get() = viewButton
@@ -105,6 +106,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         addView(LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(lensButton)
+            addView(mirrorButton)
             addView(modeSwitch)
             addView(settingsButton)
         }, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
@@ -201,9 +203,12 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         recButton.isEnabled = !a.stopping
         lockedWhileRecording.forEach { it.isEnabled = !recording && !a.stopping && !a.warmingUp }
         proOnly.forEach { it.visibility = if (a.simple) View.GONE else View.VISIBLE }
+        a.info.visibility = View.VISIBLE // Glass hides it behind its settings sheet
         modeSwitch.text = if (a.simple) "Pro ▸" else "Simple ▸"
         // Always shown, even with one lens: its menu is also where Rescan and Send diagnostics live.
         lensButton.text = a.lenses.getOrNull(a.lensIndex)?.label?.takeIf { it.isNotEmpty() } ?: "Lens"
+        mirrorButton.visibility = if (a.lenses.getOrNull(a.lensIndex)?.front == true) View.VISIBLE else View.GONE
+        mirrorButton.text = if (a.mirrorFront) "Mirror: on" else "Mirror: off"
 
         profileButton.text = a.profile.label
         viewButton.text = (if (a.simple) "Look: " else "View: ") + a.currentView()?.label

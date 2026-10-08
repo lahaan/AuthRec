@@ -33,7 +33,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 | File | Role |
 |---|---|
 | `CameraActivity.kt` | State and actions behind the screen (landscape): settings/prefs, the views both layouts share (preview + gestures, info text, EV slider, focus bar, priority limits), lens selection & fallback, camera failure recovery (`onCameraFailure`: retries, session layouts, fallback to 1x) + watchdog, AF modes (tap = one-shot AF + spot watch, contrast-AF hookup), AE: Priority loop, exposure routing, eDR / WB trim / view adjustments, eDR suggestion, heat guard, recording start/stop (4K warm-up), looks list, adb hooks (`handleCommands`) |
-| `ui/GlassUi.kt` | Default layout: lens chips + big record button + flip on the right, mode/look/eDR/Adjust/Settings on the left, Pro bar (exposure, ISO and shutter dials, WB, focus, fps), Adjust panel with the eDR curve, settings sheet, REC pill, hint banner |
+| `ui/GlassUi.kt` | Default layout: lens chips + big record button + flip (+ selfie mirror on the front camera) on the right, mode/look/eDR/Adjust/Settings on the left, Pro bar (exposure, ISO and shutter dials, WB, focus, fps), Adjust panel with the eDR curve, settings sheet, REC pill, hint banner |
 | `ui/ClassicUi.kt` | The original layout (buttons in two columns, exposure bar), Settings → Layout → Classic; its ⚙ (top right) switches back to Glass and has the lens tools |
 | `ui/Glass.kt`, `RecordButton`, `ValueDial`, `ToneCurveView`, `CameraUi` | Glass drawable + `UiKit` (controls in either style), the record button, the ISO/shutter ruler, the eDR curve graph, the layout interface and `Stepper` |
 | `camera/RawCamera.kt` | Camera2 session (all device/session work on the camera thread): RAW_SENSOR stream + tiny YUV "metering" stream, session layouts 0–2 (`variant`), request building (AE/AF/AWB/zoom routing/regions), per-frame `FrameMeta` with colour-metadata fallbacks, failure reporting, reference-shot capture |
@@ -86,6 +86,14 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   the same clock and video pts = sensor ts − first frame ts.
 - Camera can only be opened while the activity is resumed (HyperOS refuses "background" opens).
 - Front camera rotation: `(sensorOrientation + displayDeg) % 360` (back: minus). App is landscape-only.
+  That gives the true image (X14: a bottle's label reads correctly in preview and file); the
+  selfie-style mirror is the `mirrorFront` button next to flip (preview, taps and recording).
+- **Preview resampling**: when the image is drawn at nearly a whole-number scale (front camera:
+  1632 px into 1600, ×1.02) bilinear sampling makes the noise's strength beat in a grid (~50 px);
+  such scales use a quintic B-spline (`Renderer.beatsWithNoise`). Recordings are 1:1.
+- A lens switch to another RAW size (X14 1x 4096 ⇄ 2.6x 4080) replaces the Renderer; the camera
+  keeps delivering until it's closed after it, so GL work queued behind `release` is dropped
+  (`released`): a frame that ran on the destroyed context crashed with EGL_BAD_CONTEXT.
 - Changing AF mode per tap (video ⇄ picture) stalls Xiaomi's pipeline for a moment: avoid.
   CONTINUOUS_VIDEO ⇄ AUTO costs at most one frame (measured).
 - **Xiaomi's continuous AF ignores AF regions and AF_TRIGGER_CANCEL** (X14 main: focus didn't move
@@ -107,16 +115,18 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   eDR / LUT input conversion / strength are baked into one 33³ LUT on a thread (`ViewLut`)
   whenever they change; until it matches the settings the per-pixel path runs.
 - **Colour NR** (Clean 2/3, "+ Colour"/"+ Colour+") is temporal and colour-only: each pixel's
-  colour (channels minus their Rec.709 mean) is blended with a ping-pong history where the
-  3×3-smoothed RAW brightness hasn't moved beyond the sensor's noise profile (EMA weight 0.7/0.85,
-  history reset on size/target change). It runs on the finished view (or on the log when
-  recording log): done before the view, eDR/LUT toes turned the missing noise into crushed darks;
-  split in linear light, luminance noise went into all three channels (+50 % grain). Recorded luma is untouched
-  (encoder input is exact BT.709 limited, `recdebug=bars`). X14 at ISO 3200: colour noise −55 to
-  −69 % on 1x and the ultrawide. The files show *more* luma grain with it (+10 % at 150 Mbps,
-  +31 % at 50 Mbps): with less colour noise to code, the encoder stops smoothing luma. The
-  spatial chroma filter it replaced left blotches and darkened noisy shadows. Motion is judged on
-  brightness only: something moving at the same brightness but another colour could smear.
+  colour (channels minus their Rec.709 mean) is blended with a ping-pong history (EMA weight
+  0.7/0.85, reset on size/target change) where nothing moved, judged against the sensor's noise
+  profile twice: the 3×3-smoothed RAW brightness per pixel, and the colour of the 4×4 sensor
+  blocks around it (`coarseColour` pass, ~0.7 ms at 4K). Brightness alone let a grey cable
+  sliding over an orange mat (similar RAW brightness) leave grey trails (owner, 2.6x). It runs on
+  the finished view (or on the log when recording log): done before the view, eDR/LUT toes
+  turned the missing noise into crushed darks; split in linear light, luminance noise went into
+  all three channels (+50 % grain). Recorded luma is untouched (encoder input is exact BT.709
+  limited, `recdebug=bars`). X14 at ISO 3200: colour noise −55 to −69 % on 1x and the
+  ultrawide. The files show *more* luma grain with it (+10 % at 150 Mbps, +31 % at 50 Mbps):
+  with less colour noise to code, the encoder stops smoothing luma. The spatial chroma filter it
+  replaced left blotches and darkened noisy shadows.
 - **Recording pre-roll**: REC starts the encoder at once (frames discarded) and the clip begins
   1 s later (2K: 0.5 s) at a requested key frame (re-requested every 4 frames; the X14 encoder
   once ignored one). It absorbs the first-use allocation of the encoder's ~50 MB input buffers
@@ -175,7 +185,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   `clean=3`, `afverbose=true` (`--ez`), `cmd=dumpcams|refshot|edit|rescan|failcam`, `layout=0..2`,
   `fakeheat=47.5`, `lutinput=SLOG3`, `fullpreview=true`, `edr=true`, `tonehi=-75 tonelo=30`,
   `wbwarm/wbtint`, `ui=glass|classic`, `edrhint=reset|show`, `recdebug=split|dropkey|bars|off`,
-  `aspect=16:9`, `glasstiming=true`, `pipetiming=true`, `bakedview=false`).
+  `aspect=16:9`, `glasstiming=true`, `pipetiming=true`, `bakedview=false`, `mirror=true`).
   **Every `am start` pauses and resumes the activity, i.e. closes and reopens the camera**, so
   state that lives in the session (AF, a recording) is reset by the next command; hooks that must
   act on a running session post themselves (`failcam` after 2 s, `fakeheatdelay`). For taps use

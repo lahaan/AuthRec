@@ -133,6 +133,12 @@ class CameraActivity : Activity() {
         private set
     internal var wbTint = 0
         private set
+    /**
+     * Front camera as a mirror image (selfie style), on the preview and in the recording. Off, it
+     * shows and records what the camera sees (text reads the right way round).
+     */
+    internal var mirrorFront = false
+        private set
     /** Shape of the recorded frame: a centre crop of the 4:3 sensor image, or all of it. */
     internal enum class FrameAspect(val label: String, val ratio: Float) {
         OPEN_GATE("4:3", 4f / 3f), WIDE("16:9", 16f / 9f), UNIVISIUM("2:1", 2f), SCOPE("2.39:1", 2.39f)
@@ -275,6 +281,7 @@ class CameraActivity : Activity() {
         vibrancePct = prefs.getInt("vibrance", 0)
         wbWarmth = prefs.getInt("wbWarm", 0)
         wbTint = prefs.getInt("wbTint", 0)
+        mirrorFront = prefs.getBoolean("mirrorFront", false)
         superpixel = prefs.getBoolean("superpixel", false)
         audioOn = prefs.getBoolean("audio", true)
         capture = capture.copy(fps = prefs.getInt("fps", 30))
@@ -306,6 +313,7 @@ class CameraActivity : Activity() {
             .putInt("vibrance", vibrancePct)
             .putInt("wbWarm", wbWarmth)
             .putInt("wbTint", wbTint)
+            .putBoolean("mirrorFront", mirrorFront)
             .putBoolean("superpixel", superpixel)
             .putBoolean("audio", audioOn)
             .putInt("fps", capture.fps)
@@ -409,6 +417,16 @@ class CameraActivity : Activity() {
     }
 
     /** eDR on/off with the current curve. */
+    internal fun setMirrorFront(on: Boolean) {
+        mirrorFront = on
+        renderer?.mirror = mirrored()
+        updateUi()
+        saveSoon()
+    }
+
+    /** Whether the current lens is shown mirrored. */
+    private fun mirrored() = mirrorFront && camera?.info?.front == true
+
     internal fun setEdr(on: Boolean) {
         edrOn = on
         applyTone()
@@ -641,6 +659,7 @@ class CameraActivity : Activity() {
         var u = (x - (vw - iw) / 2) / iw
         var v = (y - (vh - ih) / 2) / ih
         if (u !in 0f..1f || v !in 0f..1f) return
+        if (mirrored()) u = 1 - u
         repeat(displayQuarterTurns) { val t = u; u = v; v = 1 - t }
 
         focusAt(u, v, lock)
@@ -1430,6 +1449,7 @@ class CameraActivity : Activity() {
         } else {
             ((cam.info.sensorOrientation - displayDeg + 360) % 360) / 90
         }
+        r.mirror = mirrored()
         r.attachSurface(holder.surface, w, h, displayQuarterTurns)
     }
 
@@ -1443,7 +1463,7 @@ class CameraActivity : Activity() {
             if (!resumed) return
             val r = renderer
             val cam = camera
-            if (r != null && cam != null && !scanning && !retryPending && cam.openRequestedMs > 0) {
+            if (r != null && cam != null && !scanning && !retryPending && !cam.referenceCapturing && cam.openRequestedMs > 0) {
                 val now = SystemClock.elapsedRealtime()
                 val last = r.lastFrameMs
                 when {
@@ -1607,6 +1627,7 @@ class CameraActivity : Activity() {
         EventLog.log("Recording ${w}x$h (${aspect.label}) ${codec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
             "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, " +
             "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, WB shift $wbWarmth/$wbTint, " +
+            (if (mirrored()) "mirrored, " else "") +
             "battery %.1f °C".format(batteryTempC))
         // In simple mode the recording is what you see, so bake the look in.
         r.startRecording(rec, capture.fps, bakeLut || simple, w, h, keep) { err ->
@@ -1850,7 +1871,8 @@ class CameraActivity : Activity() {
      * fakeheat = °C (pretend battery temperature, until the next real reading) after fakeheatdelay ms,
      * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects),
      * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false,
-     * wbwarm / wbtint = -100..100 (white balance trim), ui = glass | classic (rebuilds the screen),
+     * wbwarm / wbtint = -100..100 (white balance trim), mirror = true (front camera as a mirror image),
+     * ui = glass | classic (rebuilds the screen),
      * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
      * aspect = 4:3 | 16:9 | 2:1 | 2.39:1 (recorded frame), glasstiming = true (log the backdrop's GPU time),
      * pipetiming = true (log each pipeline stage's time, with glFinish between them),
@@ -1929,6 +1951,7 @@ class CameraActivity : Activity() {
             "reset" -> prefs.edit().remove("edrHintShown").apply()
             "show" -> showEdrHint()
         }
+        if (extras.containsKey("mirror")) setMirrorFront(extras.getBoolean("mirror"))
         if (extras.containsKey("wbwarm") || extras.containsKey("wbtint")) {
             setWbShift(extras.getInt("wbwarm", wbWarmth), extras.getInt("wbtint", wbTint))
         }

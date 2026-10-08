@@ -1,10 +1,12 @@
-# Handoff: state as of 0.3.0 (2026-10-07, released as GitHub pre-release v0.3.0)
+# Handoff: state as of 0.4.0 (2026-10-08, released as GitHub pre-release v0.4.0)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
 (0.2.1: diagnosable lens probe), then 0.2.2: robustness for the 15 Ultra and the owner's feedback,
 then 0.3.0: the third 15 Ultra report (green clip starts, tint, lenses coming and going) and the
-owner's next round (new UI, eDR, a look from a reference photo).
+owner's next round (new UI, eDR, a look from a reference photo), then 0.4.0: the owner's round
+after 0.3.0 (tap AF on contrast-AF lenses, real glass, frame aspects, start-of-clip drops,
+temporal colour NR) and a daylight test of it.
 Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: **feedback/**
 (`notes.md` has every reported item, its diagnosis and status; 15–21 are 0.3.0's).
 
@@ -72,10 +74,10 @@ Not verified:
 - Look editor "Clip frame" with 10-bit clips; LUT import of unusual .cube files (DOMAIN, 1D).
 - AE: Priority at its limits; "limits reached" warning.
 
-## After 0.3.0 (on main, 2026-10-08; not released)
+## 0.4.0 (pre-release v0.4.0, 2026-10-08)
 
-Owner's round after 0.3.0 (feedback/notes.md items 22–32), all tested on the X14 at night in a
-dark room (ISO 3200, magenta LEDs), so daylight behaviour is still to be seen:
+Owner's round after 0.3.0 (feedback/notes.md items 22–38), tested on the X14 at night in a dark
+room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 - Tap AF on contrast-AF lenses (zoom routes, backup telephoto): locked on a bottle at 0.25 m on
   the 2.6x and held it 16 s. Needs the owner's bottle-and-background test in daylight.
 - Glass: real backdrop (blurred preview inside each control, refracting bevel), gloss fixed on
@@ -88,13 +90,20 @@ dark room (ISO 3200, magenta LEDs), so daylight behaviour is still to be seen:
   finished view (or the log when recording log), replacing the spatial chroma filter (blotchy,
   crushed darks). ISO 3200, static scene: colour noise −55…−69 % on 1x and the ultrawide, levels
   within ±0.5, recorded luma untouched (the files even keep ~10 % more luma grain at 150 Mbps, as
-  the encoder no longer spends its bits on colour noise). 4K cost ~+2 ms. Not tested: motion
-  (pans, moving coloured things) and daylight.
+  the encoder no longer spends its bits on colour noise). 4K cost ~+2 ms.
+- Owner's daylight test (2026-10-08 afternoon, items 33–38): crash on a 2.6x → 1x switch (GL work
+  queued after the renderer's teardown; 31 rapid switches fine since), colour NR trails behind a
+  cable moving over an orange mat (now also a block-colour change test; owner: fixed),
+  settings rows scrolled past the sheet drew their glass above it (clipped now),
+  off-centre flip symbol (vector icon), a ~50 px noise grid on the front preview (bilinear beat at
+  ×1.02; quintic B-spline), and a selfie mirror button on the front camera (the image itself was
+  verified unmirrored).
 
 ## Start here (next session)
 
-1. Read `feedback/notes.md` (items 22–32 are the newest), then anything new in `feedback/`.
-2. 0.3.0 is out (pre-release, same signing key as 0.2.2). From the friend's next diagnostics, check the `Encoder …` line of
+1. Read `feedback/notes.md` (items 22–38 are the newest), then anything new in `feedback/`.
+2. 0.4.0 is out (pre-release, same signing key as 0.2.2). From the friend's next diagnostics
+   (0.3.0's showed no crash; 0.6x unreachable), check tap AF on her telephotos, the `Encoder …` line of
    her recordings (partial frames? key frame first?), the `… colour:` lines (physical results on
    `0/4`, `0/5`?), and that the scan kept 4.1x and skipped `0/3` after one crash.
 3. The owner will send UI sketches for the Glass layout; layouts live in `ui/` (CLAUDE.md).

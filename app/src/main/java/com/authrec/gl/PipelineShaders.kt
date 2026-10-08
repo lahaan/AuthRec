@@ -200,6 +200,35 @@ internal object PipelineShaders {
     """.trimIndent() + "\n"
 
     /**
+     * Colour of each 4×4 block of the prep pass's mosaic (mean of its 4 red, 8 green, 4 blue
+     * samples), for colour NR's change test: quiet enough to see a colour change that brightness
+     * alone misses, cheap at a sixteenth of the pixels.
+     */
+    val coarseColour = """
+        #version 310 es
+        precision highp float;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(binding = 0) uniform highp sampler2D uLinear;
+        layout(rgba16f, binding = 0) writeonly uniform highp image2D uOut;
+        uniform ivec2 uRedOffset;
+
+        void main() {
+            ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+            if (any(greaterThanEqual(o, textureSize(uLinear, 0) / 4))) return;
+            vec3 sum = vec3(0.0);
+            for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
+                ivec2 p = o * 4 + ivec2(x, y);
+                float v = texelFetch(uLinear, p, 0).r;
+                ivec2 site = (p + uRedOffset) & 1;
+                if (site == ivec2(0, 0)) sum.r += v;
+                else if (site == ivec2(1, 1)) sum.b += v;
+                else sum.g += v;
+            }
+            imageStore(uOut, o, vec4(sum / vec3(4.0, 8.0, 4.0), 1.0));
+        }
+    """.trimIndent()
+
+    /**
      * Develop: camera RGB → (temporal colour noise reduction) → target gamut → log → the clean log
      * (when something uses it) and the view, in one pass.
      *
@@ -215,8 +244,10 @@ internal object PipelineShaders {
      *   and with less colour noise that lift was gone (it read as crushed blacks);
      * - the spatial chroma filter this replaces left blotches (fine colour grain gone, the coarse
      *   kind not) and darkened noisy shadows by up to 29 %.
-     * Motion is judged on a 3×3-smoothed brightness against the sensor's own noise profile for
-     * that frame, so moving things aren't blended and don't trail colour.
+     * Motion is judged against the sensor's own noise profile for that frame, twice: a 3×3-smoothed
+     * brightness per pixel (fine detail), and the colour of the 4×4 sensor blocks around it
+     * (coarseColour): a grey cable sliding over an orange mat at much the same brightness passed
+     * the first test and left grey trails behind (owner, X14 2.6x, 2026-10-08).
      */
     private val developBase = """
         #version 310 es
@@ -226,6 +257,8 @@ internal object PipelineShaders {
 
         layout(binding = 0) uniform highp sampler2D uLinear;     // r32f from the prep pass
         layout(binding = 2) uniform highp sampler2D uHistIn;     // previous frames: colour (rgb), smoothed brightness (a)
+        layout(binding = 3) uniform highp sampler2D uCoarseNow;  // block colours of this frame (coarseColour)
+        layout(binding = 4) uniform highp sampler2D uCoarsePrev; // and of the previous one
         layout(rgba16f, binding = 0) writeonly uniform highp image2D uOutView;
         layout(rgba16f, binding = 1) writeonly uniform highp image2D uOutLog;
         layout(rgba16f, binding = 2) writeonly uniform highp image2D uHistOut;
@@ -258,8 +291,11 @@ internal object PipelineShaders {
             }
         }
 
-        /** [c] (view or log) with its colour, not its brightness, blended over time where nothing moved. */
-        vec3 colourNr(ivec2 p, vec3 c, float smoothed) {
+        /**
+         * [c] (view or log) with its colour, not its brightness, blended over time where nothing
+         * moved. [rawUv]: where the pixel is on the sensor (0..1), for the block colours.
+         */
+        vec3 colourNr(ivec2 p, vec3 c, float smoothed, vec2 rawUv) {
             if (uTnr == 0) return c;
             float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
             vec3 colour = c - vec3(luma);
@@ -269,19 +305,27 @@ internal object PipelineShaders {
                 // well under 1.5, a real change jumps past 3.
                 float sigma = sqrt(max(smoothed, 0.0) * uNoise.x + uNoise.y);
                 float moved = abs(smoothed - h.a) / max(sigma, 1e-7);
-                colour = mix(colour, h.rgb, uTnrAlpha * (1.0 - smoothstep(1.5, 3.0, moved)));
+                // Block colours (means of 4 red, 8 green, 4 blue samples) against two frames' noise;
+                // a static scene stays under ~3 on every channel.
+                vec3 now = texture(uCoarseNow, rawUv).rgb;
+                vec3 prev = texture(uCoarsePrev, rawUv).rgb;
+                vec3 blockVar = 2.0 * (max(now, 0.0) * uNoise.x + uNoise.y) / vec3(4.0, 8.0, 4.0);
+                vec3 z = abs(now - prev) / sqrt(max(blockVar, vec3(1e-12)));
+                float changed = max(z.r, max(z.g, z.b));
+                float keep = (1.0 - smoothstep(1.5, 3.0, moved)) * (1.0 - smoothstep(3.5, 7.0, changed));
+                colour = mix(colour, h.rgb, uTnrAlpha * keep);
             }
             imageStore(uHistOut, p, vec4(colour, smoothed));
             return vec3(luma) + colour;
         }
     """.trimIndent() + "\n" + viewCommon + """
-        void develop(ivec2 p, vec3 cam, float smoothed) {
+        void develop(ivec2 p, vec3 cam, float smoothed, vec2 rawUv) {
             vec3 lin = uCamToTarget * cam * uExposure;
             vec3 c = vec3(encodeLog(lin.r), encodeLog(lin.g), encodeLog(lin.b));
-            if (uTnrOnLog) c = colourNr(p, c, smoothed);
+            if (uTnrOnLog) c = colourNr(p, c, smoothed, rawUv);
             if (uWriteLog) imageStore(uOutLog, p, vec4(c, 1.0));
             vec3 v = viewOf(c);
-            if (!uTnrOnLog) v = colourNr(p, v, smoothed);
+            if (!uTnrOnLog) v = colourNr(p, v, smoothed, rawUv);
             imageStore(uOutView, p, vec4(v, 1.0));
         }
     """.trimIndent() + "\n"
@@ -317,7 +361,7 @@ internal object PipelineShaders {
             else                          cam = vec3(colAtG, C, rowAtG);
             // 3×3 binomial over the (white-balanced) mosaic: a brightness that's quiet enough to
             // tell motion from noise.
-            develop(p, cam, (4.0 * C + 2.0 * cross + diag) / 16.0);
+            develop(p, cam, (4.0 * C + 2.0 * cross + diag) / 16.0, (vec2(p) + 0.5) / vec2(size));
         }
     """.trimIndent()
 
@@ -333,7 +377,7 @@ internal object PipelineShaders {
                 px(base + uRedOffset),
                 0.5 * (px(base + ivec2(1 - uRedOffset.x, uRedOffset.y)) + px(base + ivec2(uRedOffset.x, 1 - uRedOffset.y))),
                 px(base + ivec2(1) - uRedOffset));
-            develop(o, cam, 0.25 * (cam.r + 2.0 * cam.g + cam.b));
+            develop(o, cam, 0.25 * (cam.r + 2.0 * cam.g + cam.b), (vec2(base) + 1.0) / vec2(size * 2));
         }
     """.trimIndent()
 
@@ -345,11 +389,13 @@ internal object PipelineShaders {
         out vec2 vUv;
         uniform int uRotation;  // quarter turns clockwise
         uniform vec4 uCrop;     // x, y, width, height of the texture to show (a recorded frame); unset = all
+        uniform bool uMirror;   // left-right, as seen on screen (selfie style)
         void main() {
             // One oversized triangle covering the viewport; no vertex buffers needed.
             vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
             gl_Position = vec4(pos, 0.0, 1.0);
             vec2 uv = vec2(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);  // texture row 0 = top of screen
+            if (uMirror) uv.x = 1.0 - uv.x;
             for (int i = 0; i < uRotation; i++) uv = vec2(uv.y, 1.0 - uv.x);
             vec4 crop = uCrop.z > 0.0 ? uCrop : vec4(0.0, 0.0, 1.0, 1.0);
             vUv = crop.xy + uv * crop.zw;
@@ -369,11 +415,46 @@ internal object PipelineShaders {
     val displayFragment = """
         #version 300 es
         precision mediump float;
-        in vec2 vUv;
+        in highp vec2 vUv;  // texel positions in a 4K image need more than mediump's 11 bits
         uniform sampler2D uImage;
         uniform bool uPeaking;
+        uniform bool uSmooth;  // B-spline instead of bilinear (scales where noise beats)
         uniform vec2 uTexel;  // one source pixel in uv units
         out vec4 fragColor;
+
+        /**
+         * Quintic B-spline sampling in 9 bilinear taps (each pair of its 6×6 weights is one tap).
+         * Its weights' sum of squares hardly changes with the sampling phase, so noise looks the
+         * same everywhere: measured on screen, the front camera's noise energy varied 3× across
+         * each 50-px beat with bilinear, 1.3× with a cubic B-spline, 1.07× with this.
+         */
+        vec3 bspline(highp vec2 uv) {
+            highp vec2 size = vec2(textureSize(uImage, 0));
+            highp vec2 t = uv * size - 0.5;
+            highp vec2 i = floor(t);
+            highp vec2 f = t - i;
+            highp vec2 f2 = f * f;
+            highp vec2 f3 = f2 * f;
+            highp vec2 f4 = f2 * f2;
+            highp vec2 f5 = f4 * f;
+            highp vec2 w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) * (1.0 - f) * (1.0 - f) / 120.0;
+            highp vec2 w1 = (26.0 - 50.0 * f + 20.0 * f2 + 20.0 * f3 - 20.0 * f4 + 5.0 * f5) / 120.0;
+            highp vec2 w2 = (66.0 - 60.0 * f2 + 30.0 * f4 - 10.0 * f5) / 120.0;
+            highp vec2 w3 = (26.0 + 50.0 * f + 20.0 * f2 - 20.0 * f3 - 20.0 * f4 + 10.0 * f5) / 120.0;
+            highp vec2 w5 = f5 / 120.0;
+            highp vec2 w4 = 1.0 - w0 - w1 - w2 - w3 - w5;
+            highp vec2 g0 = w0 + w1;
+            highp vec2 g1 = w2 + w3;
+            highp vec2 g2 = w4 + w5;
+            // Tap positions in texel-centre units, then back to uv.
+            highp vec2 p0 = (i - 2.0 + w1 / g0 + 0.5) / size;
+            highp vec2 p1 = (i + w3 / g1 + 0.5) / size;
+            highp vec2 p2 = (i + 2.0 + w5 / max(g2, 1e-8) + 0.5) / size;
+            vec3 r0 = g0.x * texture(uImage, vec2(p0.x, p0.y)).rgb + g1.x * texture(uImage, vec2(p1.x, p0.y)).rgb + g2.x * texture(uImage, vec2(p2.x, p0.y)).rgb;
+            vec3 r1 = g0.x * texture(uImage, vec2(p0.x, p1.y)).rgb + g1.x * texture(uImage, vec2(p1.x, p1.y)).rgb + g2.x * texture(uImage, vec2(p2.x, p1.y)).rgb;
+            vec3 r2 = g0.x * texture(uImage, vec2(p0.x, p2.y)).rgb + g1.x * texture(uImage, vec2(p1.x, p2.y)).rgb + g2.x * texture(uImage, vec2(p2.x, p2.y)).rgb;
+            return g0.y * r0 + g1.y * r1 + g2.y * r2;
+        }
 
         float luma(vec2 uv) { return dot(texture(uImage, uv).rgb, vec3(0.2126, 0.7152, 0.0722)); }
 
@@ -385,7 +466,7 @@ internal object PipelineShaders {
         }
 
         void main() {
-            vec3 c = texture(uImage, vUv).rgb;
+            vec3 c = uSmooth ? bspline(vUv) : texture(uImage, vUv).rgb;
             if (uPeaking) {
                 vec2 d = uTexel * 2.0;
                 float gx = lumaSmooth(vUv + vec2(d.x, 0.0)) - lumaSmooth(vUv - vec2(d.x, 0.0));

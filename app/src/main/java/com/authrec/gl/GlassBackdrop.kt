@@ -5,7 +5,9 @@ import android.os.SystemClock
 import android.util.Log
 
 /** Where a Glass control sits on the preview surface: pixels, top-left origin, as views measure. */
-class GlassRect(val left: Float, val top: Float, val right: Float, val bottom: Float, val radius: Float, val alpha: Float)
+/** A control's glass shape in surface pixels (top-left origin), drawn only inside [clip]. */
+class GlassRect(val left: Float, val top: Float, val right: Float, val bottom: Float, val radius: Float, val alpha: Float,
+                val clip: android.graphics.RectF? = null)
 
 /**
  * What the Glass layout's controls show of the image behind them. The preview is a SurfaceView
@@ -45,13 +47,14 @@ internal class GlassBackdrop {
      * made a tile-based GPU (Adreno) write the whole screen out and read it back, ~2 ms a frame.
      * [refresh] = false keeps the last blurred copy (while recording, every GPU millisecond counts).
      */
-    fun prepare(image: Int, imageW: Int, imageH: Int, rotation: Int, letterbox: IntArray, viewW: Int, viewH: Int, refresh: Boolean) {
+    fun prepare(image: Int, imageW: Int, imageH: Int, rotation: Int, mirror: Boolean, letterbox: IntArray, viewW: Int, viewH: Int,
+                refresh: Boolean) {
         if (timing) { GLES30.glFinish(); t0 = SystemClock.elapsedRealtimeNanos() }
         val w = (viewW / SCALE).coerceAtLeast(1)
         val h = (viewH / SCALE).coerceAtLeast(1)
         val fresh = w != bw || h != bh
         ensureTargets(w, h)
-        if (refresh || fresh) blurScreen(image, imageW, imageH, rotation, letterbox)
+        if (refresh || fresh) blurScreen(image, imageW, imageH, rotation, mirror, letterbox)
     }
 
     /** Step 2, on the window surface after the image: the controls' glass shapes. */
@@ -68,7 +71,7 @@ internal class GlassBackdrop {
         }
     }
 
-    private fun blurScreen(image: Int, imageW: Int, imageH: Int, rotation: Int, letterbox: IntArray) {
+    private fun blurScreen(image: Int, imageW: Int, imageH: Int, rotation: Int, mirror: Boolean, letterbox: IntArray) {
         // 1. The screen at a quarter size: black margins plus the image, 4 taps a pixel.
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo[0])
         GLES30.glViewport(0, 0, bw, bh)
@@ -79,6 +82,7 @@ internal class GlassBackdrop {
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, image)
         GLES30.glUniform1i(Gl.uniform(downProgram, "uImage"), 0)
         GLES30.glUniform1i(Gl.uniform(downProgram, "uRotation"), rotation)
+        GLES30.glUniform1i(Gl.uniform(downProgram, "uMirror"), if (mirror) 1 else 0)
         // Each output pixel covers roughly imageW / (letterbox width / SCALE) source texels.
         val spread = (imageW.toFloat() / (letterbox[2].coerceAtLeast(1) / SCALE) / 4f).coerceAtLeast(0.5f)
         GLES30.glUniform2f(Gl.uniform(downProgram, "uTexel"), spread / imageW, spread / imageH)
@@ -116,10 +120,11 @@ internal class GlassBackdrop {
             // GL's origin is bottom-left.
             val bottom = viewH - r.bottom
             val top = viewH - r.top
-            val x0 = r.left.toInt().coerceIn(0, viewW)
-            val y0 = bottom.toInt().coerceIn(0, viewH)
-            val x1 = (r.right.toInt() + 1).coerceIn(0, viewW)
-            val y1 = (top.toInt() + 1).coerceIn(0, viewH)
+            val c = r.clip
+            val x0 = maxOf(r.left, c?.left ?: 0f).toInt().coerceIn(0, viewW)
+            val y0 = maxOf(bottom, c?.let { viewH - it.bottom } ?: 0f).toInt().coerceIn(0, viewH)
+            val x1 = (minOf(r.right, c?.right ?: viewW.toFloat()).toInt() + 1).coerceIn(0, viewW)
+            val y1 = (minOf(top, c?.let { viewH - it.top } ?: viewH.toFloat()).toInt() + 1).coerceIn(0, viewH)
             if (x1 <= x0 || y1 <= y0) continue
             GLES30.glScissor(x0, y0, x1 - x0, y1 - y0)
             GLES30.glUniform4f(rectLoc, r.left, bottom, r.right, top)

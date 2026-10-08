@@ -149,6 +149,9 @@ class RawCamera(
         private set
     @Volatile var openRequestedMs = 0L
         private set
+    /** A [referenceCapture] has the session: no preview frames until it's done. */
+    @Volatile var referenceCapturing = false
+        private set
 
     @Volatile var latestMeta: FrameMeta? = null
         private set
@@ -257,6 +260,7 @@ class RawCamera(
         val gen = ++generation
         opened = true
         resultsSeen = 0
+        referenceCapturing = false // one cut short by a close never finished
         capturesFailed = 0
         openRequestedMs = SystemClock.elapsedRealtime()
         EventLog.log("Opening $name, session layout $variant")
@@ -472,6 +476,9 @@ class RawCamera(
      */
     fun referenceCapture(dir: File, onDone: (String) -> Unit) = handler.post {
         val d = device ?: return@post onDone("camera not open")
+        // No frames reach the preview meanwhile: the activity's watchdog must not take that for a
+        // stalled lens (it reopened the camera under the capture, which then crashed).
+        referenceCapturing = true
         dir.mkdirs()
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
         val aspect = info.size.width.toFloat() / info.size.height
@@ -483,12 +490,18 @@ class RawCamera(
         var capturing = false
         var pending = 2
         fun done(msg: String) {
+            if (!referenceCapturing) return
             onDone(msg)
             raw.close()
             jpeg.close()
-            session?.close()
-            session = null
-            createSession(d)
+            runCatching {
+                session?.close()
+                session = null
+                createSession(d)
+            }
+            // Counts as a fresh open for the watchdog: frames take a moment to come back.
+            openRequestedMs = SystemClock.elapsedRealtime()
+            referenceCapturing = false
         }
         raw.setOnImageAvailableListener({ r ->
             val img = r.acquireNextImage() ?: return@setOnImageAvailableListener
@@ -523,24 +536,36 @@ class RawCamera(
             listOf(output(raw.surface), output(jpeg.surface)),
             { handler.post(it) },
             object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(s: CameraCaptureSession) {
+                override fun onConfigured(s: CameraCaptureSession) = failSoft {
                     session = s
                     val preview = buildRequest(d, listOf(raw.surface))
                     s.setRepeatingRequest(preview.build(), captureCallback, handler)
                     // Let auto exposure / white balance settle in the new session, then stop the
                     // stream and let in-flight frames drain so the only RAW frame saved is the still.
-                    handler.postDelayed({ s.stopRepeating() }, 2500)
+                    handler.postDelayed({ failSoft { s.stopRepeating() } }, 2500)
                     handler.postDelayed({
-                        val still = buildRequest(d, listOf(raw.surface, jpeg.surface)).apply {
-                            set(CaptureRequest.JPEG_QUALITY, 100.toByte())
-                        }
-                        capturing = true
-                        s.capture(still.build(), object : CameraCaptureSession.CaptureCallback() {
-                            override fun onCaptureCompleted(cs: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                                File(dir, "meta.json").writeText(referenceMeta(result, jpegSize).toString(2))
+                        failSoft {
+                            val still = buildRequest(d, listOf(raw.surface, jpeg.surface)).apply {
+                                set(CaptureRequest.JPEG_QUALITY, 100.toByte())
                             }
-                        }, handler)
+                            capturing = true
+                            s.capture(still.build(), object : CameraCaptureSession.CaptureCallback() {
+                                override fun onCaptureCompleted(cs: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                                    File(dir, "meta.json").writeText(referenceMeta(result, jpegSize).toString(2))
+                                }
+                            }, handler)
+                        }
                     }, 3000)
+                }
+
+                /** The camera can be closed under the capture (activity paused): give up quietly. */
+                private fun failSoft(block: () -> Unit) {
+                    try {
+                        block()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Reference capture interrupted", e)
+                        done("reference capture interrupted: ${e.message}")
+                    }
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) = done("RAW+JPEG session rejected")

@@ -1,8 +1,15 @@
 package com.authrec.ui
 
 import android.animation.ValueAnimator
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.os.SystemClock
 import android.text.TextUtils
 import android.view.Gravity
@@ -54,9 +61,14 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     // ---- Right: lenses, record, flip ----
     private val recordButton = RecordButton(a) { a.toggleRecording() }
     private val lensColumn = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
-    private val flipButton = roundChip("⟲") { flipCamera() }.apply {
-        textSize = 22f
+    private val flipButton = roundChip("") { flipCamera() }.apply {
+        foreground = FlipIcon(this, a.dp(2).toFloat())
         contentDescription = "Front / back camera"
+    }
+    /** Selfie-style mirror, next to the flip button while the front camera is on. */
+    private val mirrorButton = roundChip("") { a.setMirrorFront(!a.mirrorFront) }.apply {
+        foreground = MirrorIcon(this, a.dp(2).toFloat())
+        contentDescription = "Mirror front camera"
     }
     private var lensKeys = emptyList<String>()
     private val lensChips = mutableMapOf<Int, Button>()
@@ -259,6 +271,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         addView(flipButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
             setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18))
         })
+        // Under the EV slider (which ends 17 % of the height above the bottom), level with flip.
+        addView(mirrorButton, FrameLayout.LayoutParams(a.dp(40), a.dp(40), Gravity.BOTTOM or Gravity.END).apply {
+            setMargins(0, 0, rightColumnW + (sliderW - a.dp(40)) / 2, a.dp(21))
+        })
 
         // Bottom of the image (Pro), with its panels above it.
         addView(proBar, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
@@ -298,18 +314,24 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private fun publishGlass() {
         val out = ArrayList<GlassRect>(48)
         a.surfaceView.getLocationInWindow(origin)
-        collectGlass(root, 1f, out)
+        collectGlass(root, 1f, RectF(-1e6f, -1e6f, 1e6f, 1e6f), out)
         val same = out.size == publishedGlass.size && out.indices.all { i ->
             val p = out[i]
             val q = publishedGlass[i]
-            p.left == q.left && p.top == q.top && p.right == q.right && p.bottom == q.bottom && p.alpha == q.alpha
+            p.left == q.left && p.top == q.top && p.right == q.right && p.bottom == q.bottom && p.alpha == q.alpha &&
+                p.clip == q.clip
         }
         if (same) return
         publishedGlass = out
         a.setGlassRects(out)
     }
 
-    private fun collectGlass(v: View, parentAlpha: Float, out: MutableList<GlassRect>) {
+    /**
+     * [clip]: what the view's ancestors let it show, in surface pixels. The views clip themselves;
+     * the GL backdrop has to be told, or a settings row scrolled past the sheet's top still drew
+     * its glass over the image.
+     */
+    private fun collectGlass(v: View, parentAlpha: Float, clip: RectF, out: MutableList<GlassRect>) {
         if (v.visibility != View.VISIBLE) return
         val alpha = parentAlpha * v.alpha
         if (alpha < 0.02f) return
@@ -325,10 +347,22 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             v.getLocationInWindow(loc)
             val x = (loc[0] - origin[0]).toFloat()
             val y = (loc[1] - origin[1]).toFloat()
-            out += GlassRect(x + box.left * v.scaleX, y + box.top * v.scaleY, x + box.right * v.scaleX, y + box.bottom * v.scaleY,
-                radius * v.scaleX, alpha)
+            val r = GlassRect(x + box.left * v.scaleX, y + box.top * v.scaleY, x + box.right * v.scaleX, y + box.bottom * v.scaleY,
+                radius * v.scaleX, alpha, clip)
+            if (r.right > clip.left && r.left < clip.right && r.bottom > clip.top && r.top < clip.bottom) out += r
         }
-        if (v is android.view.ViewGroup) for (i in 0 until v.childCount) collectGlass(v.getChildAt(i), alpha, out)
+        if (v !is android.view.ViewGroup) return
+        var inner = clip
+        if (v.clipChildren) {
+            v.getLocationInWindow(loc)
+            val x = (loc[0] - origin[0]).toFloat()
+            val y = (loc[1] - origin[1]).toFloat()
+            val pad = v.clipToPadding
+            inner = RectF(x + if (pad) v.paddingLeft else 0, y + if (pad) v.paddingTop else 0,
+                x + v.width - if (pad) v.paddingRight else 0, y + v.height - if (pad) v.paddingBottom else 0)
+            if (!inner.intersect(clip)) return
+        }
+        for (i in 0 until v.childCount) collectGlass(v.getChildAt(i), alpha, inner, out)
     }
 
     // ---- Building blocks ----
@@ -557,10 +591,15 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         flipButton.visibility = if (a.lenses.any { it.front }) View.VISIBLE else View.GONE
         kit.setOn(flipButton, current?.front == true)
         flipButton.isEnabled = !busy && !a.scanning
+        mirrorButton.visibility = if (current?.front == true) View.VISIBLE else View.GONE
+        kit.setOn(mirrorButton, a.mirrorFront)
+        mirrorButton.isEnabled = !busy
 
         // Pro bar.
         val pro = !a.simple
         proBar.visibility = if (pro && settingsSheet.visibility != View.VISIBLE) View.VISIBLE else View.GONE
+        // The info line sits behind the sheet's rows and showed through its glass.
+        a.info.visibility = if (settingsSheet.visibility == View.VISIBLE) View.INVISIBLE else View.VISIBLE
         if (!pro) listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel).forEach { it.visibility = View.GONE }
         val ae = a.capture.ae
         setCaption(aeChip, when (ae) {
@@ -717,3 +756,103 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         hintClose = null
     }
 }
+
+/**
+ * The front / back flip symbol: an open circle with an arrowhead, drawn in the middle of [view]
+ * in its text colour (the ⟲ glyph sat low and to the right: its font's metrics, not its shape).
+ */
+private class FlipIcon(private val view: TextView, private val stroke: Float) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND }
+    private val arc = RectF()
+    private val head = Path()
+
+    override fun draw(canvas: Canvas) {
+        val r = minOf(bounds.width(), bounds.height()) * 0.22f
+        val cx = bounds.exactCenterX()
+        val cy = bounds.exactCenterY()
+        paint.color = view.currentTextColor
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = stroke
+        arc.set(cx - r, cy - r, cx + r, cy + r)
+        // Open at the upper left; the arrowhead on the end that comes round anticlockwise.
+        val start = 215f
+        val sweep = -290f
+        canvas.drawArc(arc, start, sweep, false, paint)
+        val end = Math.toRadians((start + sweep).toDouble())
+        val px = cx + r * kotlin.math.cos(end).toFloat()
+        val py = cy + r * kotlin.math.sin(end).toFloat()
+        // Unit tangent in the direction of travel (decreasing angle) and the outward normal.
+        val tx = kotlin.math.sin(end).toFloat()
+        val ty = -kotlin.math.cos(end).toFloat()
+        val nx = kotlin.math.cos(end).toFloat()
+        val ny = kotlin.math.sin(end).toFloat()
+        val h = stroke * 2.6f
+        head.reset()
+        head.moveTo(px + tx * h * 0.7f, py + ty * h * 0.7f)
+        head.lineTo(px - tx * h * 0.3f + nx * h * 0.6f, py - ty * h * 0.3f + ny * h * 0.6f)
+        head.lineTo(px - tx * h * 0.3f - nx * h * 0.6f, py - ty * h * 0.3f - ny * h * 0.6f)
+        head.close()
+        paint.style = Paint.Style.FILL
+        canvas.drawPath(head, paint)
+    }
+
+    override fun setAlpha(alpha: Int) {
+        paint.alpha = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        paint.colorFilter = colorFilter
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity() = PixelFormat.TRANSLUCENT
+}
+
+/** Mirror symbol: two triangles pointing apart across a dashed line, the left one filled. */
+private class MirrorIcon(private val view: TextView, private val stroke: Float) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeJoin = Paint.Join.ROUND }
+    private val path = Path()
+
+    override fun draw(canvas: Canvas) {
+        val s = minOf(bounds.width(), bounds.height()) * 0.5f
+        val cx = bounds.exactCenterX()
+        val cy = bounds.exactCenterY()
+        val gap = s * 0.14f
+        val half = s * 0.36f
+        val depth = s * 0.34f
+        paint.color = view.currentTextColor
+        paint.strokeWidth = stroke
+        fun triangle(dir: Float) {
+            path.reset()
+            path.moveTo(cx + dir * gap, cy - half)
+            path.lineTo(cx + dir * gap, cy + half)
+            path.lineTo(cx + dir * (gap + depth), cy)
+            path.close()
+        }
+        paint.style = Paint.Style.FILL
+        triangle(-1f)
+        canvas.drawPath(path, paint)
+        paint.style = Paint.Style.STROKE
+        triangle(1f)
+        canvas.drawPath(path, paint)
+        // The mirror line, dashed.
+        val dash = s * 0.13f
+        var y = cy - s * 0.5f
+        while (y < cy + s * 0.5f) {
+            canvas.drawLine(cx, y, cx, minOf(y + dash, cy + s * 0.5f), paint)
+            y += dash * 1.8f
+        }
+    }
+
+    override fun setAlpha(alpha: Int) {
+        paint.alpha = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        paint.colorFilter = colorFilter
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity() = PixelFormat.TRANSLUCENT
+}
+
