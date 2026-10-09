@@ -1684,12 +1684,20 @@ class CameraActivity : Activity() {
 
     private fun lutDir() = File(getExternalFilesDir(null), "luts").apply { mkdirs() }
 
-    /** Copies .cube files bundled in assets/luts into the LUT folder (once; deleting one there is respected). */
+    /**
+     * Copies the .cube LUTs and .look.json looks bundled in assets/luts into the LUT folder: once
+     * each (deleting one there is respected), and never over a file of the same name (the user's
+     * own copy, maybe edited since).
+     */
     private fun installBundledLuts() {
         val installed = prefs.getStringSet("bundledLuts", emptySet())!!
-        val names = assets.list("luts").orEmpty().filter { it.endsWith(".cube", ignoreCase = true) && it !in installed }
+        val names = assets.list("luts").orEmpty().filter {
+            (it.endsWith(".cube", ignoreCase = true) || it.endsWith(Look.SUFFIX)) && it !in installed
+        }
         names.forEach { name ->
-            runCatching { assets.open("luts/$name").use { input -> File(lutDir(), name).outputStream().use { input.copyTo(it) } } }
+            val target = File(lutDir(), name)
+            if (target.exists()) return@forEach
+            runCatching { assets.open("luts/$name").use { input -> target.outputStream().use { input.copyTo(it) } } }
         }
         if (names.isNotEmpty()) prefs.edit().putStringSet("bundledLuts", installed + names).apply()
     }

@@ -193,6 +193,8 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   (platform `Activity`, `startActivityForResult`), no new dependencies without a reason.
 - Settings persist in SharedPreferences `authrec`; lens cache in `lenses` (bump
   `LensProbe.VERSION` when probing logic changes so devices rescan).
+- Bundled LUTs and looks: `app/src/main/assets/luts` (`.cube`, `.look.json`), copied into the
+  app's LUT folder once each by `installBundledLuts` (never over a file of the same name).
 - Anything that can fail on an unknown phone (lens routes, metadata, session config) must fail
   soft: catch, log under tag `AuthRec`, show a message or fall back. Never crash on HAL quirks.
 - UI strings are short; Simple mode stays minimal (look, eDR, adjust, exposure, 4K/2K, record).

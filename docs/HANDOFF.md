@@ -1,4 +1,4 @@
-# Handoff: state as of 0.4.0 (2026-10-08, released as GitHub pre-release v0.4.0)
+# Handoff: state as of 0.5.0 (2026-10-09, released as GitHub pre-release v0.5.0)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -6,7 +6,9 @@ How it got here: built in one long session from a capability bench → live RAW 
 then 0.3.0: the third 15 Ultra report (green clip starts, tint, lenses coming and going) and the
 owner's next round (new UI, eDR, a look from a reference photo), then 0.4.0: the owner's round
 after 0.3.0 (tap AF on contrast-AF lenses, real glass, frame aspects, start-of-clip drops,
-temporal colour NR) and a daylight test of it.
+temporal colour NR) and a daylight test of it, then 0.5.0: the first part of the UI polish and
+NR polish after a day with 0.4.0 (colour NR's change test rebuilt, clear glass, sliding selection,
+new record button) plus the owner's two looks bundled.
 Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: **feedback/**
 (`notes.md` has every reported item, its diagnosis and status; 15–21 are 0.3.0's).
 
@@ -107,8 +109,8 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
    her recordings (partial frames? key frame first?), the `… colour:` lines (physical results on
    `0/4`, `0/5`?), and that the scan kept 4.1x and skipped `0/3` after one crash.
 3. **0.5.0 is planned as the big UI polish/overhaul plus NR polish** (owner, 2026-10-09, after
-   using 0.4.0: "the bones of it seem to be working"). Started on main (not committed yet when
-   written; feedback/notes.md items 39–44): colour NR's change test redone (8×8/16×16 window
+   using 0.4.0: "the bones of it seem to be working"). First part released as 0.5.0
+   (feedback/notes.md items 39–47): colour NR's change test redone (8×8/16×16 window
    colour against a running average, self-learned noise per window, frame-wide camera-motion
    back-off), clear-glass look, sliding selection pill, panel reveal, new record button. **Needs
    the owner's eyes**: NR at night with movement (street lights, the 2.6x/0.6x against a warm
