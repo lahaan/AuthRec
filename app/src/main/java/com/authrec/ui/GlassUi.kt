@@ -60,7 +60,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
     // ---- Right: lenses, record, flip ----
     private val recordButton = RecordButton(a) { a.toggleRecording() }
-    private val lensColumn = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
+    private val lensColumn = SelectionLayout(a).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
     private val flipButton = roundChip("") { flipCamera() }.apply {
         foreground = FlipIcon(this, a.dp(2).toFloat())
         contentDescription = "Front / back camera"
@@ -314,7 +314,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private fun publishGlass() {
         val out = ArrayList<GlassRect>(48)
         a.surfaceView.getLocationInWindow(origin)
-        collectGlass(root, 1f, RectF(-1e6f, -1e6f, 1e6f, 1e6f), out)
+        collectGlass(root, 1f, RectF(-1e6f, -1e6f, 1e6f, 1e6f), false, out)
         val same = out.size == publishedGlass.size && out.indices.all { i ->
             val p = out[i]
             val q = publishedGlass[i]
@@ -329,21 +329,23 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     /**
      * [clip]: what the view's ancestors let it show, in surface pixels. The views clip themselves;
      * the GL backdrop has to be told, or a settings row scrolled past the sheet's top still drew
-     * its glass over the image.
+     * its glass over the image. [onGlass]: an ancestor is glass already; its buttons sit on that
+     * pane as tinted shapes instead of each opening its own clear window through the frost (owner:
+     * the settings pills showed the scene sharper than the sheet around them).
      */
-    private fun collectGlass(v: View, parentAlpha: Float, clip: RectF, out: MutableList<GlassRect>) {
+    private fun collectGlass(v: View, parentAlpha: Float, clip: RectF, onGlass: Boolean, out: MutableList<GlassRect>) {
         if (v.visibility != View.VISIBLE) return
         val alpha = parentAlpha * v.alpha
         if (alpha < 0.02f) return
         val box: android.graphics.RectF?
         val radius: Float
         when {
-            v === recordButton -> { box = android.graphics.RectF(0f, 0f, v.width.toFloat(), v.height.toFloat()); radius = v.width / 2f }
+            v === recordButton -> { box = recordButton.glassBox(); radius = box.width() / 2f }
             v === a.exposureSlider -> { box = a.exposureSlider.glassBox(); radius = 30f }
             v.background is GlassDrawable -> { box = android.graphics.RectF(0f, 0f, v.width.toFloat(), v.height.toFloat()); radius = (v.background as GlassDrawable).radius }
             else -> { box = null; radius = 0f }
         }
-        if (box != null && v.width > 0) {
+        if (box != null && v.width > 0 && !onGlass) {
             v.getLocationInWindow(loc)
             val x = (loc[0] - origin[0]).toFloat()
             val y = (loc[1] - origin[1]).toFloat()
@@ -362,7 +364,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
                 x + v.width - if (pad) v.paddingRight else 0, y + v.height - if (pad) v.paddingBottom else 0)
             if (!inner.intersect(clip)) return
         }
-        for (i in 0 until v.childCount) collectGlass(v.getChildAt(i), alpha, inner, out)
+        for (i in 0 until v.childCount) collectGlass(v.getChildAt(i), alpha, inner, onGlass || box != null, out)
     }
 
     // ---- Building blocks ----
@@ -441,6 +443,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         panels.forEach { if (it !== panel) it.visibility = View.GONE }
         if (show && panel === adjustPanel) a.priorityPanelOpen = false
         panel.visibility = if (show) View.VISIBLE else View.GONE
+        if (show) kit.reveal(panel)
         update()
     }
 
@@ -463,12 +466,13 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             row(label, pro, seg)
             settingsRows += { mark(options.indexOfFirst { it.second == current() }) }
         }
-        content.addView(LinearLayout(a).apply {
+        // Fixed above the rows, which scroll beneath it.
+        val header = LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(title("Settings"), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             addView(kit.button("✕") { toggle(settingsSheet) })
-        })
+        }
         choice("Mode", false, listOf("Simple" to true, "Pro" to false), { a.simple }) { a.setSimple(it) }
         choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), { a.superpixel }) { a.setSuperpixel(it) }
         choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
@@ -495,14 +499,23 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         buttons(false, "Lenses…" to { a.showLensMenu(settingsChip) }, "Rescan lenses" to { toggle(settingsSheet); a.rescanLenses() },
             "Send diagnostics…" to { a.sendDiagnostics() })
         content.addView(kit.label("AuthRec ${a.packageManager.getPackageInfo(a.packageName, 0).versionName}", 11f, dim = true).apply {
-            setPadding(0, a.dp(12), 0, 0)
+            setPadding(0, a.dp(12), 0, a.dp(10))
         })
-        return ScrollView(a).apply {
-            background = GlassDrawable(a.dp(24).toFloat(), solid = true).apply { baseColor = 0xB8101418.toInt() }
-            setPadding(a.dp(20), a.dp(14), a.dp(20), a.dp(14))
+        // Rows fade out towards the sheet's edges instead of being cut by a straight line just
+        // under its rounded rim (owner: scrolled rows looked clipped, poking past the corners).
+        val rows = ScrollView(a).apply {
             isVerticalScrollBarEnabled = false
-            visibility = View.GONE
+            isVerticalFadingEdgeEnabled = true
+            setFadingEdgeLength(a.dp(28))
             addView(content)
+        }
+        return LinearLayout(a).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GlassDrawable(a.dp(24).toFloat(), solid = true).apply { baseColor = 0x99101418.toInt() }
+            setPadding(a.dp(20), a.dp(14), a.dp(20), a.dp(8))
+            visibility = View.GONE
+            addView(header)
+            addView(rows, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         }
     }
 
@@ -515,6 +528,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         val keys = order.map { a.lenses[it].key }
         if (keys == lensKeys && lensChips.size == order.size) return
         lensKeys = keys
+        lensColumn.reset()
         lensColumn.removeAllViews()
         lensChips.clear()
         // The chips fit between the top edge and the record button, keeping a clear gap above it so
@@ -584,10 +598,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         rebuildLenses()
         val current = a.lenses.getOrNull(a.lensIndex)
         if (current != null && !current.front) lastBack = current.key
-        lensChips.forEach { (i, chip) ->
-            kit.setOn(chip, i == a.lensIndex)
-            chip.isEnabled = !busy && !a.scanning
-        }
+        lensChips.values.forEach { it.isEnabled = !busy && !a.scanning }
+        // The accent pill rides from the old lens to the new one (none on the front camera).
+        lensColumn.select(lensChips[a.lensIndex])
         flipButton.visibility = if (a.lenses.any { it.front }) View.VISIBLE else View.GONE
         kit.setOn(flipButton, current?.front == true)
         flipButton.isEnabled = !busy && !a.scanning

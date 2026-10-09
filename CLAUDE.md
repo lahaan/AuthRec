@@ -35,14 +35,14 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 | `CameraActivity.kt` | State and actions behind the screen (landscape): settings/prefs, the views both layouts share (preview + gestures, info text, EV slider, focus bar, priority limits), lens selection & fallback, camera failure recovery (`onCameraFailure`: retries, session layouts, fallback to 1x) + watchdog, AF modes (tap = one-shot AF + spot watch, contrast-AF hookup), AE: Priority loop, exposure routing, eDR / WB trim / view adjustments, eDR suggestion, heat guard, recording start/stop (4K warm-up), looks list, adb hooks (`handleCommands`) |
 | `ui/GlassUi.kt` | Default layout: lens chips + big record button + flip (+ selfie mirror on the front camera) on the right, mode/look/eDR/Adjust/Settings on the left, Pro bar (exposure, ISO and shutter dials, WB, focus, fps), Adjust panel with the eDR curve, settings sheet, REC pill, hint banner |
 | `ui/ClassicUi.kt` | The original layout (buttons in two columns, exposure bar), Settings → Layout → Classic; its ⚙ (top right) switches back to Glass and has the lens tools |
-| `ui/Glass.kt`, `RecordButton`, `ValueDial`, `ToneCurveView`, `CameraUi` | Glass drawable + `UiKit` (controls in either style), the record button, the ISO/shutter ruler, the eDR curve graph, the layout interface and `Stepper` |
+| `ui/Glass.kt`, `RecordButton`, `ValueDial`, `ToneCurveView`, `CameraUi` | Glass drawable, `SelectionLayout` (sliding accent pill) + `UiKit` (controls in either style), the record button, the ISO/shutter ruler, the eDR curve graph, the layout interface and `Stepper` |
 | `camera/RawCamera.kt` | Camera2 session (all device/session work on the camera thread): RAW_SENSOR stream + tiny YUV "metering" stream, session layouts 0–2 (`variant`), request building (AE/AF/AWB/zoom routing/regions), per-frame `FrameMeta` with colour-metadata fallbacks, failure reporting, reference-shot capture |
 | `camera/LensProbe.kt` | Finds every RAW-capable lens (listed ids, hidden ids 0–31, zoom routes, physical sub-cameras), test-streams each with HAL-recovery waits, keeps listed cameras and lenses the previous scan found, skips routes that took the camera service down, caches per firmware (`VERSION`), labels 0.6x/1x/2.6x |
 | `EventLog.kt` | Persistent event log (`files/events.log`: opens, layouts, failures, retries, scans, recordings, heat, crashes); part of Send diagnostics |
 | `ExposureSlider.kt` | The vertical EV slider (relative drag, double-tap = 0, amber where it's digital gain) |
 | `gl/Renderer.kt` | GL thread: RAW upload, compute passes, preview draw (+ frame mask), encoder-surface draw (2nd shared EGL context, 10-bit config, crop for 16:9 etc., pre-roll), auto gain, sharpness metric for contrast AF (centre-weighted), baked view LUT, recording timing, debug timings |
-| `gl/PipelineShaders.kt` | GLSL: prep (black/shading/WB/defect pixels) → develop (MHC demosaic or superpixel, matrix, log, view, temporal colour NR, in one pass) + `viewCommon` (eDR, LUT input conversion, branch-free tetrahedral LUT, saturation/vibrance) + display (crop, peaking) |
-| `gl/GlassBackdrop.kt` | The Glass layout's backdrop: quarter-size blurred copies of the preview drawn inside each control's shape with a refracting bevel |
+| `gl/PipelineShaders.kt` | GLSL: prep (black/shading/WB/defect pixels) → develop (MHC demosaic or superpixel, matrix, log, view, temporal colour NR, in one pass), colour NR's change test (`coarseColour`, `colourChange`) + `viewCommon` (eDR, LUT input conversion, branch-free tetrahedral LUT, saturation/vibrance) + display (crop, peaking) |
+| `gl/GlassBackdrop.kt` | The Glass layout's glass: each control's shape filled with the preview as clear glass (buttons) or frosted (panels), bent at the rim |
 | `color/ViewLut.kt` | Bakes eDR + LUT input conversion + LUT + strength into one 33³ LUT on a background thread |
 | `gl/GlUtil.kt` | EGL core (main + encoder contexts), GL helpers |
 | `record/Recorder.kt` | MediaCodec video (surface input) + AAC audio on the camera clock + MediaMuxer → MediaStore `Movies/AuthRec` |
@@ -108,7 +108,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 - The preview uses the superpixel path between recordings (≈4 ms vs ≈15–25 ms a frame).
 - **4K budget** (X14, `pipetiming`, glFinish between stages, so pessimistic): upload ~2, prep ~3.5,
   develop+view ~12 ms (one merged pass); Clean's pixel fix adds ~3 to prep (2K too: prep always
-  runs on the full RAW), its colour NR ~2 to develop (2K: ~1). Was ~27 ms before 2026-10-08: a
+  runs on the full RAW), its colour NR ~2 to develop (2K: ~1) and ~2 for its change test. Was ~27 ms before 2026-10-08: a
   separate finish pass re-read a full-size RGBA16F image, and the tetrahedral LUT's six branches
   diverged across each GPU wave (now branch-free; ties broken with one strict comparison, or
   greys came out wrong). The view's
@@ -116,10 +116,19 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   whenever they change; until it matches the settings the per-pixel path runs.
 - **Colour NR** (Clean 2/3, "+ Colour"/"+ Colour+") is temporal and colour-only: each pixel's
   colour (channels minus their Rec.709 mean) is blended with a ping-pong history (EMA weight
-  0.7/0.85, reset on size/target change) where nothing moved, judged against the sensor's noise
-  profile twice: the 3×3-smoothed RAW brightness per pixel, and the colour of the 4×4 sensor
-  blocks around it (`coarseColour` pass, ~0.7 ms at 4K). Brightness alone let a grey cable
-  sliding over an orange mat (similar RAW brightness) leave grey trails (owner, 2.6x). It runs on
+  0.7/0.85, reset on size/target change) where nothing moved, judged three ways: per pixel, the
+  3×3-smoothed RAW brightness against the noise profile; per 8×8 and 16×16 sensor window
+  (`coarseColour` 4×4 blocks → `colourChange`), the window's colour ((R−G, B−G)/(R+2G+B), so
+  exposure changes don't count) against its own running average, in units of its noise: profile ×
+  that channel's WB × shading gain × a scale each window learns while still (the profiles were off
+  ×0.2–×3 per lens on the X14: still scenes read as moving on the 0.6x, the 2.6x was blind); and
+  frame-wide, the mean window z² over noise's 2 (camera moving) backs the blend off to 30 %.
+  Brightness alone let a grey cable over an orange mat leave trails; 4×4 blocks against the
+  previous frame still trailed at high ISO and washed out greens under street lights while moving
+  (owner, 0.4.0). Numpy replica at X14 ISO 3200 noise (`feedback/samples/2026-10-09-ui-nr/`):
+  trails 27× fainter, a dark pan over leaves kept 91 % of their colour (was 19 %), still-scene NR
+  within 10 %. ~2 ms at 4K for the two passes. `nrdebug=true` logs the frame-wide measure (still:
+  0–0.3) and the learned noise scale. It runs on
   the finished view (or on the log when recording log): done before the view, eDR/LUT toes
   turned the missing noise into crushed darks; split in linear light, luminance noise went into
   all three channels (+50 % grain). Recorded luma is untouched (encoder input is exact BT.709
@@ -135,9 +144,22 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   encoder hand-over, slowest pre-roll frame).
 - **Frame** (`aspect`: 4:3, 16:9, 2:1, 2.39:1): the encoder gets a centre crop of the image
   (height a multiple of 16, e.g. 4096×2304); the preview darkens the rest and draws frame lines.
-- **Glass backdrop** costs ~1.5 ms a preview frame (`glasstiming`), refreshed every third frame
-  while recording. Its blur passes run before the window's render pass: drawing them in between
-  made the tile GPU store and reload the whole screen (~2 ms).
+- **Glass backdrop** costs ~1.7 ms a preview frame (`glasstiming`), refreshed every third frame
+  while recording. Buttons are clear glass sampling the preview image itself (a blurred copy hid
+  the bending: owner, "not like real glass"): a 4 % magnification, and towards the rim what lies
+  just beyond the edge pulled in (a glass drop's look), a thin specular line on the lit rim,
+  darker over bright scenes. Panels holding text are frosted (quarter-size blur). The views add
+  only a light tint and a hairline rim (`GlassDrawable`; the old body gradient and top gloss were
+  "too strong"). Look chosen from mock-ups over a real preview frame (same folder). Its blur passes
+  run before the window's render pass: drawing them in between made the tile GPU store and reload
+  the whole screen (~2 ms).
+- **Selection** in Glass: `SelectionLayout` draws the accent pill behind its (nested) buttons and
+  slides it to a new choice (lens chips, every option row); the chosen button's `GlassDrawable` is
+  `clear`. Panels fade/grow in (`UiKit.reveal`); hiding stays instant because state reads
+  `visibility`. Record button: white ring, flat red core, clear glass between (`glassBox`).
+  Only top-level controls get GL glass: buttons on a glass panel are tinted shapes on its frost
+  (each opened a clear window through it). The settings sheet keeps its title fixed and fades the
+  scrolling rows at its edges (a hard cut under the rounded rim looked clipped).
 - **eDR** (was "Balance"; prefs `edrOn`/`edrHi`/`edrLo`, default −75/+30, migrated from 0.2.2's
   `toneHi`/`toneLo`): a luminance-based curve in stops around middle grey (highlights above +1 stop
   compressed, shadows below −1 stop lifted, half-stop soft knees) applied before the look/LUT. It
@@ -185,7 +207,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   `clean=3`, `afverbose=true` (`--ez`), `cmd=dumpcams|refshot|edit|rescan|failcam`, `layout=0..2`,
   `fakeheat=47.5`, `lutinput=SLOG3`, `fullpreview=true`, `edr=true`, `tonehi=-75 tonelo=30`,
   `wbwarm/wbtint`, `ui=glass|classic`, `edrhint=reset|show`, `recdebug=split|dropkey|bars|off`,
-  `aspect=16:9`, `glasstiming=true`, `pipetiming=true`, `bakedview=false`, `mirror=true`).
+  `aspect=16:9`, `glasstiming=true`, `pipetiming=true`, `bakedview=false`, `mirror=true`, `nrdebug=true`).
   **Every `am start` pauses and resumes the activity, i.e. closes and reopens the camera**, so
   state that lives in the session (AF, a recording) is reset by the next command; hooks that must
   act on a running session post themselves (`failcam` after 2 s, `fakeheatdelay`). For taps use

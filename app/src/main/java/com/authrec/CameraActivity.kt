@@ -1876,6 +1876,7 @@ class CameraActivity : Activity() {
      * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
      * aspect = 4:3 | 16:9 | 2:1 | 2.39:1 (recorded frame), glasstiming = true (log the backdrop's GPU time),
      * pipetiming = true (log each pipeline stage's time, with glFinish between them),
+     * nrdebug = true (log colour NR's frame-wide motion measure every 30 frames),
      * bakedview = false (view math per pixel instead of the baked view LUT, to compare),
      * recdebug = split | dropkey | bars | off (encoder output handling: deliver frames in pieces /
      * lose the first key frame; bars: colour bars in the recording; see Recorder).
@@ -1964,6 +1965,7 @@ class CameraActivity : Activity() {
         if (extras.containsKey("fullpreview")) renderer?.previewFullRes = extras.getBoolean("fullpreview")
         if (extras.containsKey("glasstiming")) renderer?.glassTiming = extras.getBoolean("glasstiming")
         if (extras.containsKey("pipetiming")) renderer?.pipeTiming = extras.getBoolean("pipetiming")
+        if (extras.containsKey("nrdebug")) renderer?.nrDebug = extras.getBoolean("nrdebug")
         if (extras.containsKey("bakedview")) renderer?.bakeViewLut = extras.getBoolean("bakedview")
         extras.getString("recdebug")?.let {
             Recorder.debugSplitFrames = it == "split"

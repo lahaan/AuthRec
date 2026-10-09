@@ -106,9 +106,15 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
    (0.3.0's showed no crash; 0.6x unreachable), check tap AF on her telephotos, the `Encoder …` line of
    her recordings (partial frames? key frame first?), the `… colour:` lines (physical results on
    `0/4`, `0/5`?), and that the scan kept 4.1x and skipped `0/3` after one crash.
-3. The owner will send UI sketches for the Glass layout; layouts live in `ui/` (CLAUDE.md).
-4. Owner decisions pending (see "Ideas" below): ETTR (proposal below), whether the 1 s REC
-   pre-roll is fine (the clip starts 1 s after the press).
+3. **0.5.0 is planned as the big UI polish/overhaul plus NR polish** (owner, 2026-10-09, after
+   using 0.4.0: "the bones of it seem to be working"). Started on main (not committed yet when
+   written; feedback/notes.md items 39–44): colour NR's change test redone (8×8/16×16 window
+   colour against a running average, self-learned noise per window, frame-wide camera-motion
+   back-off), clear-glass look, sliding selection pill, panel reveal, new record button. **Needs
+   the owner's eyes**: NR at night with movement (street lights, the 2.6x/0.6x against a warm
+   wall) and the glass over bright scenes. The owner may still send UI sketches.
+4. Owner decisions pending (see "Ideas" below): ETTR (proposal below). The 1 s REC pre-roll is
+   fine for now (owner).
 
 ## After 0.2.2
 

@@ -23,10 +23,9 @@ import android.widget.SeekBar
 import android.widget.TextView
 
 /**
- * The "Glass" look: translucent, glossy capsules with a bright rim (a nod to liquid glass and
- * Frutiger Aero), an aqua accent for whatever is switched on, red for recording. The camera image
- * is a SurfaceView, so real backdrop blur isn't available; a dark translucent base under the gloss
- * keeps text readable over bright scenes instead.
+ * The "Glass" look: clear glass capsules that bend the image behind them (GL, GlassBackdrop) with
+ * a hairline rim, an accent for whatever is switched on (a pill that slides between choices), red
+ * for recording.
  */
 internal object Glass {
     const val ACCENT = 0xFF4FD8FF.toInt()
@@ -43,67 +42,89 @@ internal fun Context.dp(v: Number): Int = (v.toFloat() * resources.displayMetric
 internal fun View.dp(v: Number): Int = context.dp(v)
 
 /**
- * A glass capsule: dark translucent base, a soft white body gradient, a glossy highlight over the
- * upper half and a rim that is bright on top and fades towards the bottom. [accent] fills it with
- * the accent colour (a switch that is on, a selected option); pressed brightens it.
+ * A glass capsule's view layer. The glass itself (the image behind, bent at the rim, with its
+ * specular line) is drawn by GL underneath ([com.authrec.gl.GlassBackdrop]); this adds only a light
+ * tint, so the shape reads on the black margins and white labels over bright scenes, and a
+ * hairline rim. [accent] fills it with the accent colour (a switch that is on), fading in and
+ * out; pressed brightens it. The owner found the earlier body gradient and big top gloss too
+ * strong to pass for glass.
  */
 internal class GlassDrawable(
-    /** Corner radius in px (also what the backdrop blur behind it uses). */
+    /** Corner radius in px (also what the backdrop glass behind it uses). */
     val radius: Float,
-    var accent: Int? = null,
-    /** Darker base for panels that sit over the image and hold small text. */
+    initialAccent: Int? = null,
+    /** Darker tint for panels that sit over the image and hold small text. */
     private val solid: Boolean = false,
 ) : Drawable() {
-    private val base = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val body = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val gloss = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val r = RectF()
-    private val inner = RectF()
+    private val hairline = android.content.res.Resources.getSystem().displayMetrics.density
     private var pressed = false
     private var enabled = true
-    /** Base colour under the gloss when there is no accent (null = the default for [solid]). */
+    /** Tint under the label when there is no accent (null = the default for [solid]). */
     var baseColor: Int? = null
+
+    var accent: Int? = initialAccent
+        set(v) {
+            if (v == field) return
+            field = v
+            if (v != null) shownAccent = v
+            fadeAccent(if (v != null) 1f else 0f)
+        }
+    private var shownAccent = initialAccent ?: Glass.ACCENT_DEEP
+    private var accentLevel = if (initialAccent != null) 1f else 0f
+    private var accentAnim: ValueAnimator? = null
+
+    /** Inside a [SelectionLayout] that marks this one: its sliding pill shows instead of a fill. */
+    var clear = false
+        set(v) {
+            if (v != field) { field = v; invalidateSelf() }
+        }
+
+    private fun fadeAccent(to: Float) {
+        accentAnim?.cancel()
+        if (callback == null) {
+            accentLevel = to
+            return
+        }
+        accentAnim = ValueAnimator.ofFloat(accentLevel, to).apply {
+            duration = 160
+            addUpdateListener { accentLevel = it.animatedValue as Float; invalidateSelf() }
+            start()
+        }
+    }
 
     override fun draw(c: Canvas) {
         val b = bounds
         if (b.isEmpty) return
-        val stroke = radius.coerceAtMost(3f).coerceAtLeast(2f)
+        val stroke = hairline
         r.set(b.left + stroke / 2, b.top + stroke / 2, b.right - stroke / 2, b.bottom - stroke / 2)
         val rad = radius.coerceAtMost(minOf(r.height(), r.width()) / 2)
-        val top = r.top
-        val bottom = r.bottom
         val a = if (enabled) 1f else 0.45f
 
-        val tint = accent
-        // The blurred image behind (GlassBackdrop) does most of the work; the dark base keeps
-        // white text readable over bright scenes.
-        base.color = tint ?: baseColor ?: if (solid) 0x80101418.toInt() else 0x4D101418
-        base.alpha = (base.alpha * a).toInt()
-        c.drawRoundRect(r, rad, rad, base)
-
-        val lift = if (pressed) 0x40 else 0
-        body.shader = LinearGradient(0f, top, 0f, bottom,
-            Color.argb((((if (tint != null) 0x50 else 0x38) + lift) * a).toInt(), 255, 255, 255),
-            Color.argb((((if (tint != null) 0x08 else 0x10) + lift / 2) * a).toInt(), 255, 255, 255), Shader.TileMode.CLAMP)
-        c.drawRoundRect(r, rad, rad, body)
-
-        // Specular gloss on the upper half: the outline's own shape, inset, cut off below half way.
-        // (A separate shorter rounded rect had its corners squashed and poked out of round buttons.)
-        val inset = stroke * 1.5f
-        inner.set(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset)
-        val glossBottom = r.top + r.height() * 0.52f
-        gloss.shader = LinearGradient(0f, inner.top, 0f, glossBottom,
-            Color.argb((0x70 * a).toInt(), 255, 255, 255), Color.argb(0, 255, 255, 255), Shader.TileMode.CLAMP)
-        val gr = (rad - inset).coerceAtLeast(0f)
-        c.save()
-        c.clipRect(inner.left, inner.top, inner.right, glossBottom)
-        c.drawRoundRect(inner, gr, gr, gloss)
-        c.restore()
+        if (!clear) {
+            // A light dark wash with a little white in it: visible on black, gentle on the image.
+            fill.shader = null
+            fill.color = baseColor ?: if (solid) 0x66101418 else 0x1F101418
+            fill.alpha = (fill.alpha * a).toInt()
+            c.drawRoundRect(r, rad, rad, fill)
+            fill.color = Color.argb((0x14 * a).toInt(), 255, 255, 255)
+            c.drawRoundRect(r, rad, rad, fill)
+            if (accentLevel > 0f) {
+                fill.color = shownAccent
+                fill.alpha = (0xE6 * accentLevel * a).toInt()
+                c.drawRoundRect(r, rad, rad, fill)
+            }
+        }
+        if (pressed) {
+            fill.color = Color.argb(0x22, 255, 255, 255)
+            c.drawRoundRect(r, rad, rad, fill)
+        }
 
         rim.strokeWidth = stroke
-        rim.shader = LinearGradient(0f, top, 0f, bottom,
-            Color.argb((0xC0 * a).toInt(), 255, 255, 255), Color.argb((0x30 * a).toInt(), 255, 255, 255), Shader.TileMode.CLAMP)
+        rim.shader = LinearGradient(0f, r.top, 0f, r.bottom,
+            Color.argb((0x66 * a).toInt(), 255, 255, 255), Color.argb((0x14 * a).toInt(), 255, 255, 255), Shader.TileMode.CLAMP)
         c.drawRoundRect(r, rad, rad, rim)
     }
 
@@ -123,6 +144,134 @@ internal class GlassDrawable(
     override fun setColorFilter(colorFilter: ColorFilter?) = Unit
     @Deprecated("Deprecated in Java")
     override fun getOpacity() = PixelFormat.TRANSLUCENT
+}
+
+/**
+ * A LinearLayout whose chosen glass button (a child, or a button in a nested row) is marked by an
+ * accent pill that slides behind the buttons from the previous choice to the new one, and fades
+ * in or out when there's no choice (the lens chips while the front camera is on).
+ */
+internal class SelectionLayout(context: Context) : LinearLayout(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var chosen: View? = null
+    private val cur = RectF()
+    private val from = RectF()
+    private val to = RectF()
+    private val tmp = android.graphics.Rect()
+    private var curRadius = 0f
+    private var fromRadius = 0f
+    private var toRadius = 0f
+    /** The pill's opacity (0..1). */
+    private var shown = 0f
+    private var slide: ValueAnimator? = null
+    private var fade: ValueAnimator? = null
+    var color = Glass.ACCENT_DEEP
+
+    init {
+        setWillNotDraw(false)
+    }
+
+    fun select(view: View?) {
+        if (view === chosen) return
+        val previous = chosen
+        (previous?.background as? GlassDrawable)?.clear = false
+        chosen = view
+        (view?.background as? GlassDrawable)?.clear = true
+        when {
+            view == null -> fadeTo(0f)
+            previous == null || cur.isEmpty || !isLaidOut || !view.isLaidOut || !isMine(view) -> {
+                // Nothing to slide from: appear where it belongs.
+                slide?.cancel()
+                snap()
+                fadeTo(1f)
+            }
+            else -> {
+                from.set(cur)
+                fromRadius = curRadius
+                rectOf(view, to)
+                toRadius = radiusOf(view)
+                slide?.cancel()
+                slide = ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 280
+                    interpolator = android.view.animation.DecelerateInterpolator(1.6f)
+                    addUpdateListener {
+                        val f = it.animatedValue as Float
+                        cur.set(from.left + (to.left - from.left) * f, from.top + (to.top - from.top) * f,
+                            from.right + (to.right - from.right) * f, from.bottom + (to.bottom - from.bottom) * f)
+                        curRadius = fromRadius + (toRadius - fromRadius) * f
+                        invalidate()
+                    }
+                    start()
+                }
+                fadeTo(1f)
+            }
+        }
+    }
+
+    /** Forgets the choice without animating (its views are about to be replaced). */
+    fun reset() {
+        slide?.cancel()
+        fade?.cancel()
+        (chosen?.background as? GlassDrawable)?.clear = false
+        chosen = null
+        shown = 0f
+        cur.setEmpty()
+        invalidate()
+    }
+
+    private fun fadeTo(target: Float) {
+        if (shown == target && fade?.isRunning != true) return
+        fade?.cancel()
+        fade = ValueAnimator.ofFloat(shown, target).apply {
+            duration = 160
+            addUpdateListener { shown = it.animatedValue as Float; invalidate() }
+            start()
+        }
+    }
+
+    private fun isMine(v: View): Boolean {
+        var p = v.parent
+        while (p != null) {
+            if (p === this) return true
+            p = p.parent
+        }
+        return false
+    }
+
+    private fun rectOf(v: View, out: RectF) {
+        tmp.set(0, 0, v.width, v.height)
+        offsetDescendantRectToMyCoords(v, tmp)
+        out.set(tmp)
+        val inset = resources.displayMetrics.density / 2
+        out.inset(inset, inset)
+    }
+
+    private fun radiusOf(v: View): Float {
+        val r = (v.background as? GlassDrawable)?.radius ?: (minOf(v.width, v.height) / 2f)
+        return r.coerceAtMost(minOf(v.width, v.height) / 2f)
+    }
+
+    private fun snap() {
+        val v = chosen ?: return
+        if (!isMine(v) || !v.isLaidOut) return
+        rectOf(v, cur)
+        curRadius = radiusOf(v)
+    }
+
+    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        super.onLayout(changed, l, t, r, b)
+        if (slide?.isRunning != true) snap()
+    }
+
+    override fun dispatchDraw(canvas: Canvas) {
+        val v = chosen
+        if (shown > 0f && !cur.isEmpty) {
+            paint.color = color
+            paint.alpha = (0xE6 * shown * (if (v == null || v.isEnabled) 1f else 0.45f)).toInt()
+            canvas.drawRoundRect(cur, curRadius, curRadius, paint)
+        }
+        super.dispatchDraw(canvas)
+    }
 }
 
 /**
@@ -200,7 +349,7 @@ internal class UiKit(val context: Context, val glass: Boolean) {
      * Returns the row and a function that marks option [i] as chosen.
      */
     fun segmented(options: List<String>, onPick: (Int) -> Unit): Pair<LinearLayout, (Int) -> Unit> {
-        val row = LinearLayout(context).apply {
+        val row = SelectionLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
@@ -211,11 +360,20 @@ internal class UiKit(val context: Context, val glass: Boolean) {
             }.also { row.addView(it, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = context.dp(6) }) }
         }
         val mark: (Int) -> Unit = { chosen ->
-            buttons.forEachIndexed { i, b ->
-                if (glass) setOn(b, i == chosen) else b.setTextColor(if (i == chosen) Glass.ACCENT else Color.WHITE)
-            }
+            if (glass) row.select(buttons.getOrNull(chosen))
+            else buttons.forEachIndexed { i, b -> b.setTextColor(if (i == chosen) Glass.ACCENT else Color.WHITE) }
         }
         return row to mark
+    }
+
+    /** Glass panels appear with a short fade and grow; hiding is immediate (state reads visibility). */
+    fun reveal(panel: View) {
+        if (!glass) return
+        panel.alpha = 0f
+        panel.scaleX = 0.96f
+        panel.scaleY = 0.96f
+        panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(170)
+            .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
     }
 
     companion object {

@@ -200,6 +200,7 @@ class Renderer(
     private var prepProgram = 0
     private var developProgram = 0
     private var coarseProgram = 0
+    private var changeProgram = 0
     private var superpixelProgram = 0
     private var displayProgram = 0
 
@@ -376,6 +377,11 @@ class Renderer(
         prepProgram = Gl.computeProgram(PipelineShaders.prep)
         developProgram = Gl.computeProgram(PipelineShaders.develop)
         coarseProgram = Gl.computeProgram(PipelineShaders.coarseColour)
+        changeProgram = Gl.computeProgram(PipelineShaders.colourChange)
+        motionBuffer = IntArray(1).also { GLES30.glGenBuffers(1, it, 0) }[0]
+        GLES30.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, motionBuffer)
+        GLES30.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, 16, zeroInts(4), GLES30.GL_DYNAMIC_DRAW)
+        GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, motionBuffer)
         superpixelProgram = Gl.computeProgram(PipelineShaders.developSuperpixel)
         displayProgram = Gl.renderProgram(PipelineShaders.displayVertex, PipelineShaders.displayFragment)
 
@@ -656,12 +662,13 @@ class Renderer(
         GLES30.glUniform1f(Gl.uniform(prepProgram, "uWhite"), meta?.whiteLevel ?: 1023f)
         val shift = wbShift
         val wb = meta?.wbGains ?: floatArrayOf(1f, 1f, 1f, 1f)
-        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uWb"), 1, FloatArray(4) { wb[it] * shift[it] }, 0)
+        val prepWb = FloatArray(4) { wb[it] * shift[it] }
+        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uWb"), 1, prepWb, 0)
         GLES30.glUniform2i(Gl.uniform(prepProgram, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
         GLES30.glUniform1i(Gl.uniform(prepProgram, "uFixDefects"), if (cleanup >= 1) 1 else 0)
         GLES31.glDispatchCompute(groupsX, groupsY, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
-        if (cleanup >= 2) updateCoarseColour()
+        if (cleanup >= 2) updateColourChange(prepWb, meta)
         stage(2)
 
         // Pass 2: demosaic, colour noise reduction, colour, log, the view (and the clean log).
@@ -684,6 +691,7 @@ class Renderer(
         GLES31.glDispatchCompute((outW + 15) / 16, (outH + 15) / 16, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
         stage(3)
+        if (cleanup >= 2) logColourNrMotion()
     }
 
     // ---- Temporal colour noise reduction (see PipelineShaders.developBase) ----
@@ -698,28 +706,97 @@ class Renderer(
     private var historyOnLog = false
     /** 1×1 stand-in bound while colour NR is off, so the shader never sees an empty unit. */
     private var noHistory = 0
-    /** Block colours (PipelineShaders.coarseColour) of this frame and the previous one, swapped each frame. */
-    private val coarse = IntArray(2)
-    private var coarseNow = 0
+    // Colour NR's change test (PipelineShaders.coarseColour, colourChange): this frame's 4×4 block
+    // colours, and the running colour of each 8×8 / 16×16 window (read one, write the other).
+    private var blocksTex = 0
+    private var keepTex = 0
+    private val model8 = IntArray(2)
+    private val model16 = IntArray(2)
+    private var modelWrite = 0
+    private var changeFresh = true
+    /** Per frame (alternating slots): the windows' summed z² for the develop pass, and their noise scales (debug). */
+    private var motionBuffer = 0
+    private var motionSlot = 0
+    /** Debug (adb nrdebug=true): log the frame-wide motion measure now and then. */
+    @Volatile var nrDebug = false
+    private var nrDebugFrames = 0
 
-    private fun updateCoarseColour() {
-        if (coarse[0] == 0) {
-            for (i in 0..1) coarse[i] = Gl.texture2D(GLES30.GL_RGBA16F, w / 4, h / 4, linear = true)
-            historyFresh = true // nothing to compare the first block colours with
+    private fun updateColourChange(prepWb: FloatArray, meta: FrameMeta?) {
+        val bw = w / 4
+        val bh = h / 4
+        if (blocksTex == 0) {
+            blocksTex = Gl.texture2D(GLES30.GL_RGBA16F, bw, bh, linear = false)
+            keepTex = Gl.texture2D(GLES30.GL_RGBA16F, bw, bh, linear = true)
+            for (i in 0..1) {
+                model8[i] = Gl.texture2D(GLES30.GL_RGBA16F, bw, bh, linear = false)
+                model16[i] = Gl.texture2D(GLES30.GL_RGBA16F, bw, bh, linear = false)
+            }
+            changeFresh = true
         }
-        coarseNow = 1 - coarseNow
+        val groups = intArrayOf((bw + 15) / 16, (bh + 15) / 16)
         GLES30.glUseProgram(coarseProgram)
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, linearTex)
-        GLES31.glBindImageTexture(0, coarse[coarseNow], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(0, blocksTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
         GLES30.glUniform2i(Gl.uniform(coarseProgram, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
-        GLES31.glDispatchCompute((w / 4 + 15) / 16, (h / 4 + 15) / 16, 1)
+        GLES31.glDispatchCompute(groups[0], groups[1], 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+
+        modelWrite = 1 - modelWrite
+        motionSlot = 1 - motionSlot
+        GLES30.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, motionBuffer)
+        GLES30.glBufferSubData(GLES31.GL_SHADER_STORAGE_BUFFER, motionSlot * 4, 4, zeroInts(1))
+        GLES30.glBufferSubData(GLES31.GL_SHADER_STORAGE_BUFFER, (2 + motionSlot) * 4, 4, zeroInts(1))
+        GLES30.glUseProgram(changeProgram)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, blocksTex)
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, shadingTex)
+        Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, model8[1 - modelWrite])
+        Gl.bindTexture(3, GLES30.GL_TEXTURE_2D, model16[1 - modelWrite])
+        GLES31.glBindImageTexture(0, model8[modelWrite], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(1, model16[modelWrite], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(2, keepTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES30.glUniform4fv(Gl.uniform(changeProgram, "uWb"), 1, prepWb, 0)
+        val (ns, no) = rawNoise(meta)
+        GLES30.glUniform2f(Gl.uniform(changeProgram, "uNoiseRaw"), ns, no)
+        GLES30.glUniform1i(Gl.uniform(changeProgram, "uFresh"), if (changeFresh) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(changeProgram, "uSlot"), motionSlot)
+        GLES30.glUniform2i(Gl.uniform(changeProgram, "uRawSize"), w, h)
+        GLES31.glDispatchCompute(groups[0], groups[1], 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
+        changeFresh = false
     }
+
+    /** Debug: the frame-wide motion measure of the frame just developed (stalls the GPU; adb only). */
+    private fun logColourNrMotion() {
+        if (!nrDebug || blocksTex == 0 || ++nrDebugFrames % 30 != 0) return
+        GLES31.glMemoryBarrier(GLES31.GL_BUFFER_UPDATE_BARRIER_BIT)
+        GLES30.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, motionBuffer)
+        val mapped = GLES30.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 16, GLES30.GL_MAP_READ_BIT) as? ByteBuffer
+            ?: return
+        mapped.order(ByteOrder.nativeOrder())
+        val sum = mapped.getInt(motionSlot * 4).toLong() and 0xffffffffL
+        val scales = mapped.getInt((2 + motionSlot) * 4).toLong() and 0xffffffffL
+        GLES30.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)
+        val windows = 16.0 * (w / 4) * (h / 4)
+        val excess = sum / windows - 2.0
+        android.util.Log.i("AuthRec", "colour NR: motion excess %.2f (0 still, 1-3 moving), strength %.2f, noise vs profile ×%.2f".format(
+            excess, 1 - 0.7 * smoothstep(1.0, 3.0, excess), scales / windows))
+    }
+
+    private fun smoothstep(a: Double, b: Double, x: Double): Double {
+        val t = ((x - a) / (b - a)).coerceIn(0.0, 1.0)
+        return t * t * (3 - 2 * t)
+    }
+
+    /** Noise of normalised RAW at brightness x: x · S + O (SENSOR_NOISE_PROFILE, else an estimate). */
+    private fun rawNoise(meta: FrameMeta?): Pair<Float, Float> =
+        meta?.noise?.let { it[0] to it[1] } ?: fallbackNoise(meta?.iso ?: 400)
+
+    private fun zeroInts(n: Int): ByteBuffer = ByteBuffer.allocateDirect(4 * n).order(ByteOrder.nativeOrder())
 
     private fun setColourNr(prog: Int, meta: FrameMeta?, outW: Int, outH: Int, p: LogProfile) {
         if (cleanup < 2) {
             releaseHistory()
-            for (unit in 2..4) Gl.bindTexture(unit, GLES30.GL_TEXTURE_2D, noHistory)
+            for (unit in 2..3) Gl.bindTexture(unit, GLES30.GL_TEXTURE_2D, noHistory)
             GLES31.glBindImageTexture(2, noHistory, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
             GLES30.glUniform1i(Gl.uniform(prog, "uTnr"), 0)
             GLES30.glUniform1i(Gl.uniform(prog, "uTnrOnLog"), 0)
@@ -742,8 +819,9 @@ class Renderer(
         }
         GLES30.glUniform1i(Gl.uniform(prog, "uTnrOnLog"), if (onLog) 1 else 0)
         Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, history[historyRead])
-        Gl.bindTexture(3, GLES30.GL_TEXTURE_2D, coarse[coarseNow])
-        Gl.bindTexture(4, GLES30.GL_TEXTURE_2D, coarse[1 - coarseNow])
+        Gl.bindTexture(3, GLES30.GL_TEXTURE_2D, keepTex)
+        GLES30.glUniform1i(Gl.uniform(prog, "uSlot"), motionSlot)
+        GLES30.glUniform1f(Gl.uniform(prog, "uWindows"), ((w / 4) * (h / 4)).toFloat())
         GLES31.glBindImageTexture(2, history[1 - historyRead], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
         GLES30.glUniform1i(Gl.uniform(prog, "uTnr"), if (historyFresh) 2 else 1)
         historyFresh = false
@@ -751,7 +829,7 @@ class Renderer(
         GLES30.glUniform1f(Gl.uniform(prog, "uTnrAlpha"), if (cleanup >= 3) TNR_STRONG else TNR_NORMAL)
         // Sensor noise for normalised RAW (S·x + O), carried through the prep pass's white
         // balance and shading gains (~1.8 on average: variance scales by gain × S and gain² × O).
-        val (ns, no) = meta?.noise?.let { it[0] to it[1] } ?: fallbackNoise(meta?.iso ?: 400)
+        val (ns, no) = rawNoise(meta)
         GLES30.glUniform2f(Gl.uniform(prog, "uNoise"), ns * NR_GAIN, no * NR_GAIN * NR_GAIN)
     }
 
@@ -759,9 +837,11 @@ class Renderer(
     private fun fallbackNoise(iso: Int): Pair<Float, Float> = (iso * 6.6e-7f) to (iso * iso * 1.2e-12f)
 
     private fun releaseHistory() {
-        if (coarse[0] != 0) {
-            GLES30.glDeleteTextures(2, coarse, 0)
-            coarse.fill(0)
+        if (blocksTex != 0) {
+            GLES30.glDeleteTextures(2, intArrayOf(blocksTex, keepTex), 0)
+            GLES30.glDeleteTextures(2, model8, 0)
+            GLES30.glDeleteTextures(2, model16, 0)
+            blocksTex = 0
         }
         if (historyW == 0) return
         GLES30.glDeleteTextures(2, history, 0)
@@ -835,7 +915,7 @@ class Renderer(
         glass?.let {
             it.timing = glassTiming
             it.prepare(tex, if (sp) w / 2 else w, if (sp) h / 2 else h, rotation, mirror, letterbox, viewW, viewH,
-                refresh = recording == null || frameCounter % 3 == 0L)
+                frameCrop, refresh = recording == null || frameCounter % 3 == 0L)
         }
 
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
@@ -847,7 +927,7 @@ class Renderer(
         drawTexture(tex, rotation, peakingTexel = if (peaking) (if (sp) 2f else 1f) else 0f,
             smooth = beatsWithNoise(across.toFloat() / vw), mirror = mirror)
         drawFrameMask(letterbox[0], letterbox[1], vw, vh)
-        glass?.drawShapes(rects, viewW, viewH)
+        glass?.drawShapes(rects, viewW, viewH, density)
         if (timingStart > 0) {
             GLES30.glFinish()
             screenNs += SystemClock.elapsedRealtimeNanos() - timingStart
@@ -861,6 +941,8 @@ class Renderer(
 
     private var screenFrames = 0
     private var screenNs = 0L
+    /** For the glass's hairline sizes. */
+    private val density = android.content.res.Resources.getSystem().displayMetrics.density
 
     private var maskProgram = 0
 

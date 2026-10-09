@@ -201,8 +201,7 @@ internal object PipelineShaders {
 
     /**
      * Colour of each 4×4 block of the prep pass's mosaic (mean of its 4 red, 8 green, 4 blue
-     * samples), for colour NR's change test: quiet enough to see a colour change that brightness
-     * alone misses, cheap at a sixteenth of the pixels.
+     * samples), the building block of colour NR's change test ([colourChange]).
      */
     val coarseColour = """
         #version 310 es
@@ -229,6 +228,120 @@ internal object PipelineShaders {
     """.trimIndent()
 
     /**
+     * Colour NR's change test, per 8×8 and 16×16 sensor window (centred on every 4×4 block
+     * corner, made of [coarseColour]'s blocks): has its colour changed against a running average of
+     * its past frames by more than the sensor's noise explains?
+     *
+     * - Colour is (R−G, B−G) over R+2G+B: exposure changes leave it alone, and dividing by the
+     *   whole brightness instead of green keeps it quiet in the dark.
+     * - Noise per channel from the noise profile and that channel's own gain here (white balance ×
+     *   lens shading), scaled by what each window has learned while still: the running mean of its
+     *   z²/2. The profiles alone were off by a different factor per lens (X14 on a still scene:
+     *   1x ×0.5, 2.6x ×0.2, 0.6x ×3), which made the test blind on one and NR give up on another.
+     * - Against a running average, not just the previous frame: less noise, and slow movement adds
+     *   up until it's caught. The result is a chi-square with 2 degrees of freedom (z² ≈ 2 for pure
+     *   noise); keep fades from 1 to 0 between z 2.5 and 4.5.
+     * - The frame-wide mean of z² (clipped, so one moving object barely counts) rises when the
+     *   camera moves even where no single window can tell: [Motion] lets the develop pass back off.
+     * In a simulation at the X14's ISO 3200 noise (2026-10-09): a grey bar sliding over a
+     * yellow-orange wall left a trail 27× fainter than with the previous test (4×4 blocks against
+     * the previous frame, average gain), and a pan over dark green leaves under orange light kept
+     * 91 % of their colour instead of 19 %; static NR within 10 % of before.
+     */
+    val colourChange = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(binding = 0) uniform highp sampler2D uBlocks;      // 4×4 block means (coarseColour)
+        layout(binding = 1) uniform mediump sampler2D uShading;  // R, G_even, G_odd, B gains, as in prep
+        layout(binding = 2) uniform highp sampler2D uModel8In;    // running colour of each 8×8 window, a: noise scale
+        layout(binding = 3) uniform highp sampler2D uModel16In;   // and of each 16×16 one
+        layout(rgba16f, binding = 0) writeonly uniform highp image2D uModel8Out;
+        layout(rgba16f, binding = 1) writeonly uniform highp image2D uModel16Out;
+        layout(rgba16f, binding = 2) writeonly uniform highp image2D uKeepOut;     // r: keep (0..1)
+        // [slot]: this frame's sum of clipped z² × 16; [2 + slot]: of the noise scales × 16 (debug).
+        layout(std430, binding = 0) buffer Motion { uint motion[]; };
+
+        uniform vec4 uWb;         // the prep pass's white balance (with the user's trim)
+        uniform vec2 uNoiseRaw;   // variance of normalised RAW at x: x * S + O
+        uniform bool uFresh;      // no running average yet
+        uniform int uSlot;        // this frame's motion counter
+        uniform ivec2 uRawSize;
+
+        shared uint groupSum;
+        shared uint groupScale;
+
+        /** z² of a window's colour change; [v]: the variance of its R, G, B means. */
+        float chromaZ2(vec3 now, vec3 model, vec3 v) {
+            float floorY = 3.0 * sqrt(v.r + 4.0 * v.g + v.b);
+            float y = max(now.r + 2.0 * now.g + now.b, floorY);
+            float ym = max(model.r + 2.0 * model.g + model.b, floorY);
+            vec2 d = vec2(now.r - now.g, now.b - now.g) / y - vec2(model.r - model.g, model.b - model.g) / ym;
+            // 1.15: the running average's own noise.
+            vec2 var = vec2(v.r + v.g, v.b + v.g) / (y * y) * 1.15;
+            return d.x * d.x / var.x + d.y * d.y / var.y;
+        }
+
+        void main() {
+            ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 n = textureSize(uBlocks, 0);
+            if (gl_LocalInvocationIndex == 0u) {
+                groupSum = 0u;
+                groupScale = 0u;
+            }
+            barrier();
+            if (all(lessThan(b, n))) {
+                // Windows centred on the block corner at 4b: 8×8 = the 2×2 blocks around it,
+                // 16×16 = the 4×4 around it.
+                vec3 now8 = vec3(0.0);
+                vec3 now16 = vec3(0.0);
+                for (int y = -2; y < 2; y++) for (int x = -2; x < 2; x++) {
+                    vec3 c = texelFetch(uBlocks, clamp(b + ivec2(x, y), ivec2(0), n - 1), 0).rgb;
+                    now16 += c;
+                    if (x >= -1 && x < 1 && y >= -1 && y < 1) now8 += c;
+                }
+                now8 *= 0.25;
+                now16 *= 0.0625;
+                vec4 g4 = texture(uShading, vec2(b * 4) / vec2(uRawSize)) * uWb;
+                vec3 g = vec3(g4.r, 0.5 * (g4.g + g4.b), g4.a);
+                vec3 var8 = (g * max(now8, 0.0) * uNoiseRaw.x + g * g * uNoiseRaw.y) / vec3(16.0, 32.0, 16.0);
+                vec3 var16 = (g * max(now16, 0.0) * uNoiseRaw.x + g * g * uNoiseRaw.y) / vec3(64.0, 128.0, 64.0);
+                vec4 m8 = texelFetch(uModel8In, b, 0);
+                vec4 m16 = texelFetch(uModel16In, b, 0);
+                // z² by the noise profile, then by what this window's noise has turned out to be.
+                float raw8 = chromaZ2(now8, m8.rgb, var8);
+                float raw16 = chromaZ2(now16, m16.rgb, var16);
+                float scale8 = uFresh ? 1.0 : m8.a;
+                float scale16 = uFresh ? 1.0 : m16.a;
+                float z8 = uFresh ? 1e4 : raw8 / scale8;
+                float z16 = uFresh ? 1e4 : raw16 / scale16;
+                float keep8 = 1.0 - smoothstep(2.5, 4.5, sqrt(z8));
+                float keep16 = 1.0 - smoothstep(2.5, 4.5, sqrt(z16));
+                // Learn the noise scale while the window is still (a change isn't noise). Where it
+                // looks moving the scale still creeps up, or a lens far noisier than its profile
+                // would look moving everywhere and never learn.
+                if (!uFresh) {
+                    scale8 = clamp(mix(0.5 * raw8, scale8, keep8 > 0.5 || 0.5 * raw8 < scale8 ? 0.95 : 0.995), 0.05, 20.0);
+                    scale16 = clamp(mix(0.5 * raw16, scale16, keep16 > 0.5 || 0.5 * raw16 < scale16 ? 0.95 : 0.995), 0.05, 20.0);
+                }
+                imageStore(uModel8Out, b, vec4(mix(now8, m8.rgb, 0.8 * keep8), scale8));
+                imageStore(uModel16Out, b, vec4(mix(now16, m16.rgb, 0.8 * keep16), scale16));
+                imageStore(uKeepOut, b, vec4(min(keep8, keep16), 0.0, 0.0, 1.0));
+                if (!uFresh) {
+                    atomicAdd(groupSum, uint(min(z8, 25.0) * 16.0));
+                    atomicAdd(groupScale, uint(min(scale8, 20.0) * 16.0));
+                }
+            }
+            barrier();
+            if (gl_LocalInvocationIndex == 0u) {
+                atomicAdd(motion[uSlot], groupSum);
+                atomicAdd(motion[2 + uSlot], groupScale);
+            }
+        }
+    """.trimIndent()
+
+    /**
      * Develop: camera RGB → (temporal colour noise reduction) → target gamut → log → the clean log
      * (when something uses it) and the view, in one pass.
      *
@@ -244,10 +357,12 @@ internal object PipelineShaders {
      *   and with less colour noise that lift was gone (it read as crushed blacks);
      * - the spatial chroma filter this replaces left blotches (fine colour grain gone, the coarse
      *   kind not) and darkened noisy shadows by up to 29 %.
-     * Motion is judged against the sensor's own noise profile for that frame, twice: a 3×3-smoothed
-     * brightness per pixel (fine detail), and the colour of the 4×4 sensor blocks around it
-     * (coarseColour): a grey cable sliding over an orange mat at much the same brightness passed
-     * the first test and left grey trails behind (owner, X14 2.6x, 2026-10-08).
+     * Motion is judged against the sensor's own noise profile for that frame: a 3×3-smoothed
+     * brightness per pixel (fine detail), the colour of the 8×8 and 16×16 sensor windows around it
+     * (colourChange: a grey cable sliding over an orange mat at much the same brightness passed
+     * the brightness test and left grey trails, owner, X14 2.6x), and, frame-wide, how much the
+     * windows changed overall: while the camera moves the blend backs off everywhere, or dark,
+     * noisy detail too faint to test smeared (greens under street lights washed out, owner 0.4.0).
      */
     private val developBase = """
         #version 310 es
@@ -257,8 +372,8 @@ internal object PipelineShaders {
 
         layout(binding = 0) uniform highp sampler2D uLinear;     // r32f from the prep pass
         layout(binding = 2) uniform highp sampler2D uHistIn;     // previous frames: colour (rgb), smoothed brightness (a)
-        layout(binding = 3) uniform highp sampler2D uCoarseNow;  // block colours of this frame (coarseColour)
-        layout(binding = 4) uniform highp sampler2D uCoarsePrev; // and of the previous one
+        layout(binding = 3) uniform highp sampler2D uChange;     // colourChange's keep (r)
+        layout(std430, binding = 0) readonly buffer Motion { uint motion[]; };
         layout(rgba16f, binding = 0) writeonly uniform highp image2D uOutView;
         layout(rgba16f, binding = 1) writeonly uniform highp image2D uOutLog;
         layout(rgba16f, binding = 2) writeonly uniform highp image2D uHistOut;
@@ -271,6 +386,8 @@ internal object PipelineShaders {
         uniform bool uTnrOnLog;      // denoise the log (recording log) instead of the view
         uniform float uTnrAlpha;     // weight of the history where nothing moved
         uniform vec2 uNoise;         // variance of one prep-pass sample at brightness x: x * uNoise.x + uNoise.y
+        uniform int uSlot;           // this frame's motion counter
+        uniform float uWindows;      // how many windows colourChange tested
 
         float px(ivec2 p) {
             p = clamp(p, ivec2(0), textureSize(uLinear, 0) - 1);
@@ -305,15 +422,13 @@ internal object PipelineShaders {
                 // well under 1.5, a real change jumps past 3.
                 float sigma = sqrt(max(smoothed, 0.0) * uNoise.x + uNoise.y);
                 float moved = abs(smoothed - h.a) / max(sigma, 1e-7);
-                // Block colours (means of 4 red, 8 green, 4 blue samples) against two frames' noise;
-                // a static scene stays under ~3 on every channel.
-                vec3 now = texture(uCoarseNow, rawUv).rgb;
-                vec3 prev = texture(uCoarsePrev, rawUv).rgb;
-                vec3 blockVar = 2.0 * (max(now, 0.0) * uNoise.x + uNoise.y) / vec3(4.0, 8.0, 4.0);
-                vec3 z = abs(now - prev) / sqrt(max(blockVar, vec3(1e-12)));
-                float changed = max(z.r, max(z.g, z.b));
-                float keep = (1.0 - smoothstep(1.5, 3.0, moved)) * (1.0 - smoothstep(3.5, 7.0, changed));
-                colour = mix(colour, h.rgb, uTnrAlpha * keep);
+                // The windows' colour test; their centres sit on block corners (4 px apart).
+                float windowKeep = texture(uChange, rawUv + 2.0 / vec2(textureSize(uLinear, 0))).r;
+                // Frame-wide excess of the windows' z² over noise's 2: ~0 when still, 1–3 in pans.
+                float excess = float(motion[uSlot]) / (16.0 * uWindows) - 2.0;
+                float alpha = uTnrAlpha * (1.0 - 0.7 * smoothstep(1.0, 3.0, excess));
+                float keep = (1.0 - smoothstep(1.5, 3.0, moved)) * windowKeep;
+                colour = mix(colour, h.rgb, alpha * keep);
             }
             imageStore(uHistOut, p, vec4(colour, smoothed));
             return vec3(luma) + colour;

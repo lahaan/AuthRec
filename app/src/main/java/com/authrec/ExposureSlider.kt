@@ -21,7 +21,7 @@ import kotlin.math.roundToInt
  *
  * The parts of the range the sensor can't deliver (beyond the camera's exposure compensation,
  * so plain digital gain) are drawn amber, and the value turns amber while [warn] is set (high
- * effective ISO: expect noise). [glass]: drawn in a glass capsule with a glossy knob.
+ * effective ISO: expect noise). [glass]: drawn in a glass capsule with a ringed knob.
  */
 class ExposureSlider(context: Context, private val glass: Boolean = false, private val onChange: (Float) -> Unit) : View(context) {
 
@@ -60,19 +60,22 @@ class ExposureSlider(context: Context, private val glass: Boolean = false, priva
 
     private val capsule = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3f }
-    private val knobGloss = Paint(Paint.ANTI_ALIAS_FLAG)
     private val knobRing = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 5f; color = 0xFF4FD8FF.toInt() }
     private val box = RectF()
 
     override fun onDraw(c: Canvas) {
         val x = trackX
         if (glass) {
-            // A glass capsule around the track, like the other Glass controls.
+            // A glass capsule around the track, like the other Glass controls: the glass itself is
+            // GL's (glassBox), this adds the same light tint and hairline rim as GlassDrawable.
             box.set(x - 30f, 4f, x + 30f, height - 4f)
-            capsule.shader = LinearGradient(0f, box.top, 0f, box.bottom, 0x50FFFFFF, 0x18FFFFFF, Shader.TileMode.CLAMP)
-            capsule.alpha = 255
+            capsule.shader = null
+            capsule.color = 0x1F101418
             c.drawRoundRect(box, 30f, 30f, capsule)
-            rim.shader = LinearGradient(0f, box.top, 0f, box.bottom, 0xA0FFFFFF.toInt(), 0x30FFFFFF, Shader.TileMode.CLAMP)
+            capsule.color = 0x14FFFFFF
+            c.drawRoundRect(box, 30f, 30f, capsule)
+            rim.strokeWidth = resources.displayMetrics.density
+            rim.shader = LinearGradient(0f, box.top, 0f, box.bottom, 0x66FFFFFF, 0x14FFFFFF, Shader.TileMode.CLAMP)
             c.drawRoundRect(box, 30f, 30f, rim)
         }
         c.drawText("EV", x, if (glass) 42f else 30f, title)
@@ -87,11 +90,7 @@ class ExposureSlider(context: Context, private val glass: Boolean = false, priva
         }
         val y = yOf(value)
         c.drawCircle(x, y, 20f, knob)
-        if (glass) {
-            knobGloss.shader = LinearGradient(0f, y - 20f, 0f, y + 4f, 0xFFFFFFFF.toInt(), 0x00FFFFFF, Shader.TileMode.CLAMP)
-            c.drawCircle(x, y - 6f, 12f, knobGloss)
-            c.drawCircle(x, y, 20f, knobRing)
-        }
+        if (glass) c.drawCircle(x, y, 20f, knobRing)
         label.color = if (warn) AMBER else Color.WHITE
         c.drawText("%+.1f".format(value), x - 34f, y + 12f, label)
     }

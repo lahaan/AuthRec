@@ -4,19 +4,20 @@ import android.opengl.GLES30
 import android.os.SystemClock
 import android.util.Log
 
-/** Where a Glass control sits on the preview surface: pixels, top-left origin, as views measure. */
 /** A control's glass shape in surface pixels (top-left origin), drawn only inside [clip]. */
 class GlassRect(val left: Float, val top: Float, val right: Float, val bottom: Float, val radius: Float, val alpha: Float,
                 val clip: android.graphics.RectF? = null)
 
 /**
  * What the Glass layout's controls show of the image behind them. The preview is a SurfaceView
- * drawn by our GL thread, so Android's view blur can't see it; instead each preview frame is also
- * drawn at a quarter size and blurred (lightly for buttons, more for big panels holding text), and
- * every control's rounded shape is filled with it as if it were a slab of glass: flat in the
- * middle, so the scene shows through undistorted, with a rounded bevel towards the rim that bends
- * what's behind inwards (a little more for red than for blue, as real glass does) and catches the
- * light along its top-left edge. The views then draw their tint, text and gloss on top.
+ * drawn by our GL thread, so Android's view blur can't see it; instead every control's rounded
+ * shape is filled with the image as if it were a slab of glass: buttons clear (the preview image
+ * itself, sharp, or the bending can't be seen; owner: "not bending like real glass" when they
+ * showed a blurred copy), panels holding text frosted (a quarter-size blurred copy). The middle
+ * magnifies a little; towards the rim the surface turns down steeply and shows what lies just
+ * beyond the edge, pulled in, as a drop of glass does (a little more for red than for blue). A
+ * thin specular line runs along the lit top-left rim; over bright scenes the glass darkens so
+ * white labels stay readable. The views then draw only a light tint and a hairline rim on top.
  *
  * Cost on the X14 (`glasstiming` adb hook, which glFinishes around the screen draw): screen draw
  * 1.8 ms a frame without glass, ~3.3 ms with ~18 shapes, so about 1.5 ms; a third of that while
@@ -40,6 +41,13 @@ internal class GlassBackdrop {
 
     private var t0 = 0L
 
+    // The image and how the screen shows it, from [prepare], for the clear glass.
+    private var image = 0
+    private var rotation = 0
+    private var mirror = false
+    private val letterbox = IntArray(4)
+    private var frameKeep = 1f
+
     /**
      * Step 1, before anything is drawn to the window: [image] as the screen shows it ([rotation]
      * quarter turns, inside [letterbox] = x, y, w, h in GL pixels), small and blurred. Doing this
@@ -48,8 +56,13 @@ internal class GlassBackdrop {
      * [refresh] = false keeps the last blurred copy (while recording, every GPU millisecond counts).
      */
     fun prepare(image: Int, imageW: Int, imageH: Int, rotation: Int, mirror: Boolean, letterbox: IntArray, viewW: Int, viewH: Int,
-                refresh: Boolean) {
+                frameKeep: Float, refresh: Boolean) {
         if (timing) { GLES30.glFinish(); t0 = SystemClock.elapsedRealtimeNanos() }
+        this.image = image
+        this.rotation = rotation
+        this.mirror = mirror
+        letterbox.copyInto(this.letterbox)
+        this.frameKeep = frameKeep
         val w = (viewW / SCALE).coerceAtLeast(1)
         val h = (viewH / SCALE).coerceAtLeast(1)
         val fresh = w != bw || h != bh
@@ -58,8 +71,8 @@ internal class GlassBackdrop {
     }
 
     /** Step 2, on the window surface after the image: the controls' glass shapes. */
-    fun drawShapes(rects: List<GlassRect>, viewW: Int, viewH: Int) {
-        drawShapesNow(rects, viewW, viewH)
+    fun drawShapes(rects: List<GlassRect>, viewW: Int, viewH: Int, density: Float) {
+        drawShapesNow(rects, viewW, viewH, density)
         if (timing) {
             GLES30.glFinish()
             timedNs += SystemClock.elapsedRealtimeNanos() - t0
@@ -99,16 +112,23 @@ internal class GlassBackdrop {
         blurPass(tex[1], fbo[2], 0f, 1f / bh)
     }
 
-    private fun drawShapesNow(rects: List<GlassRect>, viewW: Int, viewH: Int) {
+    private fun drawShapesNow(rects: List<GlassRect>, viewW: Int, viewH: Int, density: Float) {
         // 3. The controls' shapes on the window surface.
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, viewW, viewH)
         GLES30.glUseProgram(glassProgram)
-        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, tex[0])
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, image)
         Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, tex[2])
-        GLES30.glUniform1i(Gl.uniform(glassProgram, "uLight"), 0)
+        GLES30.glUniform1i(Gl.uniform(glassProgram, "uImage"), 0)
         GLES30.glUniform1i(Gl.uniform(glassProgram, "uHeavy"), 1)
         GLES30.glUniform2f(Gl.uniform(glassProgram, "uScreen"), viewW.toFloat(), viewH.toFloat())
+        GLES30.glUniform4f(Gl.uniform(glassProgram, "uLetterbox"), letterbox[0].toFloat(), letterbox[1].toFloat(),
+            letterbox[2].toFloat(), letterbox[3].toFloat())
+        GLES30.glUniform1i(Gl.uniform(glassProgram, "uRotation"), rotation)
+        GLES30.glUniform1i(Gl.uniform(glassProgram, "uMirror"), if (mirror) 1 else 0)
+        GLES30.glUniform1f(Gl.uniform(glassProgram, "uFrameKeep"), frameKeep)
+        GLES30.glUniform1i(Gl.uniform(glassProgram, "uBandAcross"), if (rotation % 2 == 0) 1 else 0)
+        GLES30.glUniform1f(Gl.uniform(glassProgram, "uDp"), density)
         GLES30.glEnable(GLES30.GL_BLEND)
         GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
         GLES30.glEnable(GLES30.GL_SCISSOR_TEST)
@@ -130,7 +150,7 @@ internal class GlassBackdrop {
             GLES30.glUniform4f(rectLoc, r.left, bottom, r.right, top)
             GLES30.glUniform1f(radiusLoc, r.radius)
             GLES30.glUniform1f(alphaLoc, r.alpha)
-            // Panels that hold text get the heavy blur; buttons the light one, so the bend shows.
+            // Panels that hold text are frosted; buttons clear, so the bend shows.
             GLES30.glUniform1f(frostLoc, if (minOf(r.right - r.left, r.bottom - r.top) > viewH * 0.16f) 1f else 0f)
             GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
         }
@@ -216,28 +236,38 @@ internal class GlassBackdrop {
         """.trimIndent()
 
         /**
-         * One control as a slab of glass. The rounded rectangle's signed distance gives both the
-         * antialiased outline and the bevel: within [bevel] of the rim the surface curves down
-         * like a quarter circle, and its slope pushes the lookup towards the middle (refraction;
-         * red a bit more than blue for a faint fringe). The top-left part of the bevel faces the
-         * light and brightens. highp: pixel coordinates beyond 2048 don't fit mediump.
+         * One control as a slab of glass (see the class comment). The rounded rectangle's signed
+         * distance gives the antialiased outline, the rim's normal and the bend. highp: pixel
+         * coordinates beyond 2048 don't fit mediump.
          */
         private val GLASS_FRAGMENT = """
             #version 300 es
             precision highp float;
-            uniform sampler2D uLight;
-            uniform sampler2D uHeavy;
+            uniform sampler2D uImage;    // the preview image (clear glass)
+            uniform sampler2D uHeavy;    // the screen, small and well blurred (frosted glass)
             uniform vec2 uScreen;
-            uniform vec4 uRect;     // left, bottom, right, top in GL pixels
+            uniform vec4 uRect;          // left, bottom, right, top in GL pixels
             uniform float uRadius;
             uniform float uAlpha;
-            uniform float uFrost;   // 0 = light blur (buttons), 1 = heavy (panels)
+            uniform float uFrost;        // 0 = clear (buttons), 1 = frosted (panels holding text)
+            uniform vec4 uLetterbox;     // the image on screen: x, y, w, h in GL pixels
+            uniform int uRotation;       // as the screen draws it
+            uniform bool uMirror;
+            uniform float uFrameKeep;    // share of the image the recorded frame keeps; the rest is dimmed
+            uniform bool uBandAcross;    // that band runs along the screen's width
+            uniform float uDp;
             out vec4 fragColor;
 
-            // One texture per shape (a uniform branch costs nothing; reading both and mixing did).
-            vec3 behind(vec2 p) {
-                vec2 uv = p / uScreen;
-                return uFrost > 0.5 ? texture(uHeavy, uv).rgb : texture(uLight, uv).rgb;
+            /** What the screen shows at [p] (GL pixels): the image, dimmed outside the frame, black around it. */
+            vec3 screenAt(vec2 p) {
+                if (uFrost > 0.5) return texture(uHeavy, p / uScreen).rgb;
+                vec2 uv = (p - uLetterbox.xy) / uLetterbox.zw;
+                if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec3(0.0);
+                uv.y = 1.0 - uv.y;  // texture row 0 = top of the screen
+                float dim = abs((uBandAcross ? uv.y : uv.x) - 0.5) > 0.5 * uFrameKeep ? 0.38 : 1.0;
+                if (uMirror) uv.x = 1.0 - uv.x;
+                for (int i = 0; i < uRotation; i++) uv = vec2(uv.y, 1.0 - uv.x);
+                return texture(uImage, uv).rgb * dim;
             }
 
             void main() {
@@ -255,17 +285,23 @@ internal class GlassBackdrop {
                 vec2 n = (q.x > 0.0 || q.y > 0.0) ? normalize(max(q, vec2(1e-3))) : (q.x > q.y ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
                 n *= sign(rel + vec2(1e-4));
 
-                float bevel = clamp(min(hs.x, hs.y) * 0.55, 6.0, 64.0);
-                float t = clamp(-d / bevel, 0.0, 1.0);             // 0 at the rim, 1 on the flat top
-                float e = 1.0 - t;
-                float slope = e / max(sqrt(1.0 - e * e), 0.2);     // quarter-circle bevel, capped near the rim
-                vec2 shift = -n * slope * bevel * 0.22;
+                bool frosted = uFrost > 0.5;
+                float band = clamp(min(hs.x, hs.y) * (frosted ? 0.25 : 0.5), 8.0, 90.0);
+                float e = 1.0 - clamp(-d / band, 0.0, 1.0);          // 1 at the rim, 0 on the flat part
+                vec2 src = c + rel / (frosted ? 1.02 : 1.04) + n * band * 0.75 * pow(e, 2.2);
+                vec2 off = src - p;
+                vec3 col = vec3(screenAt(p + off * 1.05).r, screenAt(p + off).g, screenAt(p + off * 0.95).b);
 
-                vec3 col = vec3(behind(p + shift * 1.12).r, behind(p + shift).g, behind(p + shift * 0.88).b);
-                // Light from the top-left (GL y points up), mostly on the bevel.
+                // Darker over bright scenes, so white labels stay readable.
+                float bright = dot(texture(uHeavy, c / uScreen).rgb, vec3(0.2126, 0.7152, 0.0722));
+                col *= 1.0 - (frosted ? 0.25 : 0.4) * smoothstep(0.35, 0.85, bright);
+
+                // A thin specular line along the lit (top-left) rim, a faint one all round, a little
+                // shade inside the far side. GL y points up.
                 float facing = max(dot(n, normalize(vec2(-0.55, 0.85))), 0.0);
-                float rimLight = e * e * (0.25 + 0.75 * facing) * 0.22;
-                col = col * 1.05 + 0.012 + rimLight;
+                float away = max(dot(n, normalize(vec2(0.55, -0.85))), 0.0);
+                float edge = exp(-max(-d, 0.0) / (1.2 * uDp));
+                col += edge * (0.10 + 0.55 * facing * facing) - 0.10 * e * e * e * away;
                 fragColor = vec4(col, a);
             }
         """.trimIndent()
