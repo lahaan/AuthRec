@@ -14,6 +14,8 @@
 #include <cstring>
 #include <vector>
 
+#include "codec_util.h"
+
 #define LOG_TAG "AuthRec"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
@@ -28,23 +30,6 @@ struct Session {
     int width = 0;
     int height = 0;
 };
-
-/** Copies one plane of [w]×[h] samples into 10-bit, from 8- or 16-bit with any row/pixel stride. */
-void convertPlane(const uint8_t* src, int rowStride, int pixelStride, int bytesPerSample, int shift,
-                  int w, int h, uint16_t* dst) {
-    for (int y = 0; y < h; y++) {
-        const uint8_t* row = src + (size_t) y * rowStride;
-        uint16_t* d = dst + (size_t) y * w;
-        if (bytesPerSample == 2) {
-            for (int x = 0; x < w; x++) {
-                const uint8_t* p = row + (size_t) x * pixelStride;
-                d[x] = (uint16_t) ((p[0] | (p[1] << 8)) >> shift);
-            }
-        } else {
-            for (int x = 0; x < w; x++) d[x] = (uint16_t) (row[(size_t) x * pixelStride] << 2);
-        }
-    }
-}
 
 /** Writes the NAL units of one access unit to [out]; returns the byte count or -1 if it didn't fit. */
 jint copyNals(x265_nal* nals, uint32_t count, uint8_t* out, jlong capacity) {
@@ -63,7 +48,7 @@ jint copyNals(x265_nal* nals, uint32_t count, uint8_t* out, jlong capacity) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_authrec_record_X265Encoder_nativeOpen(JNIEnv* env, jclass, jint width, jint height, jint fpsNum, jint fpsDen,
-                                               jstring preset, jfloat crf, jint keyint, jint bframes,
+                                               jstring preset, jfloat crf, jint maxKbps, jint keyint, jint bframes,
                                                jint primaries, jint transfer, jint matrix, jboolean fullRange) {
     auto* s = new Session();
     s->width = width;
@@ -87,6 +72,10 @@ Java_com_authrec_record_X265Encoder_nativeOpen(JNIEnv* env, jclass, jint width, 
     p->internalCsp = X265_CSP_I420;
     p->rc.rateControlMode = X265_RC_CRF;
     p->rc.rfConstant = crf;
+    if (maxKbps > 0) {        // capped CRF: grainy footage gives up grain rather than outgrow the cap
+        p->rc.vbvMaxBitrate = maxKbps;
+        p->rc.vbvBufferSize = maxKbps * 2;
+    }
     p->keyframeMax = keyint;
     p->bOpenGOP = 0;          // every key frame an IDR: MP4 sync samples players can seek to
     if (bframes >= 0) p->bframes = bframes;  // else the preset's
@@ -160,12 +149,12 @@ Java_com_authrec_record_X265Encoder_nativeEncode(JNIEnv* env, jclass, jlong hand
     if (y != nullptr) {
         int cw = s->width / 2;
         int ch = s->height / 2;
-        convertPlane(static_cast<const uint8_t*>(env->GetDirectBufferAddress(y)), yRow, yPix, bytesPerSample, shift,
-                     s->width, s->height, s->planes[0].data());
-        convertPlane(static_cast<const uint8_t*>(env->GetDirectBufferAddress(u)), uRow, uPix, bytesPerSample, shift,
-                     cw, ch, s->planes[1].data());
-        convertPlane(static_cast<const uint8_t*>(env->GetDirectBufferAddress(v)), vRow, vPix, bytesPerSample, shift,
-                     cw, ch, s->planes[2].data());
+        authrec::planeTo10(static_cast<const uint8_t*>(env->GetDirectBufferAddress(y)), yRow, yPix, bytesPerSample, shift,
+                           s->width, s->height, s->planes[0].data(), s->width);
+        authrec::planeTo10(static_cast<const uint8_t*>(env->GetDirectBufferAddress(u)), uRow, uPix, bytesPerSample, shift,
+                           cw, ch, s->planes[1].data(), cw);
+        authrec::planeTo10(static_cast<const uint8_t*>(env->GetDirectBufferAddress(v)), vRow, vPix, bytesPerSample, shift,
+                           cw, ch, s->planes[2].data(), cw);
         s->in->pts = pts;
         in = s->in;
     }

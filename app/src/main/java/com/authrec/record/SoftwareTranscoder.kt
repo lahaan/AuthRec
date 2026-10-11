@@ -20,14 +20,14 @@ import com.authrec.EventLog
 import java.nio.ByteBuffer
 
 /**
- * "Compress": re-encodes a recording with x265 ([X265Encoder]), the encoder desktop tools like
- * HandBrake use. The phone's hardware decoder hands over each frame (P010 for our 10-bit
- * recordings), x265 encodes it on the CPU, the MP4 gets the result plus the original audio as it
- * is. The original stays.
+ * "Compress": re-encodes a recording with a CPU encoder, the ones desktop tools like HandBrake use:
+ * x265 (HEVC, the default), x264 (H.264, plays everywhere) or SVT-AV1 (AV1, smallest). The phone's
+ * hardware decoder hands over each frame (P010 for our 10-bit recordings), the encoder works on
+ * the CPU, the MP4 gets the result plus the original audio as it is. The original stays.
  *
  * Why software: the X14's hardware HEVC encoder needed 73 % of the size for the quality x265
  * reaches at ~10–16 % on grainy footage (VMAF against the original, owner's clips 2026-10-10).
- * The price is time and heat: x265 keeps every CPU core busy, so the job pauses itself while the
+ * The price is time and heat: the encoders keep every CPU core busy, so the job pauses itself while the
  * battery is at [HOT_C] or more and carries on at [COOL_C] (PowerKeeper kills apps at ~48 °C).
  */
 class SoftwareTranscoder(
@@ -37,11 +37,19 @@ class SoftwareTranscoder(
     private val settings: Settings,
     private val onProgress: (Progress) -> Unit,
 ) {
+    /** The formats Compress offers, with the encoder each uses. */
+    enum class Format(val label: String) { HEVC("x265"), AVC("x264"), AV1("SVT-AV1") }
+
     /**
-     * [preset]: x265's effort ("veryfast" … "medium"); [crf]: quality target (lower = better,
-     * bigger); [tag]: for the file name; [bframes]: -1 = the preset's.
+     * [format]: which encoder; [preset]: its effort (x265/x264 "veryfast" … "medium", SVT-AV1
+     * "13" … "0"); [crf]: its quality target (lower = better, bigger; each encoder has its own
+     * scale); [maxShare]: the most the video may take of the source's bitrate (0 = no limit), so
+     * the copy is always clearly smaller: at high ISO the grain is noise the quality target would
+     * keep at any cost (the owner's ISO 3200 night clip came out 110 % of its size at Balanced);
+     * [tag]: for the file name; [bframes]: x265 only, -1 = the preset's.
      */
-    data class Settings(val preset: String, val crf: Float, val tag: String, val bframes: Int = -1)
+    data class Settings(val preset: String, val crf: Float, val tag: String, val bframes: Int = -1,
+                        val format: Format = Format.HEVC, val maxShare: Float = 0f)
 
     data class Progress(val fraction: Float, val cooling: Boolean)
 
@@ -55,7 +63,7 @@ class SoftwareTranscoder(
         var video: MediaExtractor? = null
         var audio: MediaExtractor? = null
         var decoder: MediaCodec? = null
-        var encoder: X265Encoder? = null
+        var encoder: SoftwareEncoder? = null
         var outUri: Uri? = null
         var pfd: ParcelFileDescriptor? = null
         var muxer: MediaMuxer? = null
@@ -87,7 +95,15 @@ class SoftwareTranscoder(
             decoder.configure(inFormat, null, null, 0)
             decoder.start()
 
-            encoder = X265Encoder(width, height, fps, 1, settings.preset, settings.crf, keyint = fps * 2, bframes = settings.bframes)
+            // SVT-AV1 holds its cap loosely (night clip 000637: 35 % → 36–43 % from run to run, 50 % →
+            // 60 %; x265 ~10 % over), so it's aimed lower.
+            val capScale = if (settings.format == Format.AV1) 0.85f else 1f
+            val maxKbps = if (settings.maxShare > 0f) (sourceBitrate(durationUs) * settings.maxShare * capScale / 1000).toInt() else 0
+            encoder = when (settings.format) {
+                Format.HEVC -> X265Encoder(width, height, fps, 1, settings.preset, settings.crf, maxKbps, keyint = fps * 2, bframes = settings.bframes)
+                Format.AVC -> X264Encoder(width, height, fps, settings.preset, settings.crf, maxKbps, keyint = fps * 2)
+                Format.AV1 -> SvtAv1Encoder(width, height, fps, settings.preset, settings.crf, maxKbps, keyint = fps * 2)
+            }
 
             val name = sourceName.removeSuffix(".mp4") + "_" + settings.tag + ".mp4"
             outUri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, ContentValues().apply {
@@ -98,15 +114,7 @@ class SoftwareTranscoder(
             }) ?: error("MediaStore refused to create $name")
             pfd = resolver.openFileDescriptor(outUri, "rw") ?: error("can't open $outUri")
             muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            val outFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, width, height).apply {
-                setByteBuffer("csd-0", ByteBuffer.wrap(encoder.headers))
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
-                setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-            }
-            val videoTrack = muxer.addTrack(outFormat)
+            val videoTrack = muxer.addTrack(encoder.trackFormat)
             val audioTrack = audioFormat?.let { muxer.addTrack(it) } ?: -1
             muxer.start()
             muxing = true
@@ -178,7 +186,7 @@ class SoftwareTranscoder(
                     if (audioTrack >= 0) copyAudio(writtenUs)
                 }
             }
-            // The frames x265 still holds for its look-ahead.
+            // The frames the encoder still holds for its look-ahead.
             while (true) {
                 if (cancelled) throw CancelledException()
                 val size = encoder.drain(out)
@@ -208,12 +216,13 @@ class SoftwareTranscoder(
             }
         }
         val seconds = (SystemClock.elapsedRealtime() - started) / 1000f
-        EventLog.log("Compress $sourceName → x265 ${settings.preset} crf ${settings.crf}: " +
+        EventLog.log("Compress $sourceName → ${settings.format.label} ${settings.preset} crf ${settings.crf}" +
+            (if (settings.maxShare > 0f) " max ${(settings.maxShare * 100).toInt()} %" else "") + ": " +
             (error ?: "${bytes / 1_000_000} MB, $frames frames in ${"%.1f".format(seconds)} s"))
         return Result(if (error == null) outUri else null, bytes, seconds, error)
     }
 
-    /** Waits while the battery is hot (x265 can't be slowed, only paused); cancelling still works. */
+    /** Waits while the battery is hot (the encoder can't be slowed, only paused); cancelling still works. */
     private fun coolDownIfHot(fraction: Float) {
         if (batteryC() < HOT_C) return
         EventLog.log("Compress paused: battery ${"%.1f".format(batteryC())} °C")
@@ -223,6 +232,12 @@ class SoftwareTranscoder(
             Thread.sleep(2000)
         }
         onProgress(Progress(fraction, false))
+    }
+
+    /** The source's bitrate: its file size over its length (the audio is a rounding error). */
+    private fun sourceBitrate(durationUs: Long): Long {
+        val bytes = context.contentResolver.openFileDescriptor(source, "r")?.use { it.statSize } ?: 0L
+        return bytes * 8 * 1_000_000 / durationUs.coerceAtLeast(1)
     }
 
     private fun batteryC(): Float =

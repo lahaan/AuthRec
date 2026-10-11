@@ -1,4 +1,4 @@
-# Handoff: state as of 0.5.0 (2026-10-09, released as GitHub pre-release v0.5.0)
+# Handoff: state as of 0.6.0 (2026-10-11, released as GitHub pre-release v0.6.0)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -8,8 +8,10 @@ owner's next round (new UI, eDR, a look from a reference photo), then 0.4.0: the
 after 0.3.0 (tap AF on contrast-AF lenses, real glass, frame aspects, start-of-clip drops,
 temporal colour NR) and a daylight test of it, then 0.5.0: the first part of the UI polish and
 NR polish after a day with 0.4.0 (colour NR's change test rebuilt, clear glass, sliding selection,
-new record button) plus the owner's two looks bundled.
-Architecture and device quirks: **CLAUDE.md**. Feedback, diagnostics, samples: **feedback/**
+new record button) plus the owner's two looks bundled, then 0.6.0: the Recordings screen with
+Compress (x265 / x264 / SVT-AV1 on the CPU, capped for grain), 2K 25/75 Mbps, smoother AE
+Priority, GPL-3.0, the owner's app icon and glass dialogs.
+Architecture and device quirks: **CLAUDE.md** (local only since 0.6.0, like feedback/). Feedback, diagnostics, samples: **feedback/**
 (`notes.md` has every reported item, its diagnosis and status; 15–21 are 0.3.0's).
 
 ## 0.3.0 (pre-release v0.3.0, 2026-10-07)
@@ -103,7 +105,9 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 
 ## Start here (next session)
 
-1. Read `feedback/notes.md` (items 22–38 are the newest), then anything new in `feedback/`.
+1. Read `feedback/notes.md` (items 48–55 are the newest: Priority AE smoothing, Recordings,
+   Compress with x265 / x264 / SVT-AV1 and its grain cap, bitrate overshoot), then anything new in
+   `feedback/`.
 2. 0.4.0 is out (pre-release, same signing key as 0.2.2). From the friend's next diagnostics
    (0.3.0's showed no crash; 0.6x unreachable), check tap AF on her telephotos, the `Encoder …` line of
    her recordings (partial frames? key frame first?), the `… colour:` lines (physical results on
@@ -115,8 +119,14 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
    back-off), clear-glass look, sliding selection pill, panel reveal, new record button. **Needs
    the owner's eyes**: NR at night with movement (street lights, the 2.6x/0.6x against a warm
    wall) and the glass over bright scenes. The owner may still send UI sketches.
-4. Owner decisions pending (see "Ideas" below): ETTR (proposal below). The 1 s REC pre-roll is
-   fine for now (owner).
+4. Owner decisions pending (see "Ideas" below): ETTR (proposal below); the exposure plan for
+   low light (a low-light takeover, "night looks like night", shutter limit 1/30 vs 180°);
+   Compress's grain caps (item 54); recording bitrate overshoot on noisy 4K (item 55). The 1 s
+   REC pre-roll is fine for now (owner).
+5. 0.6.0 is out (pre-release): Priority AE smoothing (still untested by the owner), 2K 25/75 Mbps,
+   Recordings screen, Compress (x265/x264/SVT-AV1), GPL-3.0, app icon, glass dialogs. From the
+   friend's next diagnostics: the 15 Ultra's `Compress …` lines (speed, any failure) and its
+   encoder list.
 
 ## After 0.2.2
 

@@ -15,3 +15,5 @@ keystore.properties
 
 # owner/tester feedback, diagnostics and samples stay local (not public)
 feedback/
+# notes for Claude sessions stay local too
+CLAUDE.md

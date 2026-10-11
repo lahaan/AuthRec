@@ -1,0 +1,3 @@
+SVT-AV1 v4.2.0 from https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v4.2.0/SVT-AV1-v4.2.0.tar.gz
+(sha256 c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740), unmodified; only the parts the
+library build uses (Docs, test, googletest, ffmpeg_plugin, .gitlab, snap, Build, Config left out).

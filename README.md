@@ -40,7 +40,7 @@ clip itself as a file too (chat apps that re-encode videos hide what went wrong)
 ## Building
 
 Open in Android Studio, or `./gradlew assembleDebug` (needs the Android NDK and CMake from the SDK
-manager, versions in `app/build.gradle.kts`; the first build compiles x265). Release builds are signed when a
+manager, versions in `app/build.gradle.kts`; the first build compiles x265, x264 and SVT-AV1, a few minutes). Release builds are signed when a
 `keystore.properties` file (not in git) points at the signing key:
 
 ```
@@ -54,7 +54,15 @@ Useful adb hooks for testing are documented on `CameraActivity.handleCommands`.
 
 ## Licence
 
-AuthRec is free software under the [GNU General Public License v3](LICENSE) (GPL-3.0). It
-includes [x265](https://x265.org) 4.2 (`app/src/main/cpp/third_party/x265`, GPL-2.0-or-later,
-© MulticoreWare, Inc. and contributors) for compressing recordings.
+AuthRec is free software under the [GNU General Public License v3](LICENSE) (GPL-3.0). For
+compressing recordings it includes, in `app/src/main/cpp/third_party`:
+
+- [x265](https://x265.org) 4.2 (HEVC), GPL-2.0-or-later, © MulticoreWare, Inc. and contributors
+- [x264](https://www.videolan.org/developers/x264.html) (H.264, "stable" 2025-06-08), GPL-2.0-or-later,
+  © the x264 project / VideoLAN and contributors
+- [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.2.0 (AV1), BSD-3-Clause-Clear and the Alliance
+  for Open Media Patent License 1.0, © Alliance for Open Media
+
+Their licence texts ship in the app too (Settings → About & licences → Licence texts;
+`app/src/main/assets/licences`).
 
