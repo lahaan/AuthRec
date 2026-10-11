@@ -489,7 +489,13 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             addView(kit.button("✕") { toggle(settingsSheet) })
         }
         choice("Mode", false, listOf("Simple" to true, "Pro" to false), { a.simple }) { a.setSimple(it) }
-        choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), { a.superpixel }) { a.setSuperpixel(it) }
+        val resNote = kit.label("", 11f, dim = true)
+        choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), {
+            val limit = a.fourKLimit()
+            resNote.text = limit?.let { "4K records at ${it.first}×${it.second} on this phone (its video encoder's limit)." } ?: ""
+            resNote.visibility = if (resNote.text.isEmpty()) View.GONE else View.VISIBLE
+            a.superpixel
+        }, note = resNote) { a.setSuperpixel(it) }
         choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
         choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
         val codecNote = kit.label("", 11f, dim = true)

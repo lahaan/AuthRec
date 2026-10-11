@@ -174,17 +174,8 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
 
         val info = hardwareEncoder(config.codec.mime) ?: error("no hardware ${config.codec.label} encoder")
         val maxBitrate = info.getCapabilitiesForType(config.codec.mime).videoCapabilities?.bitrateRange?.upper ?: Int.MAX_VALUE
-        val format = MediaFormat.createVideoFormat(config.codec.mime, width, height).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, (config.bitrateMbps * 1_000_000).coerceAtMost(maxBitrate))
-            setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_PROFILE, config.codec.profile)
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            // Tag as plain SDR Rec.709 so players don't apply HDR tone mapping to log footage.
-            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-        }
+        val format = videoFormat(config.codec.mime, config.codec.profile, width, height,
+            (config.bitrateMbps * 1_000_000).coerceAtMost(maxBitrate), config.fps)
         codecName = info.name
         videoCodec = MediaCodec.createByCodecName(info.name)
         videoCodec.setCallback(videoCallback, handler)
@@ -499,6 +490,20 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
             val s = minOf(maxW.toFloat() / w, maxH.toFloat() / h)
             return (Math.floor(w * s / 16.0).toInt() * 16) to (Math.floor(h * s / 16.0).toInt() * 16)
         }
+
+        /** The encoder settings every recording uses (and RecordingCheck tests). */
+        fun videoFormat(mime: String, profile: Int, width: Int, height: Int, bitrate: Int, fps: Int): MediaFormat =
+            MediaFormat.createVideoFormat(mime, width, height).apply {
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_PROFILE, profile)
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                // Tag as plain SDR Rec.709 so players don't apply HDR tone mapping to log footage.
+                setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+            }
 
         /** The phone's hardware encoder for [mime] (the one recordings use). */
         fun hardwareEncoder(mime: String): MediaCodecInfo? = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {

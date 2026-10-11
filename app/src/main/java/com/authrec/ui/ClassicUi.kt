@@ -264,6 +264,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         if (!a.scanning) menu.menu.add(0, 1, 1, "Rescan lenses")
         menu.menu.add(0, 2, 2, "Send diagnostics…")
         if (!a.scanning) menu.menu.add(0, 3, 3, "Run capability bench")
+        if (!a.scanning && a.recordingLimits != null) menu.menu.add(0, 6, 4, "Re-check recording")
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 0 -> a.setClassicUi(false)
@@ -272,6 +273,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
                 3 -> a.openBench()
                 4 -> a.openRecordings()
                 5 -> com.authrec.About.show(a)
+                6 -> a.recheckRecording()
             }
             true
         }

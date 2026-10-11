@@ -44,6 +44,7 @@ import com.authrec.color.Looks
 import com.authrec.gl.Renderer
 import com.authrec.record.RecordConfig
 import com.authrec.record.Recorder
+import com.authrec.record.RecordingCheck
 import com.authrec.record.VideoCodec
 import com.authrec.ui.CameraUi
 import com.authrec.ui.ClassicUi
@@ -233,6 +234,7 @@ class CameraActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         loadPrefs()
         installBundledLuts()
+        recordingLimits = RecordingCheck.load(this)?.also { r -> r.box?.let { encoderBox = it } }
         buildUi()
         window.insetsController?.apply {
             hide(WindowInsets.Type.systemBars())
@@ -609,7 +611,11 @@ class CameraActivity : Activity() {
     internal fun effectiveCodec() = if (codecOffered(codec)) codec else VideoCodec.HEVC_8
     internal fun setCodec(c: VideoCodec) { codec = c; settingsChanged() }
     /** Bitrates offered for the current resolution: 2K needs far less (owner asked for 25 and 75). */
-    internal fun bitrateOptions(): List<Int> = if (superpixel) BITRATES_2K else BITRATES_4K
+    internal fun bitrateOptions(): List<Int> {
+        val all = if (superpixel) BITRATES_2K else BITRATES_4K
+        val cap = recordingLimits?.maxMbps ?: 0
+        return if (cap <= 0) all else all.filter { it <= cap * 1.1 }.ifEmpty { listOf(all.first()) }
+    }
 
     internal fun cycleBitrate() {
         val options = bitrateOptions()
@@ -1252,12 +1258,14 @@ class CameraActivity : Activity() {
         if (!scanning) menu.menu.add(1, RESCAN_ITEM, order.size, "Rescan lenses")
         menu.menu.add(1, DIAGNOSTICS_ITEM, order.size + 1, "Send diagnostics…")
         if (!scanning) menu.menu.add(1, BENCH_ITEM, order.size + 2, "Run capability bench")
+        if (!scanning && recorder == null) menu.menu.add(1, RECHECK_ITEM, order.size + 4, "Re-check recording")
         menu.menu.add(1, STYLE_ITEM, order.size + 3, if (classicUi) "Switch to the Glass layout" else "Switch to the Classic layout")
         menu.setOnMenuItemClickListener { item ->
             when {
                 item.itemId == RESCAN_ITEM -> rescanLenses()
                 item.itemId == DIAGNOSTICS_ITEM -> sendDiagnostics()
                 item.itemId == BENCH_ITEM -> openBench()
+                item.itemId == RECHECK_ITEM -> recheckRecording()
                 item.itemId == STYLE_ITEM -> setClassicUi(!classicUi)
                 item.itemId != lensIndex -> {
                     nativeFailed -= lenses[item.itemId].key
@@ -1482,6 +1490,7 @@ class CameraActivity : Activity() {
             EventLog.log("Colour clean-up off for this clip: $why")
             runOnUiThread { note("Colour clean-up off for this clip: the phone can't keep up") }
         }
+        if (recordingLimits?.tenBit == false) r.tenBitRecording = false
         rendererLens = lenses.getOrNull(lensIndex)?.key
         r.seedAutoGain(rendererLens?.let { prefs.getFloat(autoGainKey(it), Float.NaN) } ?: Float.NaN)
         cam.reader.setOnImageAvailableListener({ r.onFrameAvailable() }, cameraHandler)
@@ -1565,6 +1574,69 @@ class CameraActivity : Activity() {
         updateUi()
         resumed = true
         if (pendingScan) findLensesThenStart(forceScan = true) else camera?.open(capture)
+        // Once per phone and firmware, when the camera has settled (see RecordingCheck).
+        if (recordingLimits == null) info.postDelayed({ startRecordingCheck() }, 5000)
+    }
+
+    /** What the recording check found on this phone (null: not checked yet). */
+    internal var recordingLimits: RecordingCheck.Result? = null
+        private set
+    private var checkThread: Thread? = null
+
+    private fun startRecordingCheck() {
+        if (checkThread != null || recorder != null || stopping || scanning || !resumed || camera == null) return
+        val largest = lenses.maxByOrNull { it.rawWidth.toLong() * it.rawHeight }?.let { it.rawWidth to it.rawHeight }
+            ?: camera?.info?.size?.let { it.width to it.height } ?: return
+        note("Checking what this phone records…")
+        EventLog.log("Recording check: started, largest frame ${largest.first}x${largest.second}")
+        checkThread = Thread({
+            val r = runCatching { RecordingCheck.run(this, largest, BITRATES_4K.max()) { recorder != null || !resumed } }
+                .onFailure { EventLog.log("Recording check failed", it) }.getOrNull()
+            runOnUiThread {
+                checkThread = null
+                if (r == null) {
+                    EventLog.log("Recording check: stopped (runs again later)")
+                    return@runOnUiThread
+                }
+                EventLog.log("Recording check: box ${r.box?.let { "${it.first}x${it.second}" } ?: "none"}, " +
+                    "10-bit ${r.tenBit}, max ${if (r.maxMbps > 0) "${r.maxMbps} Mbps" else "as offered"} (${r.summary})")
+                applyRecordingLimits(r)
+                val found = listOfNotNull(
+                    if (!r.tenBit) "8-bit" else null,
+                    r.box?.let { "4K up to ${it.first}×${it.second}" },
+                    if (r.maxMbps > 0) "up to ${r.maxMbps} Mbps" else null)
+                note(if (found.isEmpty()) "Recording check: everything works" else "This phone records " + found.joinToString(", "))
+            }
+        }, "recording-check").apply { start() }
+    }
+
+    private fun applyRecordingLimits(r: RecordingCheck.Result) {
+        recordingLimits = r
+        r.box?.let { encoderBox = it }
+        if (!r.tenBit) renderer?.tenBitRecording = false
+        if (bitrateMbps !in bitrateOptions()) setBitrate(bitrateOptions().last())
+        updateUi()
+    }
+
+    /** Forgets what the check (and failed recordings) found and checks again. */
+    internal fun recheckRecording() {
+        RecordingCheck.clear(this)
+        prefs.edit().remove(encoderBoxKey()).apply()
+        recordingLimits = null
+        encoderBox = null
+        EventLog.log("Recording re-check requested")
+        restartPipeline() // a fresh renderer finds its own 10-bit support again
+        info.postDelayed({ startRecordingCheck() }, 3000)
+    }
+
+    /** The 4K frame of the current lens and aspect as recorded here, if smaller than the image (for Settings). */
+    internal fun fourKLimit(): Pair<Int, Int>? {
+        val cam = camera ?: return null
+        val w = cam.info.size.width
+        val h = cam.info.size.height
+        val ch = if (aspect.ratio <= w.toFloat() / h + 0.01f) h else (Math.round(w / aspect.ratio / 16f) * 16).coerceAtMost(h)
+        val box = encoderBox ?: return null
+        return Recorder.fitInside(w, ch, box.first, box.second).takeIf { it.first != w }
     }
 
     override fun onPause() {
@@ -2220,6 +2292,7 @@ class CameraActivity : Activity() {
         private const val LUT_INPUT_MENU = 9_000
         private const val LUT_INPUT_BASE = 9_001
         private const val RESCAN_ITEM = 10_000
+        private const val RECHECK_ITEM = 10_004
         private const val DIAGNOSTICS_ITEM = 10_001
         private const val BENCH_ITEM = 10_002
         private const val STYLE_ITEM = 10_003
