@@ -39,7 +39,8 @@ clip itself as a file too (chat apps that re-encode videos hide what went wrong)
 
 ## Building
 
-Open in Android Studio, or `./gradlew assembleDebug`. Release builds are signed when a
+Open in Android Studio, or `./gradlew assembleDebug` (needs the Android NDK and CMake from the SDK
+manager, versions in `app/build.gradle.kts`; the first build compiles x265). Release builds are signed when a
 `keystore.properties` file (not in git) points at the signing key:
 
 ```
@@ -50,3 +51,10 @@ keyPassword=…
 ```
 
 Useful adb hooks for testing are documented on `CameraActivity.handleCommands`.
+
+## Licence
+
+AuthRec is free software under the [GNU General Public License v3](LICENSE) (GPL-3.0). It
+includes [x265](https://x265.org) 4.2 (`app/src/main/cpp/third_party/x265`, GPL-2.0-or-later,
+© MulticoreWare, Inc. and contributors) for compressing recordings.
+

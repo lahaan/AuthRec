@@ -17,7 +17,12 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 ```
 - Use the SDK's adb (`~/Library/Android/sdk/platform-tools/adb`); a Homebrew adb also exists and
   two adb versions fighting causes "unauthorized".
-- AGP 9.4 (built-in Kotlin), Gradle 9.8, compile/target SDK 36, minSdk 31.
+- AGP 9.4 (built-in Kotlin), Gradle 9.8, compile/target SDK 36, minSdk 31. Native code (x265 for
+  Compress): NDK 30.0.16248370 + CMake 4.1.2 (installed with `cmdline-tools/latest/bin/sdkmanager`),
+  arm64-v8a only; the first build compiles x265 (~1 min).
+- **Licence: GPL-3.0** (`LICENSE`), because the app bundles x265 (GPL-2.0-or-later, vendored
+  source in `app/src/main/cpp/third_party/x265`, release 4.2). Keep the source public and the
+  About & licences dialog (`About.kt`) accurate.
 - Signing key: `~/Desktop/Android-Projects/AuthRec-signing/` (outside the repo, never commit it).
   The owner's phone runs the **debug** build; release and debug signatures differ, so installing
   one over the other needs an uninstall (which wipes settings/looks).
@@ -46,6 +51,9 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 | `color/ViewLut.kt` | Bakes eDR + LUT input conversion + LUT + strength into one 33³ LUT on a background thread |
 | `gl/GlUtil.kt` | EGL core (main + encoder contexts), GL helpers |
 | `record/Recorder.kt` | MediaCodec video (surface input) + AAC audio on the camera clock + MediaMuxer → MediaStore `Movies/AuthRec` |
+| `record/SoftwareTranscoder.kt`, `X265Encoder.kt`, `src/main/cpp/` | Compress: hardware decoder → x265 (JNI, `x265_jni.cpp`, 10-bit Main10) → MP4 with the original audio; pauses at 44 °C battery |
+| `record/Transcoder.kt` | The hardware re-encode (decoder → encoder surface), adb tests only (see below) |
+| `RecordingsActivity.kt` | The recordings in `Movies/AuthRec` (Settings → Recordings…): thumbnail, size, bitrate; play, share, compress (Quality / Effort with plain-language notes and learned size/time estimates), delete; adb `compress` hook |
 | `SoftwareAf.kt` | Contrast-detect AF (coarse/fine sweeps, warm-up step, parabola fit, continuous monitor) for lenses whose ISP AF doesn't work for us |
 | `color/*` | `LogProfile` (Apple Log, S-Log3, LogC3 encode/decode), `ColorMath` (primaries → matrices), `Look`/`Looks` (grading params, film-style presets, bake to LUT), `CubeLut` (.cube parse/write, CPU tetra/trilinear apply), `ColorCalibration` (DNG forward-matrix route) |
 | `LookEditorActivity.kt` | Look editor on a captured log frame; saves `*.look.json` + exports `.cube` to `Download/AuthRec` |
@@ -62,6 +70,14 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
 - **The user's EV** is one value (`exposureEv`): AE Auto/Locked → AE compensation (sensor),
   residual below one AE step → digital gain; AE Priority → shifts the loop's target; Manual →
   digital gain.
+- **AE Auto is Xiaomi's**: in video it holds 1/100 and raises ISO first (1/30 only near max ISO)
+  and exposes the RAW ~2.2 EV dark; our auto gain then lifts to the ISP's (night-brightened)
+  rendering, so a dim room shows "ISO 1500 (≈12000 with gain)". **AE Priority** is ours: 10
+  updates/s in ≤0.3 EV steps, judged against the exposure of the frame it measured; the renderer
+  eases the picture per frame and evens out each frame's actual ISO × shutter with digital gain
+  (`exposureTarget`), so sensor changes don't show as steps (the old 5 Hz half-way jumps were
+  "choppy"). Frames are paired with their own metadata by timestamp (`RawCamera.metaFor`; the
+  event log says per open how many of 90 matched).
 - **Colour**: ISP per-frame `COLOR_CORRECTION_TRANSFORM` + gains. Verified vs ISP JPEGs (hue ~2.5–3°
   off). DNG forward-matrix route exists as fallback for lenses without ISP colour data.
 - **Every session needs the small YUV metering stream**: Xiaomi's front and hidden telephoto run no
@@ -142,6 +158,17 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"  
   and the GPU clock-up, which stalled single frames 100–200 ms and cost 10–20 % of clips 1–15
   frames. Each recording logs `Recording timing:` (frames lost and when, slowest frame, slowest
   encoder hand-over, slowest pre-roll frame).
+- **Bitrates**: 2K offers 25/50/75/100 Mbps, 4K 50/100/150 (`bitrateOptions`); switching
+  resolution snaps to the nearest.
+- **Re-encoding with the hardware encoder isn't worth it** (2026-10-10, owner's grainy 2K clips,
+  VMAF vs the original): the X14's c2.qti.hevc.encoder (VBR/CBR only, no CQ; complexity has no
+  effect) needed 73 % of the size for VMAF 86 even at constant QP, where x265 (medium) reached
+  88.5 at 16 % and SVT-AV1 (preset 8) 82.5 at 7 %. With B-frames its MP4 showed the first frame
+  twice (whole clip a frame late), so the transcoder asks for none. It's fast (~4× real time at
+  2K). So Compress uses x265 on the CPU: on the X14, Quick (veryfast) at Balanced takes ~1.9× the
+  clip's length at 2K (~9× at 4K: 27–31 Mpixel/s either way) and gives VMAF ~85 at ~13 % of the size (High = CRF 20: VMAF 90 at 25 %;
+  Small = 27; Thorough = medium, ~2× the time). Its B-frames mux fine (frames aligned). The X14
+  has AV1 hardware decoders only; Send diagnostics lists every phone's video encoders.
 - **Frame** (`aspect`: 4:3, 16:9, 2:1, 2.39:1): the encoder gets a centre crop of the image
   (height a multiple of 16, e.g. 4096×2304); the preview darkens the rest and draws frame lines.
 - **Glass backdrop** costs ~1.7 ms a preview frame (`glasstiming`), refreshed every third frame

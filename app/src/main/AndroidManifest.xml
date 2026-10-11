@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- The recordings list: clips an earlier install made (this install's own need nothing). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -27,6 +29,12 @@
             android:exported="false"
             android:label="AuthRec Look Editor"
             android:screenOrientation="landscape" />
+        <activity
+            android:name=".RecordingsActivity"
+            android:exported="true"
+            android:label="AuthRec Recordings"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
         <activity
             android:name=".bench.BenchActivity"
             android:exported="true"

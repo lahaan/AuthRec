@@ -259,6 +259,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private fun showSettingsMenu() {
         val menu = android.widget.PopupMenu(a, settingsButton)
         menu.menu.add(0, 0, 0, "Switch to the Glass layout")
+        menu.menu.add(0, 4, 1, "Recordings…")
+        menu.menu.add(0, 5, 5, "About & licences")
         if (!a.scanning) menu.menu.add(0, 1, 1, "Rescan lenses")
         menu.menu.add(0, 2, 2, "Send diagnostics…")
         if (!a.scanning) menu.menu.add(0, 3, 3, "Run capability bench")
@@ -268,6 +270,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
                 1 -> a.rescanLenses()
                 2 -> a.sendDiagnostics()
                 3 -> a.openBench()
+                4 -> a.openRecordings()
+                5 -> com.authrec.About.show(a)
             }
             true
         }

@@ -63,6 +63,9 @@ object Diagnostics {
             context.getSharedPreferences(name, Context.MODE_PRIVATE).all.toSortedMap().forEach { (k, v) -> appendLine("$k = $v") }
             appendLine()
         }
+        appendLine("== Video encoders ==")
+        append(encoderReport())
+        appendLine()
         appendLine("== Events (this and earlier launches) ==")
         appendLine(EventLog.tail(500))
         appendLine()
@@ -75,6 +78,24 @@ object Diagnostics {
     }
 
     /** Writes the report to Download/AuthRec and opens the share sheet. Call off the main thread. */
+    /**
+     * Every video encoder with its types, hardware or not, and size/bitrate limits: tells us
+     * whether a phone could record or compress to AV1 (the X14 has only AV1 decoders).
+     */
+    private fun encoderReport(): String = buildString {
+        runCatching {
+            android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos
+                .filter { it.isEncoder && it.supportedTypes.any { t -> t.startsWith("video/") } }
+                .forEach { info ->
+                    info.supportedTypes.filter { it.startsWith("video/") }.forEach { type ->
+                        val v = info.getCapabilitiesForType(type).videoCapabilities
+                        appendLine("${info.name} $type ${if (info.isHardwareAccelerated) "hw" else "sw"}" +
+                            (v?.let { " up to ${it.supportedWidths.upper}x${it.supportedHeights.upper}, ${it.bitrateRange.upper / 1_000_000} Mbps" } ?: ""))
+                    }
+                }
+        }.onFailure { appendLine("(couldn't list: ${it.message})") }
+    }
+
     fun share(context: Context): Uri {
         val name = "authrec-diagnostics-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date()) + ".txt"
         val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, ContentValues().apply {

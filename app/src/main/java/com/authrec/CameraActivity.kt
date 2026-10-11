@@ -598,7 +598,14 @@ class CameraActivity : Activity() {
     internal fun setFps(fps: Int) = setCapture(capture.copy(fps = fps))
     internal fun cycleCodec() = setCodec(VideoCodec.entries[(codec.ordinal + 1) % VideoCodec.entries.size])
     internal fun setCodec(c: VideoCodec) { codec = c; settingsChanged() }
-    internal fun cycleBitrate() = setBitrate(when (bitrateMbps) { 50 -> 100; 100 -> 150; else -> 50 })
+    /** Bitrates offered for the current resolution: 2K needs far less (owner asked for 25 and 75). */
+    internal fun bitrateOptions(): List<Int> = if (superpixel) BITRATES_2K else BITRATES_4K
+
+    internal fun cycleBitrate() {
+        val options = bitrateOptions()
+        setBitrate(options[(options.indexOf(bitrateMbps) + 1) % options.size])
+    }
+
     internal fun setBitrate(mbps: Int) { bitrateMbps = mbps; settingsChanged() }
     internal fun setBake(on: Boolean) { bakeLut = on; settingsChanged() }
     internal fun cycleCleanup() = setCleanup((cleanup + 1) % 4)
@@ -882,6 +889,10 @@ class CameraActivity : Activity() {
             priorityTarget = renderer?.rawBrightness?.takeIf { !it.isNaN() && it > 0f }?.toDouble() ?: DEFAULT_PRIORITY_TARGET
         }
         val modeChanged = settings.ae != capture.ae
+        if (modeChanged && settings.ae != AeMode.PRIORITY) {
+            priorityExposure = Double.NaN
+            renderer?.exposureTarget = Double.NaN
+        }
         capture = settings
         if (priorityStarted) {
             info.post(priorityTick)
@@ -934,7 +945,12 @@ class CameraActivity : Activity() {
      * limit before slowing the shutter. Fix ISO (min = max) for ISO priority, or the shutter
      * (fastest = slowest) for shutter priority. Too bright for the limits: the shutter goes
      * faster anyway (no ND to fall back on). Too dark: stays at the limits and says so.
-     * 5 updates/s, moving half-way (in stops) each time, so it settles without pumping.
+     *
+     * 10 updates/s in small steps (at most 0.3 EV), judging each measurement against the exposure
+     * that produced it rather than the latest request (which takes a few frames to reach the
+     * sensor; judging against it overshot). The renderer eases the picture between updates and
+     * evens out each frame's actual exposure with digital gain ([Renderer.exposureTarget]): the
+     * old loop's half-way jumps 5× a second showed as choppy brightness steps (owner).
      */
     private val priorityTick: Runnable = object : Runnable {
         override fun run() {
@@ -942,17 +958,39 @@ class CameraActivity : Activity() {
             if (capture.ae != AeMode.PRIORITY) return
             val r = renderer
             val measured = r?.rawBrightness ?: Float.NaN
-            if (r != null && !measured.isNaN() && measured > 0f) {
-                val current = capture.iso.toDouble() * capture.exposureNs
+            val measuredAt = r?.rawExposure ?: Double.NaN
+            if (r != null && !measured.isNaN() && measured > 0f && !measuredAt.isNaN()) {
                 val goal = priorityTarget * Math.pow(2.0, exposureEv.toDouble())
-                var target = current * Math.pow(goal / measured, 0.5)
-                if (r.rawClipFraction > 0.02f) target = minOf(target, current * 0.8)
-                val (iso, ns) = splitExposure(target)
-                priorityAtLimit = iso.toDouble() * ns < target * 0.8
-                if (abs(iso.toDouble() * ns / current - 1) > 0.04) setCapture(capture.copy(iso = iso, exposureNs = ns), updateUiNow = false)
+                var wanted = measuredAt * goal / measured
+                if (r.rawClipFraction > 0.02f) wanted = minOf(wanted, measuredAt * 0.8)
+                val (lo, hi) = exposureRange()
+                val reachable = wanted.coerceIn(lo, hi)
+                priorityAtLimit = reachable < wanted * 0.8
+                val from = priorityExposure.takeIf { !it.isNaN() } ?: measuredAt
+                priorityExposure = from * Math.pow(reachable / from, 0.35).coerceIn(PRIORITY_STEP_DOWN, PRIORITY_STEP_UP)
+                r.exposureTarget = priorityExposure
+                val requested = capture.iso.toDouble() * capture.exposureNs
+                if (abs(priorityExposure / requested - 1) > 0.03) {
+                    val (iso, ns) = splitExposure(priorityExposure)
+                    setCapture(capture.copy(iso = iso, exposureNs = ns), updateUiNow = false)
+                }
             }
-            info.postDelayed(this, 200)
+            info.postDelayed(this, 100)
         }
+    }
+
+    /** The exposure Priority aims the picture at (ISO × ns), eased 10× a second; NaN = not started. */
+    private var priorityExposure = Double.NaN
+
+    /** Exposure (ISO × ns) Priority can reach: down to the sensor's minimum (no ND), up to the limits. */
+    private fun exposureRange(): Pair<Double, Double> {
+        val info = camera?.info ?: return 0.0 to Double.MAX_VALUE
+        val frameNs = 1_000_000_000.0 / capture.fps
+        val fast = maxOf(limits.fastestNs.toDouble(), info.exposureRangeNs.lower.toDouble())
+        val slow = minOf(limits.slowestNs.toDouble(), frameNs).coerceAtLeast(fast)
+        val isoLo = maxOf(limits.isoMin, info.isoRange.lower).toDouble()
+        val isoHi = minOf(limits.isoMax, info.isoRange.upper).toDouble().coerceAtLeast(isoLo)
+        return info.isoRange.lower.toDouble() * info.exposureRangeNs.lower to isoHi * slow
     }
 
     private var priorityTarget = DEFAULT_PRIORITY_TARGET
@@ -1411,7 +1449,7 @@ class CameraActivity : Activity() {
             info.text = "Camera unavailable: ${e.message}"
             return
         }
-        val r = Renderer(cam.info, cam.reader, { cam.latestMeta }, { cam.ispLinearLogAverage }) { stats ->
+        val r = Renderer(cam.info, cam.reader, { ts -> cam.metaFor(ts) }, { cam.ispLinearLogAverage }) { stats ->
             runOnUiThread { showStats(stats) }
         }
         cam.reader.setOnImageAvailableListener({ r.onFrameAvailable() }, cameraHandler)
@@ -1519,6 +1557,8 @@ class CameraActivity : Activity() {
 
     internal fun setSuperpixel(on: Boolean) {
         superpixel = on
+        // Keep the bitrate one this resolution offers (the nearest, e.g. 4K 150 → 2K 100).
+        if (bitrateMbps !in bitrateOptions()) bitrateMbps = bitrateOptions().minBy { abs(it - bitrateMbps) }
         renderer?.superpixel = on
         applyAspect()
         settingsChanged()
@@ -1717,6 +1757,10 @@ class CameraActivity : Activity() {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*" // .cube has no registered MIME type
         }, REQ_PICK_LUT)
+    }
+
+    internal fun openRecordings() {
+        startActivity(Intent(this, RecordingsActivity::class.java))
     }
 
     /** Grabs the live log frame and opens the editor on the current look. */
@@ -2034,6 +2078,11 @@ class CameraActivity : Activity() {
         private const val REQ_EDIT_LOOK = 3
         /** Fallback RAW log-average for AE: Priority if no measurement exists yet. */
         private const val DEFAULT_PRIORITY_TARGET = 0.025
+        val BITRATES_2K = listOf(25, 50, 75, 100)
+        val BITRATES_4K = listOf(50, 100, 150)
+        /** Largest change of Priority's exposure per update (0.3 EV). */
+        private val PRIORITY_STEP_UP = Math.pow(2.0, 0.3)
+        private val PRIORITY_STEP_DOWN = Math.pow(2.0, -0.3)
         /** Retries of a failing lens before falling back to the main lens. */
         private const val MAX_CAMERA_RETRIES = 6
         /** Battery temperatures (°C): show it, warn, stop recording (PowerKeeper kills at ~48). */

@@ -461,10 +461,15 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             if (pro) proSettings += r
             return r
         }
-        fun <T> choice(label: String, pro: Boolean, options: List<Pair<String, T>>, current: () -> T, pick: (T) -> Unit) {
+        /** [offered]: which options show right now (the rest hide), e.g. bitrates per resolution. */
+        fun <T> choice(label: String, pro: Boolean, options: List<Pair<String, T>>, current: () -> T,
+                       offered: ((T) -> Boolean)? = null, pick: (T) -> Unit) {
             val (seg, mark) = kit.segmented(options.map { it.first }) { i -> pick(options[i].second) }
             row(label, pro, seg)
-            settingsRows += { mark(options.indexOfFirst { it.second == current() }) }
+            settingsRows += {
+                offered?.let { show -> options.forEachIndexed { i, o -> seg.getChildAt(i).visibility = if (show(o.second)) View.VISIBLE else View.GONE } }
+                mark(options.indexOfFirst { it.second == current() })
+            }
         }
         // Fixed above the rows, which scroll beneath it.
         val header = LinearLayout(a).apply {
@@ -478,7 +483,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
         choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
         choice("Codec", true, VideoCodec.entries.map { it.label to it }, { a.codec }) { a.setCodec(it) }
-        choice("Bitrate", true, listOf("50" to 50, "100" to 100, "150 Mbps" to 150), { a.bitrateMbps }) { a.setBitrate(it) }
+        choice("Bitrate (Mbps)", true, (CameraActivity.BITRATES_2K + CameraActivity.BITRATES_4K).distinct().sorted().map { "$it" to it },
+            { a.bitrateMbps }, offered = { it in a.bitrateOptions() }) { a.setBitrate(it) }
         choice("Record", true, listOf("Look" to true, "Log" to false), { a.bakeLut }) { a.setBake(it) }
         choice("Log profile", true, LogProfile.entries.map { it.label to it }, { a.profile }) { a.setProfile(it) }
         choice("Clean-up", true, listOf("Off" to 0, "Pixels" to 1, "+ Colour" to 2, "+ Colour+" to 3), { a.cleanup }) { a.setCleanup(it) }
@@ -496,6 +502,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             if (pro) proSettings += r
         }
         buttons(true, "Import .cube LUT…" to { a.pickLut() }, "Edit look / make LUT…" to { a.openLookEditor() })
+        buttons(false, "Recordings…" to { a.openRecordings() }, "About & licences" to { com.authrec.About.show(a) })
         buttons(false, "Lenses…" to { a.showLensMenu(settingsChip) }, "Rescan lenses" to { toggle(settingsSheet); a.rescanLenses() },
             "Send diagnostics…" to { a.sendDiagnostics() })
         content.addView(kit.label("AuthRec ${a.packageManager.getPackageInfo(a.packageName, 0).versionName}", 11f, dim = true).apply {

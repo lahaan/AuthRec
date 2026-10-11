@@ -42,7 +42,8 @@ import kotlin.math.roundToInt
 class Renderer(
     private val sensor: SensorInfo,
     private val reader: ImageReader,
-    private val metaSource: () -> FrameMeta?,
+    /** The metadata of the capture with this sensor timestamp (or the latest). */
+    private val metaSource: (Long) -> FrameMeta?,
     /** Log-average linear brightness of the ISP's rendering (NaN if unknown); drives auto gain. */
     private val ispBrightness: () -> Float,
     private val onStats: (Stats) -> Unit,
@@ -66,6 +67,18 @@ class Renderer(
         private set
     @Volatile var rawClipFraction: Float = 0f
         private set
+    /** ISO × exposure ns of the frame [rawBrightness] was measured on. */
+    @Volatile var rawExposure: Double = Double.NaN
+        private set
+    /**
+     * AE Priority: the exposure (ISO × ns) the picture should look like, or NaN (off). Each frame
+     * eases towards it and is evened out by digital gain against that frame's own exposure, so the
+     * loop's shutter/ISO changes never show as brightness steps, only as gradual noise changes
+     * (owner: Priority was choppy).
+     */
+    @Volatile var exposureTarget: Double = Double.NaN
+    private var shownExposure = Double.NaN
+    private var exposureComp = 1f
     /**
      * Share of the image the view shows blown out although the RAW still holds it (more than
      * ~3.5 stops over middle grey after the gain, sensor not clipped): what eDR brings back.
@@ -445,8 +458,13 @@ class Renderer(
         stage(-1)
         val timestamp = image.timestamp
         lastFrameMs = SystemClock.elapsedRealtime()
-        val meta = metaSource()
-        rawLogAverage(image, meta)?.let { raw -> updateAutoGain(raw) }
+        val meta = metaSource(timestamp)
+        val frameExposure = meta?.let { it.iso.toDouble() * it.exposureNs }?.takeIf { it > 0 } ?: Double.NaN
+        rawLogAverage(image, meta)?.let { raw ->
+            rawExposure = frameExposure
+            updateAutoGain(raw)
+        }
+        updateExposureComp(frameExposure)
         sharpnessRegion?.let {
             sharpness = measureSharpness(image, it)
             sharpnessTimestamp = timestamp
@@ -631,7 +649,19 @@ class Renderer(
         autoGainEv = if (autoGainEv.isNaN()) target else autoGainEv + (target - autoGainEv) * 0.08f
     }
 
-    private fun currentGain(): Float = 2f.pow(totalGainEv)
+    private fun currentGain(): Float = 2f.pow(totalGainEv) * exposureComp
+
+    private fun updateExposureComp(frameExposure: Double) {
+        val target = exposureTarget
+        if (target.isNaN() || frameExposure.isNaN()) {
+            shownExposure = Double.NaN
+            exposureComp = 1f
+            return
+        }
+        // ~0.3 s to settle at 30 fps; it starts from where the sensor is.
+        shownExposure = if (shownExposure.isNaN()) frameExposure else shownExposure * (target / shownExposure).pow(0.12)
+        exposureComp = (shownExposure / frameExposure).coerceIn(0.25, 4.0).toFloat()
+    }
 
     private fun uploadRaw(image: Image) {
         val plane = image.planes[0]

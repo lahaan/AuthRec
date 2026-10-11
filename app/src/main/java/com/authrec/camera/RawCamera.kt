@@ -112,6 +112,8 @@ class FrameMeta(
      * SENSOR_NOISE_PROFILE), or null if the lens doesn't report it. Drives colour NR's motion test.
      */
     val noise: FloatArray? = null,
+    /** SENSOR_TIMESTAMP of the capture, to match the RAW image it belongs to. */
+    val timestamp: Long = 0L,
 )
 
 /**
@@ -155,6 +157,24 @@ class RawCamera(
 
     @Volatile var latestMeta: FrameMeta? = null
         private set
+    /** The last few frames' metadata, so a RAW image can be paired with its own (see [metaFor]). */
+    private val recentMeta = ArrayDeque<FrameMeta>()
+
+    /**
+     * The metadata of the capture with [timestamp] (the RAW image's), else the latest. The latest
+     * can be a frame off, which didn't matter until exposure changes were evened out per frame.
+     */
+    fun metaFor(timestamp: Long): FrameMeta? {
+        val exact = synchronized(recentMeta) { recentMeta.lastOrNull { it.timestamp == timestamp } }
+        if (metaLookups < 90) {
+            metaLookups++
+            if (exact != null) metaMatched++
+            if (metaLookups == 90) EventLog.log("${lens?.key ?: info.cameraId}: $metaMatched of 90 frames matched their metadata by timestamp")
+        }
+        return exact ?: latestMeta
+    }
+    private var metaLookups = 0
+    private var metaMatched = 0
 
     /**
      * Log-average linear brightness of the ISP's own rendering of the scene (from the small
@@ -260,6 +280,8 @@ class RawCamera(
         val gen = ++generation
         opened = true
         resultsSeen = 0
+        metaLookups = 0
+        metaMatched = 0
         referenceCapturing = false // one cut short by a close never finished
         capturesFailed = 0
         openRequestedMs = SystemClock.elapsedRealtime()
@@ -666,7 +688,13 @@ class RawCamera(
             }
             // Odd metadata from an unusual lens must never take the app down; keep the last good frame's.
             runCatching { toMeta(physical ?: result, origin) }
-                .onSuccess { latestMeta = it }
+                .onSuccess { meta ->
+                    latestMeta = meta
+                    synchronized(recentMeta) {
+                        recentMeta.addLast(meta)
+                        while (recentMeta.size > 12) recentMeta.removeFirst()
+                    }
+                }
                 .onFailure { Log.w(TAG, "bad metadata from lens ${lens?.key}", it) }
         }
     }
@@ -727,6 +755,7 @@ class RawCamera(
             focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f,
             afState = result.get(CaptureResult.CONTROL_AF_STATE) ?: 0,
             lensMoving = result.get(CaptureResult.LENS_STATE) == CaptureResult.LENS_STATE_MOVING,
+            timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L,
             noise = noise,
         )
     }
