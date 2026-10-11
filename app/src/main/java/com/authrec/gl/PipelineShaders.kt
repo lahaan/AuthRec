@@ -445,13 +445,12 @@ internal object PipelineShaders {
         }
     """.trimIndent() + "\n"
 
-    /** Full-resolution output with Malvar-He-Cutler 5×5 linear demosaic. */
-    private val demosaicMain = """
-        void main() {
-            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-            ivec2 size = textureSize(uLinear, 0);
-            if (p.x >= size.x || p.y >= size.y) return;
-
+    /**
+     * Malvar-He-Cutler 5×5 linear demosaic at RAW pixel [p]: camera RGB, and (a) a 3×3 binomial
+     * brightness over the white-balanced mosaic, quiet enough to tell motion from noise.
+     */
+    private val mhc = """
+        vec4 mhcAt(ivec2 p) {
             float C  = px(p);
             float N  = px(p + ivec2(0, -1)), S  = px(p + ivec2(0, 1));
             float W  = px(p + ivec2(-1, 0)), E  = px(p + ivec2(1, 0));
@@ -474,9 +473,86 @@ internal object PipelineShaders {
             else if (site == ivec2(1, 1)) cam = vec3(oppAtRB, gAtRB, C);
             else if (site == ivec2(1, 0)) cam = vec3(rowAtG, C, colAtG);
             else                          cam = vec3(colAtG, C, rowAtG);
-            // 3×3 binomial over the (white-balanced) mosaic: a brightness that's quiet enough to
-            // tell motion from noise.
-            develop(p, cam, (4.0 * C + 2.0 * cross + diag) / 16.0, (vec2(p) + 0.5) / vec2(size));
+            return vec4(cam, (4.0 * C + 2.0 * cross + diag) / 16.0);
+        }
+    """.trimIndent() + "\n"
+
+    /** Full-resolution output. */
+    private val demosaicMain = mhc + """
+        void main() {
+            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = textureSize(uLinear, 0);
+            if (p.x >= size.x || p.y >= size.y) return;
+            vec4 m = mhcAt(p);
+            develop(p, m.rgb, m.a, (vec2(p) + 0.5) / vec2(size));
+        }
+    """.trimIndent()
+
+    /**
+     * Output smaller than the RAW (recording where the encoder takes less, e.g. the Xiaomi 12's
+     * 2880×2160 from 4096×3072), so colour, log, the view, colour NR and the writes run on the
+     * smaller image only. Each colour is interpolated straight at the output pixel's position
+     * from its own samples (green: at the four pixels around it, the cross average where a pixel
+     * isn't green, then blended), from one 4×4 block of the mosaic in four gathers: softer than
+     * Malvar-He-Cutler, which the downscale mostly hides. MHC at the four pixels around each
+     * output pixel (even gathered) cost as much as the full-size pass (X14 ~10 ms, X12 ~18 ms
+     * either way); shrinking a full-size image afterwards means writing and reading it back.
+     */
+    private val scaledMain = """
+        uniform vec2 uRawPerOut;  // RAW pixels per output pixel (> 1)
+
+        // The 4×4 mosaic block p-1 .. p+2 around the output pixel's position.
+        float nb[16];
+
+        float at(int x, int y) { return nb[y * 4 + x]; }
+
+        /** Is the block's pixel (x, y) green? Red sites have ((pos + uRedOffset) & 1) == 0. */
+        bool greenAt(ivec2 p, int x, int y) {
+            ivec2 s = (p + ivec2(x - 1, y - 1) + uRedOffset) & 1;
+            return s.x != s.y;
+        }
+
+        float greenOf(ivec2 p, int x, int y) {
+            return greenAt(p, x, y) ? at(x, y) : 0.25 * (at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1));
+        }
+
+        /**
+         * Bilinear over the 2-pixel lattice of the colour whose sites have parity [site] (0 red,
+         * 1 blue); [c] is the position, [p] = floor(c).
+         */
+        float latticeAt(ivec2 p, vec2 c, int site) {
+            ivec2 off = (p + uRedOffset + ivec2(site)) & 1;   // how far p sits past the lattice line
+            ivec2 l = ivec2(1) - off;                         // the lattice's first column/row in the block
+            vec2 f = (c - vec2(p - off)) * 0.5;
+            float top = mix(at(l.x, l.y), at(l.x + 2, l.y), f.x);
+            float bottom = mix(at(l.x, l.y + 2), at(l.x + 2, l.y + 2), f.x);
+            return mix(top, bottom, f.y);
+        }
+
+        void main() {
+            ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = imageSize(uOutView);
+            if (o.x >= size.x || o.y >= size.y) return;
+            vec2 c = (vec2(o) + 0.5) * uRawPerOut - 0.5;
+            ivec2 p = ivec2(floor(c));
+            vec2 f = c - vec2(p);
+            vec2 texel = 1.0 / vec2(textureSize(uLinear, 0));
+            for (int gy = 0; gy < 2; gy++) {
+                for (int gx = 0; gx < 2; gx++) {
+                    // Centred between the 2×2 block's texels: x = (i0, j1), y = (i1, j1), z = (i1, j0), w = (i0, j0).
+                    vec4 g = textureGather(uLinear, (vec2(p + ivec2(gx * 2 - 1, gy * 2 - 1)) + 1.0) * texel);
+                    int b = gy * 8 + gx * 2;
+                    nb[b] = g.w;
+                    nb[b + 1] = g.z;
+                    nb[b + 4] = g.x;
+                    nb[b + 5] = g.y;
+                }
+            }
+            float green = mix(mix(greenOf(p, 1, 1), greenOf(p, 2, 1), f.x), mix(greenOf(p, 1, 2), greenOf(p, 2, 2), f.x), f.y);
+            vec3 cam = vec3(latticeAt(p, c, 0), green, latticeAt(p, c, 1));
+            // The 2×2 mean around the position: a quiet brightness for colour NR's motion test.
+            float smoothed = 0.25 * (at(1, 1) + at(2, 1) + at(1, 2) + at(2, 2));
+            develop(o, cam, smoothed, (c + 0.5) / vec2(textureSize(uLinear, 0)));
         }
     """.trimIndent()
 
@@ -498,6 +574,7 @@ internal object PipelineShaders {
 
     val develop = developBase + demosaicMain
     val developSuperpixel = developBase + superpixelMain
+    val developScaled = developBase + scaledMain
 
     val displayVertex = """
         #version 300 es

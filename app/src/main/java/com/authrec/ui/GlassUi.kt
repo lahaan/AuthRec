@@ -462,12 +462,22 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             return r
         }
         /** [offered]: which options show right now (the rest hide), e.g. bitrates per resolution. */
+        /** [offered]: options shown; [usable]: options shown but greyed out where this phone can't. */
         fun <T> choice(label: String, pro: Boolean, options: List<Pair<String, T>>, current: () -> T,
-                       offered: ((T) -> Boolean)? = null, pick: (T) -> Unit) {
+                       offered: ((T) -> Boolean)? = null, usable: ((T) -> Boolean)? = null, note: TextView? = null,
+                       pick: (T) -> Unit) {
             val (seg, mark) = kit.segmented(options.map { it.first }) { i -> pick(options[i].second) }
             row(label, pro, seg)
+            // Its own visibility (shown only when it has something to say), so not in proSettings.
+            note?.let { content.addView(it) }
             settingsRows += {
                 offered?.let { show -> options.forEachIndexed { i, o -> seg.getChildAt(i).visibility = if (show(o.second)) View.VISIBLE else View.GONE } }
+                usable?.let { can ->
+                    options.forEachIndexed { i, o ->
+                        seg.getChildAt(i).isEnabled = can(o.second)
+                        seg.getChildAt(i).alpha = if (can(o.second)) 1f else 0.4f
+                    }
+                }
                 mark(options.indexOfFirst { it.second == current() })
             }
         }
@@ -482,7 +492,12 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), { a.superpixel }) { a.setSuperpixel(it) }
         choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
         choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
-        choice("Codec", true, VideoCodec.entries.map { it.label to it }, { a.codec }) { a.setCodec(it) }
+        val codecNote = kit.label("", 11f, dim = true)
+        choice("Codec", true, VideoCodec.entries.map { it.label to it }, {
+            codecNote.text = if (a.codec != a.effectiveCodec()) "This phone can't record 10-bit: it records ${a.effectiveCodec().label}." else ""
+            codecNote.visibility = if (codecNote.text.isEmpty() || a.simple) View.GONE else View.VISIBLE
+            a.effectiveCodec()
+        }, usable = { a.codecOffered(it) }, note = codecNote) { a.setCodec(it) }
         choice("Bitrate (Mbps)", true, (CameraActivity.BITRATES_2K + CameraActivity.BITRATES_4K).distinct().sorted().map { "$it" to it },
             { a.bitrateMbps }, offered = { it in a.bitrateOptions() }) { a.setBitrate(it) }
         choice("Record", true, listOf("Look" to true, "Log" to false), { a.bakeLut }) { a.setBake(it) }
@@ -736,6 +751,19 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
     override fun onStats() {
         if (!a.simple) updateExposureValues()
+    }
+
+    override fun openForTest(name: String) {
+        when (name) {
+            "settings" -> settingsSheet
+            "adjust" -> adjustPanel
+            "ae" -> aePanel
+            "iso" -> isoPanel
+            "shutter" -> shutterPanel
+            "wb" -> wbPanel
+            "fps" -> fpsPanel
+            else -> null
+        }?.let { if (it.visibility != View.VISIBLE) toggle(it) }
     }
 
     override fun dismissPanels(): Boolean {

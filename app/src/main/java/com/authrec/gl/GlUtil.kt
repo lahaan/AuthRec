@@ -43,6 +43,22 @@ internal class EglCore {
         return if (count[0] > 0) configs[0] else null
     }
 
+    /** The configs with 10-bit colour, for the event log: which bits, window surface, recordable. */
+    fun tenBitConfigs(): String {
+        val count = IntArray(1)
+        EGL14.eglGetConfigs(display, null, 0, 0, count, 0)
+        val all = arrayOfNulls<EGLConfig>(count[0])
+        EGL14.eglGetConfigs(display, all, 0, all.size, count, 0)
+        val v = IntArray(1)
+        fun attr(c: EGLConfig, a: Int) = if (EGL14.eglGetConfigAttrib(display, c, a, v, 0)) v[0] else -1
+        return all.filterNotNull().filter { attr(it, EGL14.EGL_RED_SIZE) == 10 }.joinToString { c ->
+            "${attr(c, EGL14.EGL_RED_SIZE)}${attr(c, EGL14.EGL_GREEN_SIZE)}${attr(c, EGL14.EGL_BLUE_SIZE)}${attr(c, EGL14.EGL_ALPHA_SIZE)}" +
+                (if (attr(c, EGL14.EGL_SURFACE_TYPE) and EGL14.EGL_WINDOW_BIT != 0) " window" else "") +
+                (if (attr(c, EGL_RECORDABLE_ANDROID) == 1) " recordable" else "") +
+                (if (attr(c, EGL14.EGL_RENDERABLE_TYPE) and EGLExt.EGL_OPENGL_ES3_BIT_KHR != 0) " es3" else "")
+        }.ifEmpty { "none" }
+    }
+
     fun createContext(config: EGLConfig, share: EGLContext): EGLContext {
         val ctx = EGL14.eglCreateContext(display, config, share, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
         check(ctx != EGL14.EGL_NO_CONTEXT) { "eglCreateContext failed: 0x${EGL14.eglGetError().toString(16)}" }

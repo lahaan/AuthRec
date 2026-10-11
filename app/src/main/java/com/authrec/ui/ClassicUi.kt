@@ -213,7 +213,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         profileButton.text = a.profile.label
         viewButton.text = (if (a.simple) "Look: " else "View: ") + a.currentView()?.label
         fpsButton.text = "${a.capture.fps} fps"
-        codecButton.text = a.codec.label
+        codecButton.text = a.effectiveCodec().label
         bitrateButton.text = "${a.bitrateMbps} Mbps"
         resButton.text = if (a.simple) (if (a.superpixel) "2K" else "4K") else if (a.superpixel) "Superpixel 2K" else "Open gate 4K"
         audioButton.text = if (a.audioOn) "Audio: on" else "Audio: off"

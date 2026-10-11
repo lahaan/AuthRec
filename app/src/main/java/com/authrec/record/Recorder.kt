@@ -66,7 +66,7 @@ data class RecordConfig(
  * showed there. If leading frames have to be dropped, both tracks are shifted to start at the
  * first key frame so sound stays in sync.
  */
-class Recorder(context: Context, val config: RecordConfig, width: Int, height: Int) {
+class Recorder(context: Context, val config: RecordConfig, val width: Int, val height: Int) {
 
     val inputSurface: Surface
     val uri: Uri
@@ -88,6 +88,12 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
     private var videoDone = false
     private var audioDone = false
     private var finished = false
+
+    /**
+     * Runs on the recorder's thread when the video encoder fails (the recording is over): until
+     * then a failed clip kept "recording" nothing until the user stopped it.
+     */
+    @Volatile var onFailed: ((String) -> Unit)? = null
     private var onFinished: ((Result) -> Unit)? = null
     private var result: Result? = null
 
@@ -109,7 +115,10 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
     /** Encoder pts of the first key frame written; both tracks are shifted so it lands at 0. */
     private var startUs = -1L
     /** What the encoder did, for the event log (Send diagnostics). */
-    private var outputsSeen = 0
+    @Volatile private var outputsSeen = 0
+
+    /** The video encoder has put out something (config or a frame) since it started. */
+    val producedOutput get() = outputsSeen > 0
     private val firstOutputs = StringBuilder()
     private var outputCapacity = 0
     private var framesJoined = 0
@@ -124,6 +133,8 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) = Unit // surface input
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+            // A recording stopped at once (e.g. retried in 8-bit) has released the muxer by now.
+            if (finished) return
             videoTrack = muxer.addTrack(format)
             maybeStartMuxer()
         }
@@ -146,6 +157,7 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
         override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
             Log.e(TAG, "video encoder error", e)
             finish("video encoder error: ${e.diagnosticInfo}")
+            onFailed?.invoke(e.diagnosticInfo)
         }
     }
 
@@ -160,9 +172,7 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
         pfd = resolver.openFileDescriptor(uri, "rw") ?: error("can't open $uri")
         muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-        val info = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.first {
-            it.isEncoder && it.isHardwareAccelerated && !it.isAlias && config.codec.mime in it.supportedTypes
-        }
+        val info = hardwareEncoder(config.codec.mime) ?: error("no hardware ${config.codec.label} encoder")
         val maxBitrate = info.getCapabilitiesForType(config.codec.mime).videoCapabilities?.bitrateRange?.upper ?: Int.MAX_VALUE
         val format = MediaFormat.createVideoFormat(config.codec.mime, width, height).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, (config.bitrateMbps * 1_000_000).coerceAtMost(maxBitrate))
@@ -454,6 +464,9 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
                     idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val format = codec.outputFormat
                         handler.post {
+                            // Stopped within a moment of starting: the muxer is released, and adding
+                            // a track to it crashed the app (Xiaomi 12, a 10-bit start retried in 8-bit).
+                            if (finished) return@post
                             audioTrack = muxer.addTrack(format)
                             maybeStartMuxer()
                         }
@@ -475,6 +488,47 @@ class Recorder(context: Context, val config: RecordConfig, width: Int, height: I
     }
 
     companion object {
+        @Volatile private var capsLogged = false
+
+        /**
+         * [w]×[h] scaled down (same shape, multiples of 16) to fit inside [maxW]×[maxH]: the size
+         * nearly every phone's encoder takes (3840/4096×2160), for when one silently fails on more.
+         */
+        fun fitInside(w: Int, h: Int, maxW: Int, maxH: Int): Pair<Int, Int> {
+            if (w <= maxW && h <= maxH) return w to h
+            val s = minOf(maxW.toFloat() / w, maxH.toFloat() / h)
+            return (Math.floor(w * s / 16.0).toInt() * 16) to (Math.floor(h * s / 16.0).toInt() * 16)
+        }
+
+        /** The phone's hardware encoder for [mime] (the one recordings use). */
+        fun hardwareEncoder(mime: String): MediaCodecInfo? = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
+            it.isEncoder && it.isHardwareAccelerated && !it.isAlias && mime in it.supportedTypes
+        }
+
+        /**
+         * [w]×[h] scaled down (same shape, multiples of 16) until the hardware encoder for [mime]
+         * takes it at [fps]. The Xiaomi 12's HEVC encoder is declared for at most 4096×2176: it
+         * accepted 4096×3072 and then put out nothing (2026-10-11). Unchanged if the phone doesn't say.
+         */
+        fun fitToEncoder(mime: String, w: Int, h: Int, fps: Int): Pair<Int, Int> {
+            val caps = runCatching { hardwareEncoder(mime)?.getCapabilitiesForType(mime)?.videoCapabilities }.getOrNull()
+                ?: return w to h
+            if (!capsLogged) {
+                capsLogged = true
+                EventLog.log("Encoder for $mime: widths ${caps.supportedWidths}, heights ${caps.supportedHeights}, " +
+                    "${w}x$h supported: ${runCatching { caps.areSizeAndRateSupported(w, h, fps.toDouble()) }.getOrNull()}")
+            }
+            fun ok(cw: Int, ch: Int) = runCatching { caps.areSizeAndRateSupported(cw, ch, fps.toDouble()) }.getOrDefault(true)
+            if (ok(w, h)) return w to h
+            var ch = h - h % 16
+            while (ch >= 144) {
+                val cw = (Math.round(ch.toFloat() * w / h / 16f) * 16)
+                if (ok(cw, ch)) return cw to ch
+                ch -= 16
+            }
+            return w to h
+        }
+
         private const val TAG = "AuthRec"
         /** While waiting for the first key frame, the sync request is repeated this often. */
         private const val SYNC_RETRY_FRAMES = 4

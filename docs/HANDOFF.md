@@ -123,7 +123,12 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
    low light (a low-light takeover, "night looks like night", shutter limit 1/30 vs 180°);
    Compress's grain caps (item 54); recording bitrate overshoot on noisy 4K (item 55). The 1 s
    REC pre-roll is fine for now (owner).
-5. 0.6.0 is out (pre-release): Priority AE smoothing (still untested by the owner), 2K 25/75 Mbps,
+5. 0.6.1 (committed, 2026-10-11): the Xiaomi 12 round (feedback/notes.md item 60): 8-bit fallback
+   where 10-bit can't be recorded, encoder size fitting + silent-encoder restart (remembered per
+   model), scaled develop for such encoders, colour NR that switches itself off when frames get
+   lost, per-lens auto gain remembered per model, crash/hang fixes, adb `open=`/`recscale=`.
+   Next: an automatic one-time recording check per phone (sizes, 10-bit, bitrate, GPU budget).
+6. 0.6.0 is out (pre-release): Priority AE smoothing (still untested by the owner), 2K 25/75 Mbps,
    Recordings screen, Compress (x265/x264/SVT-AV1), GPL-3.0, app icon, glass dialogs. From the
    friend's next diagnostics: the 15 Ultra's `Compress …` lines (speed, any failure) and its
    encoder list.

@@ -9,6 +9,7 @@ import android.graphics.PointF
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -596,7 +597,16 @@ class CameraActivity : Activity() {
 
     internal fun cycleFps() = setCapture(capture.copy(fps = when (capture.fps) { 24 -> 25; 25 -> 30; else -> 24 }))
     internal fun setFps(fps: Int) = setCapture(capture.copy(fps = fps))
-    internal fun cycleCodec() = setCodec(VideoCodec.entries[(codec.ordinal + 1) % VideoCodec.entries.size])
+    internal fun cycleCodec() {
+        val offered = VideoCodec.entries.filter { codecOffered(it) }
+        setCodec(offered[(offered.indexOf(effectiveCodec()) + 1) % offered.size])
+    }
+
+    /** False once the GPU turned out unable to hand the encoder 10-bit frames ([Renderer.tenBitRecording]). */
+    internal fun codecOffered(c: VideoCodec) = !c.tenBit || renderer?.tenBitRecording != false
+
+    /** What a recording uses: the 8-bit HEVC where 10-bit isn't possible (the setting stays). */
+    internal fun effectiveCodec() = if (codecOffered(codec)) codec else VideoCodec.HEVC_8
     internal fun setCodec(c: VideoCodec) { codec = c; settingsChanged() }
     /** Bitrates offered for the current resolution: 2K needs far less (owner asked for 25 and 75). */
     internal fun bitrateOptions(): List<Int> = if (superpixel) BITRATES_2K else BITRATES_4K
@@ -1351,11 +1361,27 @@ class CameraActivity : Activity() {
     private fun teardownPipeline() {
         info.removeCallbacks(retryCamera)
         retryPending = false
+        rememberAutoGain()
         camera?.reader?.setOnImageAvailableListener(null, null)
         renderer?.release()
         camera?.release()
         camera = null
         renderer = null
+    }
+
+    /** The lens the current renderer works for (lensIndex already names the next one during a switch). */
+    private var rendererLens: String? = null
+
+    /**
+     * Each lens's auto gain (how far the RAW sits under the ISP's rendering), per phone model: a lens
+     * starts from it instead of a fixed default, and keeps it when EV is moved before it was measured.
+     */
+    private fun autoGainKey(lens: String) = "autoGain_${Build.MODEL}_$lens"
+
+    private fun rememberAutoGain() {
+        val r = renderer ?: return
+        val lens = rendererLens ?: return
+        if (r.autoGainTrusted && !r.autoGainEv.isNaN()) prefs.edit().putFloat(autoGainKey(lens), r.autoGainEv).apply()
     }
 
     private fun restartPipeline() {
@@ -1452,6 +1478,12 @@ class CameraActivity : Activity() {
         val r = Renderer(cam.info, cam.reader, { ts -> cam.metaFor(ts) }, { cam.ispLinearLogAverage }) { stats ->
             runOnUiThread { showStats(stats) }
         }
+        r.onNrShed = { why ->
+            EventLog.log("Colour clean-up off for this clip: $why")
+            runOnUiThread { note("Colour clean-up off for this clip: the phone can't keep up") }
+        }
+        rendererLens = lenses.getOrNull(lensIndex)?.key
+        r.seedAutoGain(rendererLens?.let { prefs.getFloat(autoGainKey(it), Float.NaN) } ?: Float.NaN)
         cam.reader.setOnImageAvailableListener({ r.onFrameAvailable() }, cameraHandler)
         r.profile = profile
         r.superpixel = superpixel
@@ -1537,6 +1569,7 @@ class CameraActivity : Activity() {
 
     override fun onPause() {
         resumed = false
+        rememberAutoGain()
         runCatching { unregisterReceiver(batteryReceiver) }
         getSystemService(PowerManager::class.java).removeThermalStatusListener(thermalListener)
         stopRecording() // also cancels a warm-up
@@ -1634,8 +1667,48 @@ class CameraActivity : Activity() {
      */
     internal var warmingUp = false
         private set
-    private val commitRecording = Runnable {
-        if (!warmingUp || recorder == null) return@Runnable
+    /** A recording that failed only for want of 10-bit starts again (in 8-bit) once it's stopped. */
+    private var retryAfterStop = false
+    private val commitRecording: Runnable = object : Runnable {
+        override fun run() {
+            val rec = recorder
+            if (!warmingUp || rec == null) return
+            if (!rec.producedOutput) {
+                // Nothing from the encoder in the whole pre-roll: give it a second more, then take it
+                // as a size it doesn't take (Xiaomi 12 at 4096×3072: "Failed to configure w/h/f",
+                // frames swallowed, nothing out, while Android said the size was fine).
+                if (!preRollExtended) {
+                    preRollExtended = true
+                    info.postDelayed(this, 1000)
+                    return
+                }
+                if (encoderBox == null) {
+                    encoderBox = 4096 to 2160
+                    prefs.edit().putBoolean(encoderBoxKey(), true).apply()
+                    EventLog.log("Encoder put out nothing at ${rec.width}x${rec.height}: retrying within 4096x2160")
+                    retryAfterStop = true
+                    stopRecording()
+                    return
+                }
+            }
+            commitNow()
+        }
+    }
+
+    /** adb recscale=N: record at N % of the size (debug). */
+    private var debugRecScale = 0
+
+    /** One extra second of pre-roll for an encoder slow to start (see [commitRecording]). */
+    private var preRollExtended = false
+    /**
+     * Set once an encoder silently failed on a larger frame: recordings fit inside it from then on,
+     * on this phone model for good (each new session rediscovered it, ~4 s lost on the first clip).
+     */
+    private var encoderBox: Pair<Int, Int>? = null
+
+    private fun encoderBoxKey() = "encoderBox_${Build.MODEL}_${effectiveCodec().name}"
+
+    private fun commitNow() {
         warmingUp = false
         renderer?.commitRecording()
         recordStartMs = SystemClock.elapsedRealtime()
@@ -1650,8 +1723,16 @@ class CameraActivity : Activity() {
             showMessage("Phone too hot to record (%.1f °C); the system would close the app mid-recording".format(batteryTempC))
             return
         }
-        val (w, h, keep) = frameSize(cam)
-        val config = RecordConfig(codec, bitrateMbps, capture.fps, audioOn, cam.info.timestampsAreBoottime)
+        val (fullW, fullH, keep) = frameSize(cam)
+        val recCodec = effectiveCodec()
+        // Scaled down where this phone's encoder doesn't take the full frame (Xiaomi 12: 4096×2176 at most).
+        val (fitW, fitH) = Recorder.fitToEncoder(recCodec.mime, fullW, fullH, capture.fps)
+        if (encoderBox == null && prefs.getBoolean(encoderBoxKey(), false)) encoderBox = 4096 to 2160
+        val (boxW, boxH) = encoderBox?.let { (bw, bh) -> Recorder.fitInside(fitW, fitH, bw, bh) } ?: (fitW to fitH)
+        // adb recscale: smaller on purpose, to exercise and time the scaled develop path.
+        val (w, h) = if (debugRecScale in 30..99) (boxW * debugRecScale / 100 / 16 * 16) to (boxH * debugRecScale / 100 / 16 * 16) else boxW to boxH
+        preRollExtended = false
+        val config = RecordConfig(recCodec, bitrateMbps, capture.fps, audioOn, cam.info.timestampsAreBoottime)
         val rec = try {
             Recorder(this, config, w, h)
         } catch (e: Exception) {
@@ -1660,11 +1741,25 @@ class CameraActivity : Activity() {
             updateUi()
             return
         }
+        rec.onFailed = { err ->
+            runOnUiThread {
+                if (recorder !== rec) return@runOnUiThread
+                if (recCodec.tenBit && warmingUp) {
+                    // The encoder took the 10-bit surface but failed on its frames: 8-bit from now on.
+                    r.tenBitRecording = false
+                    EventLog.log("10-bit encoding failed at the start ($err): recording in 8-bit")
+                    retryAfterStop = true
+                    stopRecording()
+                } else {
+                    stopRecording("Stopped: the encoder failed ($err)")
+                }
+            }
+        }
         recorder = rec
         warmingUp = true
         recordStartMs = SystemClock.elapsedRealtime()
         lastResult = null
-        EventLog.log("Recording ${w}x$h (${aspect.label}) ${codec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
+        EventLog.log("Recording ${w}x$h (${aspect.label}) ${recCodec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
             "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, " +
             "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, WB shift $wbWarmth/$wbTint, " +
             (if (mirrored()) "mirrored, " else "") +
@@ -1672,10 +1767,18 @@ class CameraActivity : Activity() {
         // In simple mode the recording is what you see, so bake the look in.
         r.startRecording(rec, capture.fps, bakeLut || simple, w, h, keep) { err ->
             runOnUiThread {
-                lastResult = "Encoder surface failed: $err"
-                stopRecording()
+                if (recCodec.tenBit && !r.tenBitRecording) {
+                    // Found out only now (no 10-bit surface the encoder takes): straight again in 8-bit.
+                    retryAfterStop = true
+                    stopRecording()
+                } else {
+                    lastResult = "Encoder surface failed: $err"
+                    stopRecording()
+                }
             }
         }
+        val limits = listOfNotNull(if (recCodec != codec) "8-bit" else null, if (w != fullW) "${w}×$h" else null)
+        if (limits.isNotEmpty()) note("This phone records ${limits.joinToString(", ")}")
         // The preview runs at half resolution between recordings to save power; the pre-roll runs
         // at the recorded size so the GPU has clocked up before the clip starts.
         info.postDelayed(commitRecording, if (superpixel) PRE_ROLL_2K_MS else PRE_ROLL_MS)
@@ -1702,6 +1805,10 @@ class CameraActivity : Activity() {
                         stopping = false
                         why?.let { lastResult = it }
                         updateUi()
+                        if (retryAfterStop) {
+                            retryAfterStop = false
+                            startRecording()
+                        }
                     }
                     return@stop
                 }
@@ -1931,7 +2038,10 @@ class CameraActivity : Activity() {
      * nrdebug = true (log colour NR's frame-wide motion measure every 30 frames),
      * bakedview = false (view math per pixel instead of the baked view LUT, to compare),
      * recdebug = split | dropkey | bars | off (encoder output handling: deliver frames in pieces /
-     * lose the first key frame; bars: colour bars in the recording; see Recorder).
+     * lose the first key frame; bars: colour bars in the recording; see Recorder),
+     * open = settings | adjust | ae | iso | shutter | wb | fps | recordings (open that panel or
+     * screen, for screenshots on phones that refuse injected taps),
+     * recscale = 30..99 (`--ei`: record at that % of the size, to time the scaled develop path; 0 = off).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -2032,6 +2142,10 @@ class CameraActivity : Activity() {
         updateUi()
         extras.getString("aspect")?.let { v -> FrameAspect.entries.firstOrNull { it.label == v || it.name == v }?.let { setAspect(it) } }
         extras.getString("ui")?.let { setClassicUi(it == "classic") }
+        if (extras.containsKey("recscale")) debugRecScale = extras.getInt("recscale")
+        extras.getString("open")?.let { name ->
+            info.postDelayed({ if (name == "recordings") openRecordings() else ui.openForTest(name) }, 1200)
+        }
         when (extras.getString("cmd")) {
             // Give the camera a moment to start when launched and told to record in one go.
             "rec" -> info.postDelayed({ if (recorder == null) startRecording() }, 1500)

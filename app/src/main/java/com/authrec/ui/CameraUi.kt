@@ -26,6 +26,9 @@ internal interface CameraUi {
 
     /** About once a second with fresh camera metadata: auto exposure values and the like. */
     fun onStats() = Unit
+
+    /** adb `open=<name>`: opens a panel for screenshots on phones without input injection. */
+    fun openForTest(name: String) = Unit
 }
 
 /** "− value +" control (classic exposure bar, priority limits). */

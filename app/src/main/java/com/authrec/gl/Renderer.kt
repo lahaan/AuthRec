@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.Surface
+import com.authrec.EventLog
 import com.authrec.camera.FrameMeta
 import com.authrec.camera.SensorInfo
 import com.authrec.color.ColorMath
@@ -52,6 +53,15 @@ class Renderer(
     data class Stats(val gpuMs: Double, val fps: Double, val meta: FrameMeta?, val droppedWhileRecording: Int)
 
     /** Settings read on the GL thread each frame; written from the UI thread. */
+    /**
+     * Whether the GPU can hand the encoder 10-bit frames; false once known otherwise (the
+     * activity then records the 8-bit variant). The Xiaomi 12 (Adreno 730, Android 14) has
+     * 10-bit window configs but none recordable: 10-bit recording failed at once with "no 10-bit
+     * recordable EGL config", and through a non-recordable one the encoder failed on the first
+     * frame (2026-10-11).
+     */
+    @Volatile var tenBitRecording: Boolean = true
+
     @Volatile var profile: LogProfile = LogProfile.APPLE_LOG
     /**
      * Gain before the log curve, automatic per lens. Phone ISPs expose RAW very differently per
@@ -106,6 +116,21 @@ class Renderer(
     @Volatile var autoGainEv: Float = Float.NaN
         private set
 
+    /** The auto gain was measured at EV 0 in AE Auto (or came from such a measurement): worth remembering. */
+    @Volatile var autoGainTrusted = false
+        private set
+    /** Frames the auto gain has followed the scene since this renderer started (or was seeded). */
+    private var gainFrames = 0
+    private var gainFramesUnfrozen = 0
+
+    /** Starts the auto gain at this lens's remembered value (NaN: none yet) instead of [DEFAULT_GAIN_EV]. */
+    fun seedAutoGain(ev: Float) = post {
+        if (ev.isNaN() || !autoGainEv.isNaN()) return@post
+        autoGainEv = ev
+        gainFrames = FIRST_GAIN_FRAMES
+        autoGainTrusted = true
+    }
+
     /** All digital gain before the log curve, in EV (auto gain or its default, plus the user's). */
     val totalGainEv get() = (if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv) + exposureOffsetEv
     @Volatile var lutStrength: Float = 1f
@@ -132,6 +157,15 @@ class Renderer(
     @Volatile var previewFullRes: Boolean = false
     /** 0 off, 1 fix defect pixels, 2 + temporal colour NR, 3 + stronger temporal colour NR. */
     @Volatile var cleanup: Int = 2
+
+    /**
+     * Called (on the GL thread) when colour NR is switched off for the current recording because
+     * frames took longer than the frame interval; the argument says why, for the event log.
+     */
+    @Volatile var onNrShed: ((String) -> Unit)? = null
+
+    /** [cleanup] as the pipeline runs it: without colour NR once a recording had to shed it. */
+    private fun activeCleanup() = if (recording?.nrShed == true) minOf(cleanup, 1) else cleanup
 
     /** Red focus-peaking overlay on the preview (never recorded). */
     @Volatile var peaking: Boolean = false
@@ -161,9 +195,11 @@ class Renderer(
 
     private fun logStages() {
         if (!pipeTiming || ++stageFrames < 60) return
+        val t = developTarget()
         android.util.Log.i("AuthRec", "pipeline %s%s%s: CPU reads %.1f, upload %.1f, prep %.1f, develop %.1f, encode %.1f ms".format(
-            if (activeSuperpixel()) "superpixel" else "full size", if (recording != null) " recording" else "",
-            if (cleanup >= 2) " colour NR" else "",
+            when (t.program) { superpixelProgram -> "superpixel"; scaledProgram -> "scaled ${t.width}x${t.height}"; else -> "full size" },
+            if (recording != null) " recording" else "",
+            if (activeCleanup() >= 2) " colour NR" else "",
             *stageNs.filterIndexed { i, _ -> i != 4 }.map { it / 60 / 1e6 }.toTypedArray()))
         stageNs.fill(0)
         stageFrames = 0
@@ -206,6 +242,28 @@ class Renderer(
     private var logTex = 0
     private var spViewTex = 0
     private var spLogTex = 0
+    /** A recording's scaled develop target (0 when none), [scW]×[scH]. */
+    private var scViewTex = 0
+    private var scLogTex = 0
+    private var scW = 0
+    private var scH = 0
+    private var scaledProgram = 0
+
+    /** Where the develop pass writes this frame, and with which program. */
+    private class DevelopTarget(val program: Int, val view: Int, val log: Int, val width: Int, val height: Int)
+
+    private fun developTarget(): DevelopTarget = when {
+        activeSuperpixel() -> DevelopTarget(superpixelProgram, spViewTex, spLogTex, w / 2, h / 2)
+        recording?.scaled == true && scViewTex != 0 -> DevelopTarget(scaledProgram, scViewTex, scLogTex, scW, scH)
+        else -> DevelopTarget(developProgram, viewTex, logTex, w, h)
+    }
+
+    private fun releaseScaled() {
+        if (scViewTex == 0) return
+        GLES30.glDeleteTextures(2, intArrayOf(scViewTex, scLogTex), 0)
+        scViewTex = 0
+        scLogTex = 0
+    }
     private var shadingTex = 0
     private var lutTex = 0
     private var lutSize = 0
@@ -232,6 +290,8 @@ class Renderer(
         val surface: EGLSurface,
         val frameNs: Long,
         val mirror: Boolean,
+        /** The develop pass writes at the encoder's size (see PipelineShaders.scaledMain). */
+        val scaled: Boolean,
     ) {
         /** Frames go to the encoder but don't count yet (see Recorder.commit). */
         @Volatile var preroll = true
@@ -248,6 +308,17 @@ class Renderer(
         var slowestFrameAt = 0.0
         var slowestSwapMs = 0.0
         val gaps = StringBuilder()
+        /** Colour NR switched off for the rest of this clip: the GPU couldn't keep up with it. */
+        @Volatile var nrShed = false
+        /** The last [BUDGET_WINDOW] frames' times (ms), to tell lasting slowness from a hiccup. */
+        val recentMs = DoubleArray(BUDGET_WINDOW)
+        var timedFrames = 0
+        /** Frames lost during the pre-roll once past its first BUDGET_SKIP frames (GPU clocking up). */
+        var prerollLost = 0
+        var prerollFrames = 0
+        var prerollLastTs = -1L
+        /** Frames lost after the clip's first second (its start can stall whatever runs). */
+        var droppedSettled = 0
 
         /** One line for the event log: when frames were lost and what the GL thread was doing. */
         fun timingSummary() = "Recording timing: $dropped frames lost" +
@@ -332,13 +403,28 @@ class Renderer(
         if (released) return@post onFailed("camera closed")
         try {
             val tenBit = recorder.config.codec.tenBit
+            // Recordable only: a 10-bit window without the flag got past EGL on the Xiaomi 12, and
+            // its encoder failed on the first frame.
             val config = egl.chooseConfig(tenBit = tenBit, recordable = true)
-                ?: error("no ${if (tenBit) "10" else "8"}-bit recordable EGL config")
+            if (config == null) {
+                if (tenBit) tenBitRecording = false
+                error("no ${if (tenBit) "10" else "8"}-bit recordable EGL config")
+            }
             val ctx = egl.createContext(config, egl.mainContext)
-            val surface = egl.createWindowSurface(recorder.inputSurface, config)
+            val surface = runCatching { egl.createWindowSurface(recorder.inputSurface, config) }
+                .onFailure { egl.destroyContext(ctx) }.getOrThrow()
+            // Narrower than the image (an encoder that takes less): develop at that size instead.
+            val scaled = !superpixel && outW < w * 0.95f
+            releaseScaled()
+            if (scaled) {
+                scW = outW
+                scH = (h.toLong() * outW / w).toInt()
+                scViewTex = Gl.texture2D(GLES30.GL_RGBA16F, scW, scH, linear = true)
+                scLogTex = Gl.texture2D(GLES30.GL_RGBA16F, scW, scH, linear = true)
+            }
             // Half turns can be baked in at the same frame size (front camera is upside down in landscape).
             recording = Recording(recorder, bakeLut, superpixel, if (rotation == 2) 2 else 0, outW, outH,
-                floatArrayOf(0f, (1f - cropHeight) / 2f, 1f, cropHeight), ctx, surface, 1_000_000_000L / fps, mirror)
+                floatArrayOf(0f, (1f - cropHeight) / 2f, 1f, cropHeight), ctx, surface, 1_000_000_000L / fps, mirror, scaled)
         } catch (e: Exception) {
             onFailed(e.message ?: e.javaClass.simpleName)
         }
@@ -360,6 +446,7 @@ class Renderer(
             it.timingSummary()
         }
         recording = null
+        releaseScaled()
         onStopped(summary)
     }
 
@@ -373,6 +460,7 @@ class Renderer(
                 egl.destroyContext(it.context)
             }
             recording = null
+            releaseScaled()
             backdrop?.release()
             backdrop = null
             releaseHistory()
@@ -387,6 +475,13 @@ class Renderer(
 
     private fun setupGl() {
         egl = EglCore()
+        if (egl.chooseConfig(tenBit = true, recordable = true) == null) {
+            tenBitRecording = false
+            if (!tenBitLogged) {
+                tenBitLogged = true
+                EventLog.log("No recordable 10-bit EGL config; 10-bit configs: ${egl.tenBitConfigs()}")
+            }
+        }
         prepProgram = Gl.computeProgram(PipelineShaders.prep)
         developProgram = Gl.computeProgram(PipelineShaders.develop)
         coarseProgram = Gl.computeProgram(PipelineShaders.coarseColour)
@@ -396,6 +491,7 @@ class Renderer(
         GLES30.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, 16, zeroInts(4), GLES30.GL_DYNAMIC_DRAW)
         GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, motionBuffer)
         superpixelProgram = Gl.computeProgram(PipelineShaders.developSuperpixel)
+        scaledProgram = Gl.computeProgram(PipelineShaders.developScaled)
         displayProgram = Gl.renderProgram(PipelineShaders.displayVertex, PipelineShaders.displayFragment)
 
         rawTex = Gl.texture2D(GLES30.GL_R16UI, w, h, linear = false)
@@ -415,16 +511,25 @@ class Renderer(
         val t0 = SystemClock.elapsedRealtimeNanos()
         var meta: FrameMeta? = null
         var processed = 0
+        var behind = false
         val rec = recording
         if (rec != null) {
-            // Every frame goes to the encoder, oldest first.
+            // Every frame goes to the encoder, oldest first, but for at most PASS_BUDGET_NS per pass:
+            // an encoder that can't keep up (Xiaomi 12 choking on 4096×3072: ~250 ms a frame) kept
+            // this loop going for as long as the camera delivered, and the stop posted behind it
+            // never ran. (A cap of 3 frames instead cost the X14 frames at the start of 4K clips.)
             while (true) {
+                if (SystemClock.elapsedRealtimeNanos() - t0 > PASS_BUDGET_NS) {
+                    behind = true
+                    break
+                }
                 val image = acquireNext() ?: break
                 val f0 = SystemClock.elapsedRealtimeNanos()
                 val ts = image.timestamp
                 meta = processFrame(image)
                 processed++
                 val ms = (SystemClock.elapsedRealtimeNanos() - f0) / 1e6
+                watchBudget(rec, ms)
                 if (rec.preroll) {
                     rec.prerollSlowestMs = maxOf(rec.prerollSlowestMs, ms)
                 } else if (ms > rec.slowestFrameMs) {
@@ -439,7 +544,10 @@ class Renderer(
             }
         }
         if (processed == 0) return
-        if (windowSurface != EGL14.EGL_NO_SURFACE) {
+        // More are waiting: come back after whatever else was posted meanwhile, and leave the
+        // preview (its swap waits for the display) until caught up.
+        if (behind && frameQueued.compareAndSet(false, true)) post { renderFrames() }
+        if (!behind && windowSurface != EGL14.EGL_NO_SURFACE) {
             drawToScreen()
             egl.swapWindow()
         }
@@ -488,10 +596,41 @@ class Renderer(
         return meta
     }
 
+    /**
+     * Colour NR off for the rest of the clip once frames get lost: 2 in the pre-roll (past its
+     * first frames, while the GPU clocks up), so the clip starts without it rather than changing
+     * look, or 3 in the clip past its first second (the X14 lost 3 in a 4K clip's first half
+     * second, the start hiccup that happens with or without it, then none). The Xiaomi 12 at 4K (2880×2160 from the full RAW) lost 21 of 160
+     * frames with it, none of 310 without. The time a frame takes on this thread is only a hint
+     * (GL work overlaps; the X14 averaged 34 ms in a 4K pre-roll and lost nothing), so it counts
+     * only when clearly hopeless, and not under pipetiming, whose glFinish calls inflate it.
+     */
+    private fun watchBudget(rec: Recording, ms: Double) {
+        if (rec.nrShed || activeCleanup() < 2) return
+        rec.recentMs[rec.timedFrames % BUDGET_WINDOW] = ms
+        rec.timedFrames++
+        if (rec.timedFrames < BUDGET_SKIP + BUDGET_WINDOW) return
+        val mean = rec.recentMs.average()
+        val why = when {
+            rec.preroll && rec.prerollLost >= 2 -> "${rec.prerollLost} frames lost in the pre-roll"
+            !rec.preroll && rec.droppedSettled >= 3 -> "${rec.droppedSettled} frames lost after the first second"
+            !pipeTiming && mean > 1.25 * rec.frameNs / 1e6 -> "frames took %.0f ms on average (%.0f ms between frames)".format(mean, rec.frameNs / 1e6)
+            else -> return
+        }
+        rec.nrShed = true
+        onNrShed?.invoke(why)
+    }
+
     private fun encodeFrame(rec: Recording, timestamp: Long) {
         if (rec.originNs < 0) {
             rec.originNs = timestamp
             rec.recorder.onFirstVideoFrame(timestamp)
+        }
+        if (rec.preroll) {
+            if (++rec.prerollFrames > BUDGET_SKIP && rec.prerollLastTs >= 0) {
+                rec.prerollLost += maxOf(0, ((timestamp - rec.prerollLastTs).toDouble() / rec.frameNs).roundToInt() - 1)
+            }
+            rec.prerollLastTs = timestamp
         }
         if (rec.commitPending) {
             // The clip starts here: timing and lost frames count from this frame on.
@@ -505,6 +644,7 @@ class Renderer(
             val lost = ((timestamp - rec.lastTimestamp).toDouble() / rec.frameNs).roundToInt() - 1
             if (lost > 0) {
                 rec.dropped += lost
+                if (timestamp - rec.firstTimestamp > 1_000_000_000L) rec.droppedSettled += lost
                 if (rec.gaps.length < 120) rec.gaps.append(" %.2f s ×%d".format((timestamp - rec.firstTimestamp) / 1e9, lost))
             }
         }
@@ -517,13 +657,10 @@ class Renderer(
         GLES30.glWaitSync(fence, 0, GLES30.GL_TIMEOUT_IGNORED)
         GLES30.glDeleteSync(fence)
 
-        val sp = rec.superpixel
+        val target = developTarget()
         GLES30.glViewport(0, 0, rec.outW, rec.outH)
         drawTexture(
-            when {
-                rec.bakeLut -> if (sp) spViewTex else viewTex
-                else -> if (sp) spLogTex else logTex
-            },
+            if (rec.bakeLut) target.view else target.log,
             rotationQuarterTurns = rec.quarterTurns,
             crop = rec.crop,
             mirror = rec.mirror,
@@ -641,12 +778,19 @@ class Renderer(
     private var colWeights = FloatArray(0)
 
     private fun updateAutoGain(raw: Float) {
-        if (autoGainFrozen) return
+        // Frozen (EV moved, Priority, Manual: the ISP's tone mapping partly undoes EV, and a gain
+        // chasing it would cancel the user's) only once this lens has an estimate. One it knows
+        // nothing about learns its first ~1.5 s anyway, slightly off by what the ISP undoes, rather
+        // than run on DEFAULT_GAIN_EV: the X14 main camera's 2 EV, ~1.4 EV too bright on its
+        // telephoto and front (owner, 2026-10-11, testing a Xiaomi 12 with EV moved).
+        if (autoGainFrozen && gainFrames >= FIRST_GAIN_FRAMES) return
         val isp = ispBrightness()
         if (isp.isNaN() || raw <= 0f) return
         val target = (log2(isp / raw) + AUTO_BIAS_EV).coerceIn(0f, 5f)
         // ~1 s to settle at 30 fps, so exposure follows the scene without visible pumping.
         autoGainEv = if (autoGainEv.isNaN()) target else autoGainEv + (target - autoGainEv) * 0.08f
+        gainFrames++
+        if (!autoGainFrozen && ++gainFramesUnfrozen >= FIRST_GAIN_FRAMES) autoGainTrusted = true
     }
 
     private fun currentGain(): Float = 2f.pow(totalGainEv) * exposureComp
@@ -695,23 +839,25 @@ class Renderer(
         val prepWb = FloatArray(4) { wb[it] * shift[it] }
         GLES30.glUniform4fv(Gl.uniform(prepProgram, "uWb"), 1, prepWb, 0)
         GLES30.glUniform2i(Gl.uniform(prepProgram, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
-        GLES30.glUniform1i(Gl.uniform(prepProgram, "uFixDefects"), if (cleanup >= 1) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(prepProgram, "uFixDefects"), if (activeCleanup() >= 1) 1 else 0)
         GLES31.glDispatchCompute(groupsX, groupsY, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
-        if (cleanup >= 2) updateColourChange(prepWb, meta)
+        if (activeCleanup() >= 2) updateColourChange(prepWb, meta)
         stage(2)
 
         // Pass 2: demosaic, colour noise reduction, colour, log, the view (and the clean log).
         val p = profile
         val ccm = meta?.ccm ?: doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
         val camToTarget = ColorMath.multiply(ColorMath.convert(Primaries.REC709, p.primaries), ccm)
-        val prog = if (sp) superpixelProgram else developProgram
-        val outW = if (sp) w / 2 else w
-        val outH = if (sp) h / 2 else h
+        val target = developTarget()
+        val prog = target.program
+        val outW = target.width
+        val outH = target.height
         GLES30.glUseProgram(prog)
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, linearTex)
-        GLES31.glBindImageTexture(0, if (sp) spViewTex else viewTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
-        GLES31.glBindImageTexture(1, if (sp) spLogTex else logTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(0, target.view, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(1, target.log, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        if (prog == scaledProgram) GLES30.glUniform2f(Gl.uniform(prog, "uRawPerOut"), w.toFloat() / outW, h.toFloat() / outH)
         setViewUniforms(prog, p)
         setColourNr(prog, meta, outW, outH, p)
         GLES30.glUniform2i(Gl.uniform(prog, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
@@ -721,7 +867,7 @@ class Renderer(
         GLES31.glDispatchCompute((outW + 15) / 16, (outH + 15) / 16, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
         stage(3)
-        if (cleanup >= 2) logColourNrMotion()
+        if (activeCleanup() >= 2) logColourNrMotion()
     }
 
     // ---- Temporal colour noise reduction (see PipelineShaders.developBase) ----
@@ -824,7 +970,7 @@ class Renderer(
     private fun zeroInts(n: Int): ByteBuffer = ByteBuffer.allocateDirect(4 * n).order(ByteOrder.nativeOrder())
 
     private fun setColourNr(prog: Int, meta: FrameMeta?, outW: Int, outH: Int, p: LogProfile) {
-        if (cleanup < 2) {
+        if (activeCleanup() < 2) {
             releaseHistory()
             for (unit in 2..3) Gl.bindTexture(unit, GLES30.GL_TEXTURE_2D, noHistory)
             GLES31.glBindImageTexture(2, noHistory, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
@@ -856,7 +1002,7 @@ class Renderer(
         GLES30.glUniform1i(Gl.uniform(prog, "uTnr"), if (historyFresh) 2 else 1)
         historyFresh = false
         historyRead = 1 - historyRead
-        GLES30.glUniform1f(Gl.uniform(prog, "uTnrAlpha"), if (cleanup >= 3) TNR_STRONG else TNR_NORMAL)
+        GLES30.glUniform1f(Gl.uniform(prog, "uTnrAlpha"), if (activeCleanup() >= 3) TNR_STRONG else TNR_NORMAL)
         // Sensor noise for normalised RAW (S·x + O), carried through the prep pass's white
         // balance and shading gains (~1.8 on average: variance scales by gain × S and gain² × O).
         val (ns, no) = rawNoise(meta)
@@ -934,8 +1080,8 @@ class Renderer(
         val imgAspect = if (quarter) h.toFloat() / w else w.toFloat() / h
         val viewAspect = viewW.toFloat() / viewH
         val (vw, vh) = if (viewAspect > imgAspect) (viewH * imgAspect).toInt() to viewH else viewW to (viewW / imgAspect).toInt()
-        val sp = activeSuperpixel()
-        val tex = if (sp) spViewTex else viewTex
+        val target = developTarget()
+        val tex = target.view
         val letterbox = intArrayOf((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
         val rects = glassRects
         val glass = if (rects.isNotEmpty()) (backdrop ?: GlassBackdrop().also { backdrop = it }) else null
@@ -944,7 +1090,7 @@ class Renderer(
         // recording, a fresh blur every third frame is plenty behind the controls.
         glass?.let {
             it.timing = glassTiming
-            it.prepare(tex, if (sp) w / 2 else w, if (sp) h / 2 else h, rotation, mirror, letterbox, viewW, viewH,
+            it.prepare(tex, target.width, target.height, rotation, mirror, letterbox, viewW, viewH,
                 frameCrop, refresh = recording == null || frameCounter % 3 == 0L)
         }
 
@@ -953,8 +1099,8 @@ class Renderer(
         GLES30.glClearColor(0f, 0f, 0f, 1f)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glViewport(letterbox[0], letterbox[1], vw, vh)
-        val across = if (quarter) (if (sp) h / 2 else h) else (if (sp) w / 2 else w)
-        drawTexture(tex, rotation, peakingTexel = if (peaking) (if (sp) 2f else 1f) else 0f,
+        val across = if (quarter) target.height else target.width
+        drawTexture(tex, rotation, peakingTexel = if (peaking) w.toFloat() / target.width else 0f,
             smooth = beatsWithNoise(across.toFloat() / vw), mirror = mirror)
         drawFrameMask(letterbox[0], letterbox[1], vw, vh)
         glass?.drawShapes(rects, viewW, viewH, density)
@@ -1074,14 +1220,13 @@ class Renderer(
     private var pendingLogCapture: Pair<Int, (Bitmap) -> Unit>? = null
 
     private fun deliverLogCapture(width: Int, onFrame: (Bitmap) -> Unit) {
-        val sp = activeSuperpixel()
         val height = width * h / w
         val tex = Gl.texture2D(GLES30.GL_RGBA8, width, height, linear = true)
         val fbo = IntArray(1).also { GLES30.glGenFramebuffers(1, it, 0) }[0]
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
         GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, tex, 0)
         GLES30.glViewport(0, 0, width, height)
-        drawTexture(if (sp) spLogTex else logTex, rotationQuarterTurns = 0)
+        drawTexture(developTarget().log, rotationQuarterTurns = 0)
         val pixels = ByteBuffer.allocateDirect(width * height * 4).order(ByteOrder.nativeOrder())
         GLES30.glReadPixels(0, 0, width, height, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
@@ -1165,10 +1310,20 @@ class Renderer(
     }
 
     companion object {
+        /** The 10-bit config list goes to the event log once per process, not every lens switch. */
+        @Volatile private var tenBitLogged = false
+
         /** Extra over "match the ISP's brightness", from daylight fits against ISP JPEGs. */
         const val AUTO_BIAS_EV = 0.3f
         /** Until the first measurement arrives. */
         const val DEFAULT_GAIN_EV = 2f
+        /** Frames over which a recording's frame time is averaged (see watchBudget), and those skipped first. */
+        private const val BUDGET_WINDOW = 15
+        private const val BUDGET_SKIP = 10
+        /** Time spent on recorded frames before the GL thread looks at its other work again. */
+        private const val PASS_BUDGET_NS = 500_000_000L
+        /** Frames the auto gain needs to settle on a new lens (~1.5 s at 30 fps). */
+        private const val FIRST_GAIN_FRAMES = 45
         /** History weight of colour NR where nothing moved: "+ Colour" / "+ Colour+". */
         private const val TNR_NORMAL = 0.7f
         private const val TNR_STRONG = 0.85f
