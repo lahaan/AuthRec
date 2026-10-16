@@ -114,6 +114,8 @@ class SoftwareTranscoder(
             }) ?: error("MediaStore refused to create $name")
             pfd = resolver.openFileDescriptor(outUri, "rw") ?: error("can't open $outUri")
             muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            // A clip filmed with the phone upright carries a rotation; the copy must too.
+            if (inFormat.containsKey(MediaFormat.KEY_ROTATION)) muxer.setOrientationHint(inFormat.getInteger(MediaFormat.KEY_ROTATION))
             val videoTrack = muxer.addTrack(encoder.trackFormat)
             val audioTrack = audioFormat?.let { muxer.addTrack(it) } ?: -1
             muxer.start()

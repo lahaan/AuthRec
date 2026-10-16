@@ -105,6 +105,15 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 
 ## Start here (next session)
 
+0. **2026-10-16 round (uncommitted until the owner says so; built, not tested on the phone):**
+   feedback/notes.md items 61–68. Mid-recording driver crash hardening (realtime encoder, EGL
+   checks, fence, no Surface release under the GL thread), frames wait for their own capture
+   result, colour NR rewritten (half-res history, TAA clamp, change-test fixes), night limit on
+   the auto gain, MP4 rotation from the phone's pose, Reset button. Test first, in Log + clean
+   log with a real scene: 4K clean 2 for frame drops/NR shedding (`Recording timing`,
+   `pipetiming=true`), trails (red over dark, grey over yellowish), "N of 90 matched", a clip
+   filmed upright, the night limit in a dim room, Priority smoothness. Pause: answered, not built.
+
 1. Read `feedback/notes.md` (items 48–55 are the newest: Priority AE smoothing, Recordings,
    Compress with x265 / x264 / SVT-AV1 and its grain cap, bitrate overshoot), then anything new in
    `feedback/`.

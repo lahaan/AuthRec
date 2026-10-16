@@ -430,6 +430,39 @@ class CameraActivity : Activity() {
     /** Whether the current lens is shown mirrored. */
     private fun mirrored() = mirrorFront && camera?.info?.front == true
 
+    /**
+     * How the phone is held, in OrientationEventListener's degrees snapped to quarter turns
+     * (0 = upright portrait, 270 = the landscape the screen is locked to); -1 = unknown (flat).
+     * The screen stays landscape, so a clip filmed with the phone upright came out sideways in a
+     * 4:3 landscape frame (owner, 2026-10-15); it now carries a rotation for players instead.
+     */
+    @Volatile private var heldDegrees = -1
+
+    private val orientationListener by lazy {
+        object : android.view.OrientationEventListener(this) {
+            override fun onOrientationChanged(degrees: Int) {
+                if (degrees == ORIENTATION_UNKNOWN) return // flat: keep the last pose
+                val snapped = ((degrees + 45) / 90 % 4) * 90
+                // Near a diagonal, keep the current pose (no flicking between two).
+                val off = abs(((degrees - heldDegrees + 540) % 360) - 180)
+                if (heldDegrees < 0 || off > 60) heldDegrees = snapped
+            }
+        }
+    }
+
+    /**
+     * Clockwise turn players should give a recording started now (MediaMuxer.setOrientationHint):
+     * the frames are the locked landscape screen's image, upright when the phone is held that way.
+     * A mirrored front recording turns the other way round.
+     */
+    private fun recordingRotation(): Int {
+        val held = heldDegrees.takeIf { it >= 0 } ?: return 0
+        val reference = (360 - display.rotation * 90) % 360 // the listener's degrees in the screen's landscape
+        val turn = (held - reference + 360) % 360
+        val front = camera?.info?.front == true
+        return if (front && !mirrored()) (360 - turn) % 360 else turn
+    }
+
     internal fun setEdr(on: Boolean) {
         edrOn = on
         applyTone()
@@ -496,16 +529,24 @@ class CameraActivity : Activity() {
         // AE uncompensated: the ISP's tone mapping partly undoes exposure compensation, and a
         // gain chasing it would cancel the user's EV. So it learns at EV 0 in AUTO and holds otherwise.
         r?.autoGainFrozen = capture.ae == AeMode.MANUAL || capture.ae == AeMode.PRIORITY || abs(exposureEv) > 0.05f
+        r?.nightLimit = capture.ae != AeMode.MANUAL
         when (capture.ae) {
             AeMode.AUTO, AeMode.LOCKED -> {
                 val info = camera?.info
                 val step = info?.evStep ?: (1f / 3)
                 val steps = Math.round(exposureEv / step).coerceIn(info?.evRange?.lower ?: 0, info?.evRange?.upper ?: 0)
                 r?.exposureOffsetEv = exposureEv - steps * step
+                r?.sensorCompEv = steps * step
                 if (steps != capture.evSteps) setCapture(capture.copy(evSteps = steps), updateUiNow = false)
             }
-            AeMode.PRIORITY -> r?.exposureOffsetEv = 0f // the loop's target carries it
-            AeMode.MANUAL -> r?.exposureOffsetEv = exposureEv
+            AeMode.PRIORITY -> {
+                r?.exposureOffsetEv = 0f // the loop's target carries it
+                r?.sensorCompEv = exposureEv
+            }
+            AeMode.MANUAL -> {
+                r?.exposureOffsetEv = exposureEv
+                r?.sensorCompEv = 0f
+            }
         }
     }
 
@@ -702,6 +743,26 @@ class CameraActivity : Activity() {
 
     private fun performHapticFeedbackCompat() =
         window.decorView.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+
+    /** Whether exposure, white balance and focus are all automatic (nothing for [resetCapture] to do). */
+    internal fun captureAtDefaults() = capture.ae == AeMode.AUTO && exposureEv == 0f && !capture.awbLock &&
+        wbWarmth == 0 && wbTint == 0 && capture.af != AfMode.MANUAL && capture.focusPoint == null &&
+        focusSquare.visibility != View.VISIBLE
+
+    /**
+     * Pro's Reset: exposure Auto at EV 0, white balance Auto without trim, focus continuous on the
+     * whole scene. The look, eDR, frame rate and recording settings stay (owner, 2026-10-15: "a
+     * reset button, mainly for things like EV, focus"; EV is remembered between launches).
+     */
+    internal fun resetCapture() {
+        setAe(AeMode.AUTO)
+        if (capture.awbLock) toggleAwbLock()
+        setWbShift(0, 0)
+        setExposureEv(0f)
+        if (capture.af == AfMode.MANUAL) setCapture(capture.copy(af = AfMode.CONTINUOUS, focusPoint = null))
+        resetFocusToAuto()
+        updateUi()
+    }
 
     /** Double-tap: focus (and metering) back to the whole scene, automatic. */
     internal fun resetFocusToAuto() {
@@ -1483,7 +1544,7 @@ class CameraActivity : Activity() {
             info.text = "Camera unavailable: ${e.message}"
             return
         }
-        val r = Renderer(cam.info, cam.reader, { ts -> cam.metaFor(ts) }, { cam.ispLinearLogAverage }) { stats ->
+        val r = Renderer(cam.info, cam.reader, { ts -> cam.metaFor(ts) }, { ts -> cam.metaArrived(ts) }, { cam.ispLinearLogAverage }) { stats ->
             runOnUiThread { showStats(stats) }
         }
         r.onNrShed = { why ->
@@ -1494,6 +1555,7 @@ class CameraActivity : Activity() {
         rendererLens = lenses.getOrNull(lensIndex)?.key
         r.seedAutoGain(rendererLens?.let { prefs.getFloat(autoGainKey(it), Float.NaN) } ?: Float.NaN)
         cam.reader.setOnImageAvailableListener({ r.onFrameAvailable() }, cameraHandler)
+        cam.onResult = { r.onFrameAvailable() } // a frame waiting for its capture result
         r.profile = profile
         r.superpixel = superpixel
         r.cleanup = cleanup
@@ -1568,6 +1630,7 @@ class CameraActivity : Activity() {
         registerReceiver(batteryReceiver, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         getSystemService(PowerManager::class.java).addThermalStatusListener(mainExecutor, thermalListener)
         info.postDelayed(watchdog, 3000)
+        if (orientationListener.canDetectOrientation()) orientationListener.enable()
         if (capture.ae == AeMode.PRIORITY) priorityTick.run()
         refreshViews(selectLabel = views.getOrNull(viewIndex)?.label)
         applyView()
@@ -1644,6 +1707,7 @@ class CameraActivity : Activity() {
         rememberAutoGain()
         runCatching { unregisterReceiver(batteryReceiver) }
         getSystemService(PowerManager::class.java).removeThermalStatusListener(thermalListener)
+        orientationListener.disable()
         stopRecording() // also cancels a warm-up
         info.removeCallbacks(retryCamera)
         retryPending = false
@@ -1804,7 +1868,8 @@ class CameraActivity : Activity() {
         // adb recscale: smaller on purpose, to exercise and time the scaled develop path.
         val (w, h) = if (debugRecScale in 30..99) (boxW * debugRecScale / 100 / 16 * 16) to (boxH * debugRecScale / 100 / 16 * 16) else boxW to boxH
         preRollExtended = false
-        val config = RecordConfig(recCodec, bitrateMbps, capture.fps, audioOn, cam.info.timestampsAreBoottime)
+        val turn = recordingRotation()
+        val config = RecordConfig(recCodec, bitrateMbps, capture.fps, audioOn, cam.info.timestampsAreBoottime, turn)
         val rec = try {
             Recorder(this, config, w, h)
         } catch (e: Exception) {
@@ -1835,6 +1900,7 @@ class CameraActivity : Activity() {
             "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, " +
             "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, WB shift $wbWarmth/$wbTint, " +
             (if (mirrored()) "mirrored, " else "") +
+            (if (turn != 0) "turned $turn° (phone held ${if (turn % 180 == 0) "upside down" else "upright"}), " else "") +
             "battery %.1f °C".format(batteryTempC))
         // In simple mode the recording is what you see, so bake the look in.
         r.startRecording(rec, capture.fps, bakeLut || simple, w, h, keep) { err ->
@@ -2113,7 +2179,8 @@ class CameraActivity : Activity() {
      * lose the first key frame; bars: colour bars in the recording; see Recorder),
      * open = settings | adjust | ae | iso | shutter | wb | fps | recordings (open that panel or
      * screen, for screenshots on phones that refuse injected taps),
-     * recscale = 30..99 (`--ei`: record at that % of the size, to time the scaled develop path; 0 = off).
+     * recscale = 30..99 (`--ei`: record at that % of the size, to time the scaled develop path; 0 = off),
+     * nightiso = effective ISO where the night limit starts (`--ei`, until the next lens switch; 0 = off).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -2200,6 +2267,7 @@ class CameraActivity : Activity() {
         if (extras.containsKey("glasstiming")) renderer?.glassTiming = extras.getBoolean("glasstiming")
         if (extras.containsKey("pipetiming")) renderer?.pipeTiming = extras.getBoolean("pipetiming")
         if (extras.containsKey("nrdebug")) renderer?.nrDebug = extras.getBoolean("nrdebug")
+        if (extras.containsKey("nightiso")) renderer?.nightKneeIso = extras.getInt("nightiso").toFloat()
         if (extras.containsKey("bakedview")) renderer?.bakeViewLut = extras.getBoolean("bakedview")
         extras.getString("recdebug")?.let {
             Recorder.debugSplitFrames = it == "split"

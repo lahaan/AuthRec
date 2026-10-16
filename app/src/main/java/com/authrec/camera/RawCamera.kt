@@ -176,6 +176,12 @@ class RawCamera(
     private var metaLookups = 0
     private var metaMatched = 0
 
+    /** Whether the capture result for the RAW image with [timestamp] has arrived yet. */
+    fun metaArrived(timestamp: Long): Boolean = synchronized(recentMeta) { recentMeta.any { it.timestamp == timestamp } }
+
+    /** Runs on the camera thread after each capture result is stored (a held frame may now be ready). */
+    @Volatile var onResult: (() -> Unit)? = null
+
     /**
      * Log-average linear brightness of the ISP's own rendering of the scene (from the small
      * processed stream), or NaN until the first frame. The renderer matches our brightness to it.
@@ -694,6 +700,7 @@ class RawCamera(
                         recentMeta.addLast(meta)
                         while (recentMeta.size > 12) recentMeta.removeFirst()
                     }
+                    onResult?.invoke()
                 }
                 .onFailure { Log.w(TAG, "bad metadata from lens ${lens?.key}", it) }
         }

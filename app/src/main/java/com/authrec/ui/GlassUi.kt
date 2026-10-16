@@ -119,10 +119,15 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val wbChip = captionChip("WB") { toggle(wbPanel) }
     private val focusChip = captionChip("FOCUS") { a.cycleAf() }
     private val fpsChip = captionChip("FPS") { toggle(fpsPanel) }
+    /** Exposure, white balance and focus back to automatic (dimmed while they are). */
+    private val resetChip = captionChip("RESET") {
+        listOf(aePanel, isoPanel, shutterPanel, wbPanel).forEach { it.visibility = View.GONE }
+        a.resetCapture()
+    }
     private val proBar = LinearLayout(a).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        listOf(aeChip, isoChip, shutterChip, wbChip, focusChip, fpsChip).forEach {
+        listOf(aeChip, isoChip, shutterChip, wbChip, focusChip, fpsChip, resetChip).forEach {
             addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = a.dp(4); marginEnd = a.dp(4) })
         }
     }
@@ -665,6 +670,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         setCaption(fpsChip, "${a.capture.fps}")
         fpsRow.second(fpsOptions.indexOf(a.capture.fps))
         fpsChip.isEnabled = !busy
+        setCaption(resetChip, "All auto")
+        resetChip.isEnabled = !a.captureAtDefaults()
+        resetChip.alpha = if (resetChip.isEnabled) 1f else 0.45f
         listOf(aeChip to aePanel, isoChip to isoPanel, shutterChip to shutterPanel, wbChip to wbPanel, fpsChip to fpsPanel)
             .forEach { (chip, panel) -> if (chip !== focusChip) kit.setOn(chip, panel.visibility == View.VISIBLE) }
 

@@ -52,6 +52,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     }
     private val afButton = kit.button("") { a.cycleAf() }
     private val wbButton = kit.button("") { a.toggleAwbLock() }
+    /** Exposure, white balance and focus back to automatic. */
+    private val resetButton = kit.button("Reset") { a.resetCapture() }
     private val evGroup = Stepper(kit) { a.stepEv(it) }
     private val isoGroup = Stepper(kit) { a.stepIso(it) }
     private val shutterGroup = Stepper(kit) { a.stepShutter(it) }
@@ -76,6 +78,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         addView(afButton)
         addView(wbButton)
         addView(fpsButton)
+        addView(resetButton)
     }
     private val proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, exposureBar,
         aspectButton)
@@ -240,6 +243,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         shutterGroup.value.text = "1/$denom" + if (abs(denom - 2 * a.capture.fps) <= 1) " (180°)" else ""
         afButton.visibility = if (a.hasAfLens() && !a.simple) View.VISIBLE else View.GONE
         prioGear.visibility = if (a.capture.ae == AeMode.PRIORITY) View.VISIBLE else View.GONE
+        resetButton.isEnabled = !a.captureAtDefaults()
 
         // Sliders follow changes made elsewhere (adb, Reset).
         fun sync(bar: SeekBar, p: Int) { if (bar.progress != p) bar.progress = p }

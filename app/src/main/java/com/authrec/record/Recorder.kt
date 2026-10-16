@@ -42,6 +42,11 @@ data class RecordConfig(
     val audio: Boolean,
     /** Clock of the camera's frame timestamps, so audio can be put on the same timeline. */
     val timestampsAreBoottime: Boolean,
+    /**
+     * Degrees (0/90/180/270) players turn the picture clockwise: the frames are always the
+     * landscape screen's image, so a clip filmed with the phone upright says so here.
+     */
+    val orientationHint: Int = 0,
 )
 
 /**
@@ -94,6 +99,12 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
      * then a failed clip kept "recording" nothing until the user stopped it.
      */
     @Volatile var onFailed: ((String) -> Unit)? = null
+    /**
+     * Why the recording broke (encoder error, muxer refusing a sample), set on the recorder's
+     * thread. The codec and its input Surface stay until [stop]: releasing them at once pulled the
+     * Surface from under the GL thread, which may still be drawing a frame into it.
+     */
+    private var failure: String? = null
     private var onFinished: ((Result) -> Unit)? = null
     private var result: Result? = null
 
@@ -134,13 +145,17 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
             // A recording stopped at once (e.g. retried in 8-bit) has released the muxer by now.
-            if (finished) return
+            if (finished || failure != null) return
             videoTrack = muxer.addTrack(format)
             maybeStartMuxer()
         }
 
         override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
             if (finished) return
+            if (failure != null) {
+                runCatching { codec.releaseOutputBuffer(index, false) }
+                return
+            }
             val buf = codec.getOutputBuffer(index)
             if (outputsSeen++ < 4) {
                 outputCapacity = maxOf(outputCapacity, buf?.capacity() ?: 0)
@@ -156,8 +171,7 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
 
         override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
             Log.e(TAG, "video encoder error", e)
-            finish("video encoder error: ${e.diagnosticInfo}")
-            onFailed?.invoke(e.diagnosticInfo)
+            fail("video encoder error: ${e.diagnosticInfo}")
         }
     }
 
@@ -171,6 +185,7 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
         }) ?: error("MediaStore refused to create $name")
         pfd = resolver.openFileDescriptor(uri, "rw") ?: error("can't open $uri")
         muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        if (config.orientationHint != 0) muxer.setOrientationHint(config.orientationHint)
 
         val info = hardwareEncoder(config.codec.mime) ?: error("no hardware ${config.codec.label} encoder")
         val maxBitrate = info.getCapabilitiesForType(config.codec.mime).videoCapabilities?.bitrateRange?.upper ?: Int.MAX_VALUE
@@ -179,7 +194,22 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
         codecName = info.name
         videoCodec = MediaCodec.createByCodecName(info.name)
         videoCodec.setCallback(videoCallback, handler)
-        videoCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        // Realtime, at the frame rate: Qualcomm's encoders set their clocks from these, and without
+        // them a heavy frame (4096×3072 10-bit with grain) could leave it behind the camera, the
+        // GL thread blocked on its input and the camera's buffers running out (2026-10-15 crashes).
+        // An encoder that refuses them gets the plain settings.
+        val realtime = MediaFormat(format).apply {
+            setInteger(MediaFormat.KEY_PRIORITY, 0)
+            setInteger(MediaFormat.KEY_OPERATING_RATE, config.fps)
+        }
+        try {
+            videoCodec.configure(realtime, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (e: Exception) {
+            Log.w(TAG, "encoder refused realtime priority, configuring without", e)
+            videoCodec.reset()
+            videoCodec.setCallback(videoCallback, handler)
+            videoCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
         inputSurface = videoCodec.createInputSurface()
 
         audio = if (config.audio) {
@@ -214,12 +244,16 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
 
     /** Call once the last frame has been drawn into [inputSurface]. */
     fun stop(onFinished: (Result) -> Unit) = handler.post {
-        result?.let { // already ended by an encoder error
+        result?.let { // already ended
             onFinished(it)
             thread.quitSafely()
             return@post
         }
         this.onFinished = onFinished
+        failure?.let { // the GL thread has let go of the Surface by now: release everything
+            finish(it)
+            return@post
+        }
         audio?.stop()
         runCatching { videoCodec.signalEndOfInputStream() }.onFailure { finish("signalEndOfInputStream: ${it.message}") }
         // Safety net in case an encoder never reports end of stream.
@@ -317,9 +351,22 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
         }
         val pts = info.presentationTimeUs - startUs
         if (pts < 0) return // sound from before the first key frame
-        muxer.writeSampleData(if (video) videoTrack else audioTrack, buf,
-            MediaCodec.BufferInfo().apply { set(info.offset, info.size, pts, info.flags) })
+        if (failure != null) return
+        // The muxer throws on what it won't take (a track it stopped, say); on this thread that
+        // would take the app down mid-recording.
+        runCatching {
+            muxer.writeSampleData(if (video) videoTrack else audioTrack, buf,
+                MediaCodec.BufferInfo().apply { set(info.offset, info.size, pts, info.flags) })
+        }.onFailure { return fail("muxer refused a ${if (video) "video" else "audio"} sample: ${it.message}") }
         bytesWritten += info.size
+    }
+
+    /** The recording can't go on: say so once (event log, [onFailed]); [stop] then cleans up. */
+    private fun fail(why: String) {
+        if (finished || failure != null) return
+        failure = why
+        EventLog.log("Recording failed: $why")
+        onFailed?.invoke(why)
     }
 
     private fun maybeFinish() {
@@ -411,10 +458,12 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
             var framesRead = 0L
             val info = MediaCodec.BufferInfo()
             var eosQueued = false
+            var nextUs = 0L
 
             while (true) {
                 if (!eosQueued) {
                     val n = record.read(chunk, 0, chunk.size)
+                    if (n < 0) Thread.sleep(5) // a read error, not data: don't spin on it
                     if (n > 0) {
                         // Capture time of this chunk's first sample, on the camera's clock.
                         val startNs = if (record.getTimestamp(ts, timebase) == AudioRecord.SUCCESS) {
@@ -425,12 +474,15 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
                         }
                         framesRead += n / bytesPerFrame
                         val first = firstVideoNs
-                        if (first >= 0 && startNs >= first) queue(chunk, n, (startNs - first) / 1000, 0)
+                        if (first >= 0 && startNs >= first) {
+                            // The two clocks above can disagree by a chunk: never step back in
+                            // time (the muxer stops a track whose timestamps go backwards).
+                            val ptsUs = maxOf((startNs - first) / 1000, nextUs)
+                            if (queue(chunk, n, ptsUs, 0)) nextUs = ptsUs + (n / bytesPerFrame) * 1_000_000L / sampleRate
+                        }
                     }
-                    if (!running) {
-                        queue(chunk, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        eosQueued = true
-                    }
+                    // Until it's taken: a lost end of stream left this loop waiting for good.
+                    if (!running) eosQueued = queue(chunk, 0, nextUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                 }
                 if (drain(info, if (eosQueued) 10_000 else 0)) break
             }
@@ -440,11 +492,13 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
             }
         }
 
-        private fun queue(data: ByteArray, size: Int, ptsUs: Long, flags: Int) {
+        /** False if the encoder had no room (backed up; dropping a chunk beats stalling the mic). */
+        private fun queue(data: ByteArray, size: Int, ptsUs: Long, flags: Int): Boolean {
             val idx = codec.dequeueInputBuffer(20_000)
-            if (idx < 0) return // encoder backed up; dropping a chunk beats stalling the mic
+            if (idx < 0) return false
             codec.getInputBuffer(idx)!!.apply { clear(); put(data, 0, size) }
             codec.queueInputBuffer(idx, 0, size, ptsUs, flags)
+            return true
         }
 
         /** Moves finished AAC packets to the muxer thread; returns true at end of stream. */

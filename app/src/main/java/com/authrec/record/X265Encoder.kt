@@ -24,7 +24,10 @@ internal class X265Encoder(
         .also { check(it != 0L) { "x265 refused the settings" } }
 
     /** VPS/SPS/PPS, Annex B: the track's csd-0. */
-    val headers: ByteArray = nativeHeaders(handle) ?: error("x265 gave no headers")
+    val headers: ByteArray = nativeHeaders(handle) ?: run {
+        close() // the caller never gets an object to close
+        error("x265 gave no headers")
+    }
 
     override val meta = LongArray(3)
 

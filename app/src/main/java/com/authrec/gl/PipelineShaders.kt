@@ -275,12 +275,23 @@ internal object PipelineShaders {
         /** z² of a window's colour change; [v]: the variance of its R, G, B means. */
         float chromaZ2(vec3 now, vec3 model, vec3 v) {
             float floorY = 3.0 * sqrt(v.r + 4.0 * v.g + v.b);
-            float y = max(now.r + 2.0 * now.g + now.b, floorY);
-            float ym = max(model.r + 2.0 * model.g + model.b, floorY);
+            float yNow = now.r + 2.0 * now.g + now.b;
+            float yModel = model.r + 2.0 * model.g + model.b;
+            float y = max(yNow, floorY);
+            float ym = max(yModel, floorY);
             vec2 d = vec2(now.r - now.g, now.b - now.g) / y - vec2(model.r - model.g, model.b - model.g) / ym;
             // 1.15: the running average's own noise.
             vec2 var = vec2(v.r + v.g, v.b + v.g) / (y * y) * 1.15;
-            return d.x * d.x / var.x + d.y * d.y / var.y;
+            float z2 = d.x * d.x / var.x + d.y * d.y / var.y;
+            // In the noise floor a colour as a share of brightness is mostly noise, which held z
+            // under ~5 even for a saturated object leaving a black background: there, compare the
+            // colour differences themselves (exposure changes are tiny in absolute terms that dark).
+            if (min(yNow, yModel) < floorY) {
+                vec2 da = vec2(now.r - now.g, now.b - now.g) - vec2(model.r - model.g, model.b - model.g);
+                vec2 va = vec2(v.r + v.g, v.b + v.g) * 1.15;
+                z2 = max(z2, da.x * da.x / va.x + da.y * da.y / va.y);
+            }
+            return z2;
         }
 
         void main() {
@@ -320,10 +331,18 @@ internal object PipelineShaders {
                 float keep16 = 1.0 - smoothstep(2.5, 4.5, sqrt(z16));
                 // Learn the noise scale while the window is still (a change isn't noise). Where it
                 // looks moving the scale still creeps up, or a lens far noisier than its profile
-                // would look moving everywhere and never learn.
+                // would look moving everywhere and never learn; but only 1 % a frame and never past
+                // 3× the last frame's typical window: creeping towards a moving window's huge z²
+                // reached the 20 limit in a few frames, so an object's leading edge blinded its
+                // windows to its trailing edge (grey over a yellowish wall passed), and in pans
+                // every window went blind and the frame-wide back-off let go.
                 if (!uFresh) {
-                    scale8 = clamp(mix(0.5 * raw8, scale8, keep8 > 0.5 || 0.5 * raw8 < scale8 ? 0.95 : 0.995), 0.05, 20.0);
-                    scale16 = clamp(mix(0.5 * raw16, scale16, keep16 > 0.5 || 0.5 * raw16 < scale16 ? 0.95 : 0.995), 0.05, 20.0);
+                    float typical = float(motion[3 - uSlot]) / (16.0 * float(n.x * n.y));
+                    float cap = typical > 0.05 ? min(20.0, 3.0 * typical) : 20.0;
+                    scale8 = keep8 > 0.5 || 0.5 * raw8 < scale8 ? mix(0.5 * raw8, scale8, 0.95) : scale8 * 1.01;
+                    scale16 = keep16 > 0.5 || 0.5 * raw16 < scale16 ? mix(0.5 * raw16, scale16, 0.95) : scale16 * 1.01;
+                    scale8 = clamp(scale8, 0.05, max(cap, 0.05));
+                    scale16 = clamp(scale16, 0.05, max(cap, 0.05));
                 }
                 imageStore(uModel8Out, b, vec4(mix(now8, m8.rgb, 0.8 * keep8), scale8));
                 imageStore(uModel16Out, b, vec4(mix(now16, m16.rgb, 0.8 * keep16), scale16));
@@ -407,43 +426,144 @@ internal object PipelineShaders {
                 return 5.367655 * x + 0.092809;
             }
         }
+    """.trimIndent() + "\n" + viewCommon + """
+        // Colour NR works on each 16×16 work group in three steps (developA, B, C) with the
+        // pixels' colours shared between them; every main() calls them with barriers in between
+        // (GLSL ES allows barrier() only in main, outside any branch, before any return).
+        shared mediump vec4 sCur[256];   // the NR target's colour (rgb) and 3×3 brightness (a) per pixel
+        shared mediump vec4 sOut[256];   // its blended colour (rgb) and the history's weight (a)
+        shared float sValid[256];
+
+        ivec2 gP;
+        bool gValid;
+        vec2 gRawUv;
+        vec3 gLog;        // the clean log
+        float gLuma;      // brightness of the NR target (the view, or the log when recording log)
+        vec3 gColour;     // its colour: channels minus that brightness
+        vec3 gNr;         // the colour after blending
+        float gQuadB;     // mean 3×3 brightness of the pixel's 2×2 quad (the history's resolution)
+        float gHistB;     // the quad's brightness in the history
+        float gBlend;     // the history's weight
+
+        int quadIndex(int x, int y) {
+            ivec2 l = ivec2(gl_LocalInvocationID.xy) / 2 * 2;
+            return (l.y + y) * 16 + l.x + x;
+        }
+
+        /** Step A: develop the pixel and share its colour. [rawUv]: where it is on the sensor (0..1). */
+        void developA(ivec2 p, vec3 cam, float smoothed, vec2 rawUv, bool valid) {
+            gP = p;
+            gValid = valid;
+            gRawUv = rawUv;
+            vec3 lin = uCamToTarget * cam * uExposure;
+            gLog = vec3(encodeLog(lin.r), encodeLog(lin.g), encodeLog(lin.b));
+            vec3 t = uTnrOnLog || !valid ? gLog : viewOf(gLog);
+            gLuma = dot(t, vec3(0.2126, 0.7152, 0.0722));
+            gColour = t - vec3(gLuma);
+            gNr = gColour;
+            gBlend = 0.0;
+            int i = int(gl_LocalInvocationIndex);
+            sCur[i] = vec4(gColour, smoothed);
+            sValid[i] = valid ? 1.0 : 0.0;
+        }
 
         /**
-         * [c] (view or log) with its colour, not its brightness, blended over time where nothing
-         * moved. [rawUv]: where the pixel is on the sensor (0..1), for the block colours.
+         * Step B: blend the colour with the previous frames' where nothing moved. The history is
+         * kept at half resolution (one colour per 2×2 quad, sampled bilinearly): recordings carry
+         * colour at half resolution anyway (4:2:0), and full-size history cost 2×100 MB of memory
+         * and ~200 MB of traffic a frame at 4K, part of why frames got lost and colour NR shed.
+         *
+         * Before blending, the history's colour is clamped to what this frame has around the
+         * pixel (mean ± 1 σ of its 3×3 neighbours, as temporal anti-aliasing does): where the
+         * tests below miss a change (a grey object over a yellowish wall, red over a dark
+         * background, motion blur spreading an edge over frames) an old colour can't outlive the
+         * frame that no longer has it nearby. Pure noise almost never leaves that box: the
+         * history sits within σ/3 of the neighbours' mean.
          */
-        vec3 colourNr(ivec2 p, vec3 c, float smoothed, vec2 rawUv) {
-            if (uTnr == 0) return c;
-            float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
-            vec3 colour = c - vec3(luma);
-            if (uTnr == 1) {
-                vec4 h = texelFetch(uHistIn, p, 0);
-                // How far brightness moved, in units of this frame's noise: static areas stay
-                // well under 1.5, a real change jumps past 3.
-                float sigma = sqrt(max(smoothed, 0.0) * uNoise.x + uNoise.y);
-                float moved = abs(smoothed - h.a) / max(sigma, 1e-7);
-                // The windows' colour test; their centres sit on block corners (4 px apart).
-                float windowKeep = texture(uChange, rawUv + 2.0 / vec2(textureSize(uLinear, 0))).r;
-                // Frame-wide excess of the windows' z² over noise's 2: ~0 when still, 1–3 in pans.
-                float excess = float(motion[uSlot]) / (16.0 * uWindows) - 2.0;
-                float alpha = uTnrAlpha * (1.0 - 0.7 * smoothstep(1.0, 3.0, excess));
-                float keep = (1.0 - smoothstep(1.5, 3.0, moved)) * windowKeep;
-                colour = mix(colour, h.rgb, alpha * keep);
+        void developB() {
+            if (uTnr == 0 || !gValid) return;
+            float qb = 0.0;
+            float qn = 0.0;
+            for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
+                int j = quadIndex(x, y);
+                if (sValid[j] > 0.5) { qb += sCur[j].a; qn += 1.0; }
             }
-            imageStore(uHistOut, p, vec4(colour, smoothed));
-            return vec3(luma) + colour;
+            gQuadB = qb / max(qn, 1.0);
+            // Starting over: nothing to blend with, and the history may be uninitialised memory
+            // (a NaN there survives even a zero-weight mix and would stay in the history).
+            gHistB = gQuadB;
+            if (uTnr != 1) return;
+            gHistB = texelFetch(uHistIn, gP / 2, 0).a;
+            ivec2 l = ivec2(gl_LocalInvocationID.xy);
+            vec3 s1 = vec3(0.0);
+            vec3 s2 = vec3(0.0);
+            float n = 0.0;
+            for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+                ivec2 q = l + ivec2(x, y);
+                if (q.x < 0 || q.y < 0 || q.x > 15 || q.y > 15) continue;
+                int j = q.y * 16 + q.x;
+                if (sValid[j] < 0.5) continue;
+                vec3 c = sCur[j].rgb;
+                s1 += c;
+                s2 += c * c;
+                n += 1.0;
+            }
+            vec3 mean = s1 / n;
+            vec3 box = sqrt(max(s2 / n - mean * mean, vec3(0.0))) + 0.002;
+            vec3 h = texture(uHistIn, (vec2(gP) + 0.5) / vec2(imageSize(uOutView))).rgb;
+            h = clamp(h, mean - box, mean + box);
+            // How far the quad's brightness moved from its running average, in units of one
+            // sample's noise (the 2×2 mean of 3×3 means against an average: ~0.35 of that).
+            float sigma = sqrt(max(gQuadB, 0.0) * uNoise.x + uNoise.y);
+            float moved = abs(gQuadB - gHistB) / max(sigma, 1e-7);
+            // The windows' colour test; their centres sit on block corners (4 px apart).
+            float windowKeep = texture(uChange, gRawUv + 2.0 / vec2(textureSize(uLinear, 0))).r;
+            // Frame-wide excess of the windows' z² over noise's 2: ~0 when still, 1–3 in pans.
+            float excess = float(motion[uSlot]) / (16.0 * uWindows) - 2.0;
+            float alpha = uTnrAlpha * (1.0 - 0.7 * smoothstep(1.0, 3.0, excess));
+            float keep = (1.0 - smoothstep(1.0, 2.0, moved)) * windowKeep;
+            gBlend = alpha * keep;
+            gNr = mix(gColour, h, gBlend);
         }
-    """.trimIndent() + "\n" + viewCommon + """
-        void develop(ivec2 p, vec3 cam, float smoothed, vec2 rawUv) {
-            vec3 lin = uCamToTarget * cam * uExposure;
-            vec3 c = vec3(encodeLog(lin.r), encodeLog(lin.g), encodeLog(lin.b));
-            if (uTnrOnLog) c = colourNr(p, c, smoothed, rawUv);
-            if (uWriteLog) imageStore(uOutLog, p, vec4(c, 1.0));
-            vec3 v = viewOf(c);
-            if (!uTnrOnLog) v = colourNr(p, v, smoothed, rawUv);
-            imageStore(uOutView, p, vec4(v, 1.0));
+
+        /**
+         * Step C: each quad's top-left pixel writes the quad's history (its blended colours, and
+         * its brightness blended the same way: against a running average slow changes add up,
+         * where frame to frame each step of a blurred edge could pass), then every pixel its output.
+         */
+        void developC() {
+            ivec2 l = ivec2(gl_LocalInvocationID.xy);
+            if (uTnr != 0 && gValid && l.x % 2 == 0 && l.y % 2 == 0) {
+                vec3 c = vec3(0.0);
+                float a = 0.0;
+                float n = 0.0;
+                for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
+                    int j = quadIndex(x, y);
+                    if (sValid[j] > 0.5) { c += sOut[j].rgb; a += sOut[j].a; n += 1.0; }
+                }
+                imageStore(uHistOut, gP / 2, vec4(c / n, mix(gQuadB, gHistB, a / n)));
+            }
+            if (!gValid) return;
+            vec3 t = vec3(gLuma) + gNr;
+            if (uTnrOnLog) {
+                if (uWriteLog) imageStore(uOutLog, gP, vec4(t, 1.0));
+                imageStore(uOutView, gP, vec4(viewOf(t), 1.0));
+            } else {
+                if (uWriteLog) imageStore(uOutLog, gP, vec4(gLog, 1.0));
+                imageStore(uOutView, gP, vec4(t, 1.0));
+            }
         }
     """.trimIndent() + "\n"
+
+    /** The three steps of [developBase] around a main()'s own sampling; GLSL needs them in main itself. */
+    private const val DEVELOP_STEPS = """
+            memoryBarrierShared();
+            barrier();
+            developB();
+            sOut[gl_LocalInvocationIndex] = vec4(gNr, gBlend);
+            memoryBarrierShared();
+            barrier();
+            developC();"""
 
     /**
      * Malvar-He-Cutler 5×5 linear demosaic at RAW pixel [p]: camera RGB, and (a) a 3×3 binomial
@@ -482,9 +602,9 @@ internal object PipelineShaders {
         void main() {
             ivec2 p = ivec2(gl_GlobalInvocationID.xy);
             ivec2 size = textureSize(uLinear, 0);
-            if (p.x >= size.x || p.y >= size.y) return;
-            vec4 m = mhcAt(p);
-            develop(p, m.rgb, m.a, (vec2(p) + 0.5) / vec2(size));
+            bool valid = p.x < size.x && p.y < size.y;
+            vec4 m = mhcAt(p); // clamped reads: harmless outside the image
+            developA(p, m.rgb, m.a, (vec2(p) + 0.5) / vec2(size), valid);$DEVELOP_STEPS
         }
     """.trimIndent()
 
@@ -532,7 +652,7 @@ internal object PipelineShaders {
         void main() {
             ivec2 o = ivec2(gl_GlobalInvocationID.xy);
             ivec2 size = imageSize(uOutView);
-            if (o.x >= size.x || o.y >= size.y) return;
+            bool valid = o.x < size.x && o.y < size.y;
             vec2 c = (vec2(o) + 0.5) * uRawPerOut - 0.5;
             ivec2 p = ivec2(floor(c));
             vec2 f = c - vec2(p);
@@ -552,7 +672,7 @@ internal object PipelineShaders {
             vec3 cam = vec3(latticeAt(p, c, 0), green, latticeAt(p, c, 1));
             // The 2×2 mean around the position: a quiet brightness for colour NR's motion test.
             float smoothed = 0.25 * (at(1, 1) + at(2, 1) + at(1, 2) + at(2, 2));
-            develop(o, cam, smoothed, (c + 0.5) / vec2(textureSize(uLinear, 0)));
+            developA(o, cam, smoothed, (c + 0.5) / vec2(textureSize(uLinear, 0)), valid);$DEVELOP_STEPS
         }
     """.trimIndent()
 
@@ -561,14 +681,14 @@ internal object PipelineShaders {
         void main() {
             ivec2 o = ivec2(gl_GlobalInvocationID.xy);
             ivec2 size = textureSize(uLinear, 0) / 2;
-            if (o.x >= size.x || o.y >= size.y) return;
+            bool valid = o.x < size.x && o.y < size.y;
 
             ivec2 base = o * 2;
             vec3 cam = vec3(
                 px(base + uRedOffset),
                 0.5 * (px(base + ivec2(1 - uRedOffset.x, uRedOffset.y)) + px(base + ivec2(uRedOffset.x, 1 - uRedOffset.y))),
                 px(base + ivec2(1) - uRedOffset));
-            develop(o, cam, 0.25 * (cam.r + 2.0 * cam.g + cam.b), (vec2(base) + 1.0) / vec2(size * 2));
+            developA(o, cam, 0.25 * (cam.r + 2.0 * cam.g + cam.b), (vec2(base) + 1.0) / vec2(size * 2), valid);$DEVELOP_STEPS
         }
     """.trimIndent()
 
