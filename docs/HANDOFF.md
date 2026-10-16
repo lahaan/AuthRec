@@ -1,4 +1,4 @@
-# Handoff: state as of 0.6.0 (2026-10-11, released as GitHub pre-release v0.6.0)
+# Handoff: state as of 0.6.2 (2026-10-16, released as GitHub pre-release v0.6.2)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -105,7 +105,7 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 
 ## Start here (next session)
 
-0. **2026-10-16 round (uncommitted until the owner says so; built, not tested on the phone):**
+0. **0.6.2 (pre-release v0.6.2, 2026-10-16; built, not tested on the phone before release):**
    feedback/notes.md items 61–68. Mid-recording driver crash hardening (realtime encoder, EGL
    checks, fence, no Surface release under the GL thread), frames wait for their own capture
    result, colour NR rewritten (half-res history, TAA clamp, change-test fixes), night limit on
