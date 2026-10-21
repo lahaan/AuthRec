@@ -135,6 +135,7 @@ internal object PipelineShaders {
         layout(binding = 1) uniform mediump sampler3D uLut;
 
         uniform bool uWriteLog;      // the clean log image is wanted (recording log, or a capture)
+        uniform bool uWriteView;     // the view is wanted (not when recording log at full size: see viewFromLog)
         uniform bool uUseLut;
         uniform bool uLutConvert;    // the LUT expects another log encoding than ours
         uniform int uLutCurve;       // the LUT's
@@ -553,7 +554,7 @@ internal object PipelineShaders {
             gRawUv = rawUv;
             vec3 lin = uCamToTarget * cam * uExposure;
             gLog = vec3(encodeLog(lin.r), encodeLog(lin.g), encodeLog(lin.b));
-            vec3 t = uTnrOnLog || !valid ? gLog : viewOf(gLog);
+            vec3 t = uTnrOnLog || !valid || !uWriteView ? gLog : viewOf(gLog);
             gLuma = dot(t, vec3(0.2126, 0.7152, 0.0722));
             gColour = t - vec3(gLuma);
             gNr = gColour;
@@ -643,10 +644,10 @@ internal object PipelineShaders {
             vec3 t = vec3(gLuma) + gNr;
             if (uTnrOnLog) {
                 if (uWriteLog) imageStore(uOutLog, gP, vec4(t, 1.0));
-                imageStore(uOutView, gP, vec4(viewOf(t), 1.0));
+                if (uWriteView) imageStore(uOutView, gP, vec4(viewOf(t), 1.0));
             } else {
                 if (uWriteLog) imageStore(uOutLog, gP, vec4(gLog, 1.0));
-                imageStore(uOutView, gP, vec4(t, 1.0));
+                if (uWriteView) imageStore(uOutView, gP, vec4(t, 1.0));
             }
         }
     """.trimIndent() + "\n"
@@ -670,7 +671,7 @@ internal object PipelineShaders {
             if (!valid) return;
             vec3 lin = uCamToTarget * cam * uExposure;
             vec3 logc = vec3(encodeLog(lin.r), encodeLog(lin.g), encodeLog(lin.b));
-            vec3 t = uTnrOnLog ? logc : viewOf(logc);
+            vec3 t = uTnrOnLog || !uWriteView ? logc : viewOf(logc);
             if (uTnr != 0) {
                 float luma = dot(t, W709);
                 vec2 cur = vec2(t.r - luma, t.b - luma);
@@ -706,10 +707,10 @@ internal object PipelineShaders {
             }
             if (uTnrOnLog) {
                 if (uWriteLog) imageStore(uOutLog, p, vec4(t, 1.0));
-                imageStore(uOutView, p, vec4(viewOf(t), 1.0));
+                if (uWriteView) imageStore(uOutView, p, vec4(viewOf(t), 1.0));
             } else {
                 if (uWriteLog) imageStore(uOutLog, p, vec4(logc, 1.0));
-                imageStore(uOutView, p, vec4(t, 1.0));
+                if (uWriteView) imageStore(uOutView, p, vec4(t, 1.0));
             }
         }
     """.trimIndent() + "\n"
@@ -851,6 +852,34 @@ internal object PipelineShaders {
                 0.5 * (px(base + ivec2(1 - uRedOffset.x, uRedOffset.y)) + px(base + ivec2(uRedOffset.x, 1 - uRedOffset.y))),
                 px(base + ivec2(1) - uRedOffset));
             developA(o, cam, 0.25 * (cam.r + 2.0 * cam.g + cam.b), (vec2(base) + 1.0) / vec2(size * 2), valid);$STEPS
+        }
+    """.trimIndent()
+
+    /**
+     * The viewfinder's image while recording log at full size: the develop pass then writes only
+     * the log (writing the full-size view as well cost 100 MB of memory traffic and the view's
+     * math on 12.6 M pixels a frame, for a screen ~1600 px wide). This makes the view at half
+     * size from the log, each pixel from the mean of its 2×2 (one bilinear read at their shared
+     * corner), and only for frames the viewfinder shows. The view of the mean rather than the mean
+     * of the views, like the half-res preview between recordings (it bins the RAW). X14, 4K Log
+     * clips with Fast colour NR: GPU busy × clock −25 %, clean 0 −12 % (2026-10-21); the recorded
+     * log is bit for bit the same.
+     */
+    val viewFromLog = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(binding = 0) uniform highp sampler2D uLog;
+        layout(rgba16f, binding = 0) writeonly uniform highp image2D uOutView;
+        uniform int uCurve;
+    """.trimIndent() + "\n" + viewCommon + """
+        void main() {
+            ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = imageSize(uOutView);
+            if (o.x >= size.x || o.y >= size.y) return;
+            vec3 c = texture(uLog, (vec2(o) + 0.5) / vec2(size)).rgb;
+            imageStore(uOutView, o, vec4(viewOf(c), 1.0));
         }
     """.trimIndent()
 

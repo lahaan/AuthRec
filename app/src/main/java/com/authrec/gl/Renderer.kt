@@ -584,6 +584,8 @@ class Renderer(
         GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, motionBuffer)
         superpixelProgram = Gl.computeProgram(PipelineShaders.developSuperpixel)
         scaledProgram = Gl.computeProgram(PipelineShaders.developScaled)
+        // Here rather than at REC, so a clip's start never waits for a shader compile.
+        viewLogProgram = Gl.computeProgram(PipelineShaders.viewFromLog)
         displayProgram = Gl.renderProgram(PipelineShaders.displayVertex, PipelineShaders.displayFragment)
 
         rawTex = Gl.texture2D(GLES30.GL_R16UI, w, h, linear = false)
@@ -1285,6 +1287,7 @@ class Renderer(
         Gl.bindTexture(1, GLES30.GL_TEXTURE_3D, if (baked) bakedTex else lutTex)
         // Writing the full-size log image costs ~100 MB of memory traffic a frame; skip it unless used.
         GLES30.glUniform1i(Gl.uniform(prog, "uWriteLog"), if (recording?.bakeLut == false || pendingLogCapture != null) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(prog, "uWriteView"), if (viewFromLog()) 0 else 1)
         GLES30.glUniform1i(Gl.uniform(prog, "uUseLut"), if (lutEnabled) 1 else 0)
         if (baked) {
             GLES30.glUniform1i(Gl.uniform(prog, "uLutConvert"), 0)
@@ -1323,7 +1326,11 @@ class Renderer(
         val viewAspect = viewW.toFloat() / viewH
         val (vw, vh) = if (viewAspect > imgAspect) (viewH * imgAspect).toInt() to viewH else viewW to (viewW / imgAspect).toInt()
         val target = developTarget()
-        val tex = target.view
+        val fromLog = viewFromLog()
+        if (fromLog) makeViewFromLog(target)
+        val tex = if (fromLog) spViewTex else target.view
+        val texW = if (fromLog) w / 2 else target.width
+        val texH = if (fromLog) h / 2 else target.height
         val letterbox = intArrayOf((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
         val rects = glassRects
         val glass = if (rects.isNotEmpty()) (backdrop ?: GlassBackdrop().also { backdrop = it }) else null
@@ -1338,7 +1345,7 @@ class Renderer(
             val now = SystemClock.elapsedRealtimeNanos()
             val refresh = now - lastGlassNs >= if (recording == null) GLASS_REFRESH_IDLE_NS else GLASS_REFRESH_RECORDING_NS
             if (refresh) lastGlassNs = now
-            it.prepare(tex, target.width, target.height, rotation, mirror, letterbox, viewW, viewH, frameCrop, refresh = refresh)
+            it.prepare(tex, texW, texH, rotation, mirror, letterbox, viewW, viewH, frameCrop, refresh = refresh)
         }
 
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
@@ -1346,8 +1353,8 @@ class Renderer(
         GLES30.glClearColor(0f, 0f, 0f, 1f)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glViewport(letterbox[0], letterbox[1], vw, vh)
-        val across = if (quarter) target.height else target.width
-        drawTexture(tex, rotation, peakingTexel = if (peaking) w.toFloat() / target.width else 0f,
+        val across = if (quarter) texH else texW
+        drawTexture(tex, rotation, peakingTexel = if (peaking) w.toFloat() / texW else 0f,
             smooth = beatsWithNoise(across.toFloat() / vw), mirror = mirror)
         drawFrameMask(letterbox[0], letterbox[1], vw, vh)
         glass?.drawShapes(rects, viewW, viewH, density)
@@ -1364,6 +1371,27 @@ class Renderer(
 
     private var screenFrames = 0
     private var screenNs = 0L
+
+    /**
+     * Recording log at full size: the develop pass writes only the log, and the viewfinder's
+     * image is made from it at half size when it's drawn ([makeViewFromLog]).
+     */
+    private fun viewFromLog() = recording?.let { !it.bakeLut && !it.superpixel && !it.scaled } == true
+
+    private var viewLogProgram = 0
+
+    /** The view of the develop pass's log at half size, into the superpixel view texture (unused while recording full size). */
+    private fun makeViewFromLog(target: DevelopTarget) {
+        GLES30.glUseProgram(viewLogProgram)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, target.log)
+        GLES31.glBindImageTexture(0, spViewTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        val p = profile
+        setViewUniforms(viewLogProgram, p)
+        GLES30.glUniform1i(Gl.uniform(viewLogProgram, "uCurve"), p.shaderId)
+        GLES31.glDispatchCompute((w / 2 + 15) / 16, (h / 2 + 15) / 16, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+    }
+
     /** For the glass's hairline sizes. */
     private val density = android.content.res.Resources.getSystem().displayMetrics.density
 
