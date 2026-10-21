@@ -687,16 +687,19 @@ class Renderer(
 
     /**
      * Takes what the reader has, leaving room in it for the camera. While recording ([rec]) a
-     * backlog beyond [MAX_PENDING] frames lets the oldest go: left waiting in the reader, they
+     * backlog beyond [MAX_PENDING_RECORDING] frames lets the oldest go: left waiting in the reader, they
      * used up the camera's buffers when a hot phone fell behind (X14 at 45 °C: 4K frames took
      * 43–58 ms), so the camera failed captures instead, and the 0.6x's HAL stopped delivering
      * altogether ("no frames for 2.5 s" ended the clip; feedback item 83). Those frames were lost
      * either way; this way the camera keeps running. Recordings take frames oldest first, so the
-     * preview (which shows the newest) never builds a backlog.
+     * preview (which shows the newest) never builds a backlog. The limit is 8, not 4: at 4, a
+     * 4K clip with Quality NR at 40 °C (21 ms a frame on average) lost single frames after
+     * each 80 ms hiccup, which the waiting room absorbed before.
      */
     private fun fillPending(rec: Recording? = null) {
+        val limit = if (rec != null) MAX_PENDING_RECORDING else MAX_PENDING
         while (true) {
-            if (pending.size < MAX_PENDING) {
+            if (pending.size < limit) {
                 pending.addLast(acquireNext() ?: return)
                 continue
             }
@@ -1605,8 +1608,9 @@ class Renderer(
         /** The glass's blur of the preview is refreshed at most this often: between recordings (every 2nd frame at 24–30 fps) and while recording. */
         private const val GLASS_REFRESH_IDLE_NS = 50_000_000L
         private const val GLASS_REFRESH_RECORDING_NS = 500_000_000L
-        /** Frames taken from the reader at most (it has 6; the camera needs some). */
+        /** Frames taken from the reader at most (it has 10; the camera needs some): preview, recording. */
         private const val MAX_PENDING = 4
+        private const val MAX_PENDING_RECORDING = 8
         /** Debug (adb slowframe=ms): each recorded frame holds this thread that much longer, as a hot phone's GPU would. */
         @Volatile var debugSlowFrameMs = 0
         /** For the preview's waiting rule (recordings use their own frame rate). */

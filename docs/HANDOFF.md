@@ -1,4 +1,4 @@
-# Handoff: state as of 0.7.1 (2026-10-21, GitHub pre-release v0.7.1)
+# Handoff: state as of 0.7.2 (2026-10-21, GitHub pre-release v0.7.2)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -104,6 +104,15 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
   verified unmirrored).
 
 ## Start here (next session)
+
+0000. **0.7.2 (2026-10-21)**: feedback/notes.md items 84–85. Cheaper GPU passes with identical
+    output (prep per 2×2 quad with the pixel fix, gathered change-test blocks, glass blur every
+    other idle frame; 4K Log recordings no longer develop a full-size view): idle preview 4–12 %
+    and 4K Log recording 12–25 % less GPU work on the X14. Other phones: lens scan over ids
+    0–99 with a YUV stream in every test (the realme's HAL crash), recording stops at thermal
+    CRITICAL instead of SEVERE, open failures during a camera-service restart no longer change
+    the session layout, device details in Send diagnostics. Recordings let up to 8 frames wait
+    before skipping (0.7.1's 4 cost single frames after hiccups). Untested on non-Xiaomi phones.
 
 000. **0.7.1 (2026-10-21)**: feedback/notes.md items 82–83. Colour NR gets a Fast variant
     (Settings → Colour NR; Quality stays the default): per-pixel trail clamp, no barriers, 4K

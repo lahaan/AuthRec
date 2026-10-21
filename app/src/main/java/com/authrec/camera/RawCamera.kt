@@ -261,8 +261,11 @@ class RawCamera(
         // 6, not 4: at 4K a GL frame now and then takes 80–150 ms (the encoder's buffers being
         // allocated at a clip's start, the odd slow frame later), and with 4 buffers, one of them
         // held back for its capture result, the camera ran out and failed captures in bursts;
-        // the 0.6x once stopped delivering altogether after one (2026-10-19).
-        reader = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 6)
+        // the 0.6x once stopped delivering altogether after one (2026-10-19). 10, not 6: a
+        // recording lets up to 8 frames wait (Renderer.MAX_PENDING_RECORDING) before it skips
+        // any, and they must come out of the reader's share, not the camera's. Buffers are only
+        // allocated when a backlog needs them (25 MB each at 4K).
+        reader = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 10)
 
         // A small processed stream nobody looks at: on some lenses (Xiaomi's front and hidden
         // telephoto) the ISP only runs auto exposure / white balance while it has processed
