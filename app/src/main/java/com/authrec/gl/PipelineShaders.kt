@@ -21,7 +21,8 @@ internal object PipelineShaders {
      */
     const val DEVELOP_GROUP = 16
 
-    val prep = """
+    /** The prep pass's declarations and its last step, shared by its two variants. */
+    private val prepCommon = """
         #version 310 es
         precision highp float;
         precision highp int;
@@ -35,33 +36,9 @@ internal object PipelineShaders {
         uniform float uWhite;
         uniform vec4 uWb;           // R, G_even, G_odd, B
         uniform ivec2 uRedOffset;
-        uniform bool uFixDefects;   // repair isolated hot/dead pixels
 
-        float rawAt(ivec2 q, float black) {
-            q = clamp(q, ivec2(0), textureSize(uRaw, 0) - 1);
-            return (float(texelFetch(uRaw, q, 0).r) - black) / (uWhite - black);
-        }
-
-        void main() {
-            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-            ivec2 size = textureSize(uRaw, 0);
-            if (p.x >= size.x || p.y >= size.y) return;
-
-            float black = uBlack[(p.y & 1) * 2 + (p.x & 1)];
-            float v = (float(texelFetch(uRaw, p, 0).r) - black) / (uWhite - black);
-            if (uFixDefects) {
-                // Same-colour neighbours are 2 px away. Only a pixel far outside all eight of them
-                // (diagonals too: with just the four straight ones, thin diagonal lines and small
-                // glints looked like defects and were erased) is repaired, from the straight four.
-                float a = rawAt(p + ivec2(2, 0), black), b = rawAt(p - ivec2(2, 0), black);
-                float c = rawAt(p + ivec2(0, 2), black), d = rawAt(p - ivec2(0, 2), black);
-                float e = rawAt(p + ivec2(2, 2), black), f = rawAt(p - ivec2(2, 2), black);
-                float g = rawAt(p + ivec2(2, -2), black), h = rawAt(p + ivec2(-2, 2), black);
-                float hi = max(max(max(a, b), max(c, d)), max(max(e, f), max(g, h)));
-                float lo = min(min(min(a, b), min(c, d)), min(min(e, f), min(g, h)));
-                if (v > hi * 2.0 + 0.02 || v < lo * 0.5 - 0.02) v = 0.25 * (a + b + c + d);
-            }
-
+        /** Pixel [p]'s normalised RAW [v] through lens shading and white balance, clipped neutral. */
+        float shade(ivec2 p, float v, ivec2 size) {
             // Colour channel of this site: 0 = R, 1 = G on a red row, 2 = G on a blue row, 3 = B.
             ivec2 site = (p + uRedOffset) & 1;
             int ch = site == ivec2(0, 0) ? 0 : site == ivec2(1, 1) ? 3 : site == ivec2(1, 0) ? 1 : 2;
@@ -71,7 +48,82 @@ internal object PipelineShaders {
             // A sensor pixel clips at v = 1, i.e. at gains[ch] after scaling. Clip every channel at
             // the lowest of those so blown highlights stay white instead of turning pink.
             float neutralClip = min(min(gains.r, gains.g), min(gains.b, gains.a));
-            imageStore(uOut, p, vec4(min(v * gains[ch], neutralClip), 0.0, 0.0, 1.0));
+            return min(v * gains[ch], neutralClip);
+        }
+    """.trimIndent() + "\n"
+
+    /** Prep without the pixel fix (clean-up off): one thread per pixel. */
+    val prep = prepCommon + """
+        void main() {
+            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = textureSize(uRaw, 0);
+            if (p.x >= size.x || p.y >= size.y) return;
+            float black = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+            float v = (float(texelFetch(uRaw, p, 0).r) - black) / (uWhite - black);
+            imageStore(uOut, p, vec4(shade(p, v, size), 0.0, 0.0, 1.0));
+        }
+    """.trimIndent()
+
+    /**
+     * Prep with the pixel fix (clean-up 1 and up), one thread per 2×2 quad: its pixels and their
+     * same-colour neighbours (2 px away) are the 6×6 RAW around it, nine gathers, where a thread
+     * per pixel fetched its own nine texels (36 reads a quad). X14 idle preview at clean 1: GPU
+     * busy ~33 → ~31 % at the same clock (2026-10-21). Without the fix the per-pixel pass is the
+     * cheaper one (quads took clean 0 from 25 to ~29 %: the 36 values each thread holds). The same
+     * operations in the same order as the per-pixel pass, so the values are bit for bit the same
+     * (A/B on the X14: every output of ~800 frames identical).
+     */
+    val prepFixDefects = prepCommon + """
+        // The RAW from q0 - 2 to q0 + 3 around this thread's quad (q0: its top-left pixel).
+        float raw[36];
+
+        /** The 2×2 block at q0 + 2 (gx, gy) - 2 into raw. */
+        void gatherRaw(ivec2 q0, int gx, int gy, vec2 texel) {
+            // Centred between the block's texels: x = (i0, j1), y = (i1, j1), z = (i1, j0), w = (i0, j0).
+            // Clamp-to-edge clamps each texel like the per-pixel reads did.
+            uvec4 g = textureGather(uRaw, vec2(q0 + ivec2(gx * 2 - 1, gy * 2 - 1)) * texel);
+            int b = gy * 12 + gx * 2;
+            raw[b] = float(g.w);
+            raw[b + 1] = float(g.z);
+            raw[b + 6] = float(g.x);
+            raw[b + 7] = float(g.y);
+        }
+
+        float rawAt(int x, int y, float black) {
+            return (raw[(y + 2) * 6 + x + 2] - black) / (uWhite - black);
+        }
+
+        /** The prepared value of pixel q0 + (x, y), x and y 0 or 1. */
+        float prepAt(ivec2 q0, int x, int y, ivec2 size) {
+            ivec2 p = q0 + ivec2(x, y);
+            float black = uBlack[(p.y & 1) * 2 + (p.x & 1)];
+            float v = rawAt(x, y, black);
+            // Same-colour neighbours are 2 px away. Only a pixel far outside all eight of them
+            // (diagonals too: with just the four straight ones, thin diagonal lines and small
+            // glints looked like defects and were erased) is repaired, from the straight four.
+            float a = rawAt(x + 2, y, black), b = rawAt(x - 2, y, black);
+            float c = rawAt(x, y + 2, black), d = rawAt(x, y - 2, black);
+            float e = rawAt(x + 2, y + 2, black), f = rawAt(x - 2, y - 2, black);
+            float g = rawAt(x + 2, y - 2, black), h = rawAt(x - 2, y + 2, black);
+            float hi = max(max(max(a, b), max(c, d)), max(max(e, f), max(g, h)));
+            float lo = min(min(min(a, b), min(c, d)), min(min(e, f), min(g, h)));
+            if (v > hi * 2.0 + 0.02 || v < lo * 0.5 - 0.02) v = 0.25 * (a + b + c + d);
+            return shade(p, v, size);
+        }
+
+        void main() {
+            ivec2 q0 = ivec2(gl_GlobalInvocationID.xy) * 2;
+            ivec2 size = textureSize(uRaw, 0);
+            if (q0.x >= size.x || q0.y >= size.y) return;
+            vec2 texel = 1.0 / vec2(size);
+            // Constant loop bounds: the block's indices are constants, so it stays in registers.
+            for (int gy = 0; gy < 3; gy++) for (int gx = 0; gx < 3; gx++) gatherRaw(q0, gx, gy, texel);
+            for (int y = 0; y < 2; y++) {
+                for (int x = 0; x < 2; x++) {
+                    ivec2 p = q0 + ivec2(x, y);
+                    if (p.x < size.x && p.y < size.y) imageStore(uOut, p, vec4(prepAt(q0, x, y, size), 0.0, 0.0, 1.0));
+                }
+            }
         }
     """.trimIndent()
 
@@ -221,18 +273,42 @@ internal object PipelineShaders {
         void main() {
             ivec2 o = ivec2(gl_GlobalInvocationID.xy);
             if (any(greaterThanEqual(o, textureSize(uLinear, 0) / 4))) return;
+            // The block's 16 samples in four gathers (x = (i0, j1), y = (i1, j1), z = (i1, j0),
+            // w = (i0, j0)) rather than 16 fetches, summed in the same (row) order as before.
+            vec2 texel = 1.0 / vec2(textureSize(uLinear, 0));
+            float v[16];
+            for (int gy = 0; gy < 2; gy++) for (int gx = 0; gx < 2; gx++) {
+                vec4 g = textureGather(uLinear, vec2(o * 4 + ivec2(gx * 2 + 1, gy * 2 + 1)) * texel);
+                int k = gy * 8 + gx * 2;
+                v[k] = g.w;
+                v[k + 1] = g.z;
+                v[k + 4] = g.x;
+                v[k + 5] = g.y;
+            }
             vec3 sum = vec3(0.0);
             for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
                 ivec2 p = o * 4 + ivec2(x, y);
-                float v = texelFetch(uLinear, p, 0).r;
+                float c = v[y * 4 + x];
                 ivec2 site = (p + uRedOffset) & 1;
-                if (site == ivec2(0, 0)) sum.r += v;
-                else if (site == ivec2(1, 1)) sum.b += v;
-                else sum.g += v;
+                if (site == ivec2(0, 0)) sum.r += c;
+                else if (site == ivec2(1, 1)) sum.b += c;
+                else sum.g += c;
             }
             imageStore(uOut, o, vec4(sum / vec3(4.0, 8.0, 4.0), 1.0));
         }
     """.trimIndent()
+
+    /** colourChange's halving steps over its 256 threads, each followed by a barrier. */
+    private val REDUCE = (7 downTo 0).joinToString("") { k ->
+        val h = 1 shl k
+        """
+            if (i < ${h}u) {
+                sSum[i] += sSum[i + ${h}u];
+                sScale[i] += sScale[i + ${h}u];
+            }
+            memoryBarrierShared();
+            barrier();"""
+    }
 
     /**
      * Colour NR's change test, per 8×8 and 16×16 sensor window (centred on every 4×4 block
@@ -276,8 +352,8 @@ internal object PipelineShaders {
         uniform int uSlot;        // this frame's motion counter
         uniform ivec2 uRawSize;
 
-        shared uint groupSum;
-        shared uint groupScale;
+        shared uint sSum[256];
+        shared uint sScale[256];
 
         /** z² of a window's colour change; [v]: the variance of its R, G, B means. */
         float chromaZ2(vec3 now, vec3 model, vec3 v) {
@@ -304,11 +380,8 @@ internal object PipelineShaders {
         void main() {
             ivec2 b = ivec2(gl_GlobalInvocationID.xy);
             ivec2 n = textureSize(uBlocks, 0);
-            if (gl_LocalInvocationIndex == 0u) {
-                groupSum = 0u;
-                groupScale = 0u;
-            }
-            barrier();
+            uint sum = 0u;     // this window's share of the frame-wide sums
+            uint scale = 0u;
             if (all(lessThan(b, n))) {
                 // Windows centred on the block corner at 4b: 8×8 = the 2×2 blocks around it,
                 // 16×16 = the 4×4 around it.
@@ -355,14 +428,23 @@ internal object PipelineShaders {
                 imageStore(uModel16Out, b, vec4(mix(now16, m16.rgb, 0.8 * keep16), scale16));
                 imageStore(uKeepOut, b, vec4(min(keep8, keep16), 0.0, 0.0, 1.0));
                 if (!uFresh) {
-                    atomicAdd(groupSum, uint(min(z8, 25.0) * 16.0));
-                    atomicAdd(groupScale, uint(min(scale8, 20.0) * 16.0));
+                    sum = uint(min(z8, 25.0) * 16.0);
+                    scale = uint(min(scale8, 20.0) * 16.0);
                 }
             }
-            barrier();
-            if (gl_LocalInvocationIndex == 0u) {
-                atomicAdd(motion[uSlot], groupSum);
-                atomicAdd(motion[2 + uSlot], groupScale);
+            // The work group's sums by halving (integers: the same in any order), then one atomic
+            // per group. Every thread adding to one shared counter serialised 256 atomics per
+            // group on each; with coarseColour's gathers the change test went 5.4 → 4.5 ms in the
+            // X14's idle preview (pipetiming, 2026-10-21). (GLSL ES allows barrier() only directly
+            // in main, so it's unrolled.)
+            uint i = gl_LocalInvocationIndex;
+            sSum[i] = sum;
+            sScale[i] = scale;
+            memoryBarrierShared();
+            barrier();$REDUCE
+            if (i == 0u) {
+                atomicAdd(motion[uSlot], sSum[0]);
+                atomicAdd(motion[2 + uSlot], sScale[0]);
             }
         }
     """.trimIndent()

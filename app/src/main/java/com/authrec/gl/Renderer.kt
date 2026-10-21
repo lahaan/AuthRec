@@ -237,7 +237,7 @@ class Renderer(
     private fun logStages() {
         if (!pipeTiming || ++stageFrames < 60) return
         val t = developTarget()
-        android.util.Log.i("AuthRec", "pipeline %s%s%s: CPU reads %.1f, upload %.1f, prep %.1f, develop %.1f, encode %.1f ms".format(
+        android.util.Log.i("AuthRec", "pipeline %s%s%s: CPU reads %.1f, upload %.1f, prep %.1f, change test %.1f, develop %.1f, encode %.1f ms".format(
             when (t.program) {
                 superpixelProgram, fastSuperpixelProgram -> "superpixel"
                 scaledProgram, fastScaledProgram -> "scaled ${t.width}x${t.height}"
@@ -245,7 +245,7 @@ class Renderer(
             } + if (nrFast) " (fast NR)" else "",
             if (recording != null) " recording" else "",
             if (activeCleanup() >= 2) " colour NR" else "",
-            *stageNs.filterIndexed { i, _ -> i != 4 }.map { it / 60 / 1e6 }.toTypedArray()))
+            *intArrayOf(0, 1, 2, 4, 3, 5).map { stageNs[it] / 60 / 1e6 }.toTypedArray()))
         stageNs.fill(0)
         stageFrames = 0
     }
@@ -327,6 +327,7 @@ class Renderer(
     private var lutSize = 0
     private var shadingDims = 0 to 0
     private var prepProgram = 0
+    private var prepFixProgram = 0
     private var developProgram = 0
     private var coarseProgram = 0
     private var changeProgram = 0
@@ -573,6 +574,7 @@ class Renderer(
             }
         }
         prepProgram = Gl.computeProgram(PipelineShaders.prep)
+        prepFixProgram = Gl.computeProgram(PipelineShaders.prepFixDefects)
         developProgram = Gl.computeProgram(PipelineShaders.develop)
         coarseProgram = Gl.computeProgram(PipelineShaders.coarseColour)
         changeProgram = Gl.computeProgram(PipelineShaders.colourChange)
@@ -1042,27 +1044,28 @@ class Renderer(
             updateShading(meta.shading)
         }
 
-        val groupsX = (w + 15) / 16
-        val groupsY = (h + 15) / 16
-        val sp = activeSuperpixel()
-
-        // Pass 1: normalise RAW.
-        GLES30.glUseProgram(prepProgram)
-        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, rawTex)
-        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, shadingTex)
-        GLES31.glBindImageTexture(0, linearTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
-        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uBlack"), 1, meta?.blackLevel ?: floatArrayOf(0f, 0f, 0f, 0f), 0)
-        GLES30.glUniform1f(Gl.uniform(prepProgram, "uWhite"), meta?.whiteLevel ?: 1023f)
         val shift = wbShift
         val wb = meta?.wbGains ?: floatArrayOf(1f, 1f, 1f, 1f)
         val prepWb = FloatArray(4) { wb[it] * shift[it] }
-        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uWb"), 1, prepWb, 0)
-        GLES30.glUniform2i(Gl.uniform(prepProgram, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
-        GLES30.glUniform1i(Gl.uniform(prepProgram, "uFixDefects"), if (activeCleanup() >= 1) 1 else 0)
-        GLES31.glDispatchCompute(groupsX, groupsY, 1)
+
+        // Pass 1: normalise RAW: with the pixel fix one thread per 2×2 quad, without one per pixel
+        // (see PipelineShaders.prepFixDefects).
+        val fix = activeCleanup() >= 1
+        val prep = if (fix) prepFixProgram else prepProgram
+        GLES30.glUseProgram(prep)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, rawTex)
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, shadingTex)
+        GLES31.glBindImageTexture(0, linearTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
+        GLES30.glUniform4fv(Gl.uniform(prep, "uBlack"), 1, meta?.blackLevel ?: floatArrayOf(0f, 0f, 0f, 0f), 0)
+        GLES30.glUniform1f(Gl.uniform(prep, "uWhite"), meta?.whiteLevel ?: 1023f)
+        GLES30.glUniform4fv(Gl.uniform(prep, "uWb"), 1, prepWb, 0)
+        GLES30.glUniform2i(Gl.uniform(prep, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
+        if (fix) GLES31.glDispatchCompute((w / 2 + 15) / 16, (h / 2 + 15) / 16, 1)
+        else GLES31.glDispatchCompute((w + 15) / 16, (h + 15) / 16, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
-        if (activeCleanup() >= 2) updateColourChange(prepWb, meta)
         stage(2)
+        if (activeCleanup() >= 2) updateColourChange(prepWb, meta)
+        stage(4)
 
         // Pass 2: demosaic, colour noise reduction, colour, log, the view (and the clean log).
         val p = profile
@@ -1328,10 +1331,12 @@ class Renderer(
         // The glass's offscreen passes go first so the window's render pass stays in one piece.
         glass?.let {
             it.timing = glassTiming
-            // While recording, a fresh blur twice a second is plenty behind the controls, and every
-            // millisecond of a viewfinder frame then comes out of the encoder's budget.
+            // Only frosted panels and the darkening over bright scenes use the blur (clear glass
+            // shows the image itself), so it needn't be fresh every frame: every other frame
+            // between recordings (half of its ~1 ms), twice a second while recording, where every
+            // millisecond of a viewfinder frame comes out of the encoder's budget.
             val now = SystemClock.elapsedRealtimeNanos()
-            val refresh = recording == null || now - lastGlassNs >= GLASS_REFRESH_RECORDING_NS
+            val refresh = now - lastGlassNs >= if (recording == null) GLASS_REFRESH_IDLE_NS else GLASS_REFRESH_RECORDING_NS
             if (refresh) lastGlassNs = now
             it.prepare(tex, target.width, target.height, rotation, mirror, letterbox, viewW, viewH, frameCrop, refresh = refresh)
         }
@@ -1569,7 +1574,8 @@ class Renderer(
         private const val BUDGET_SKIP = 10
         /** While recording and behind, the preview is still drawn this often (~10 fps). */
         private const val VIEW_INTERVAL_NS = 100_000_000L
-        /** While recording, the glass's blur of the preview is refreshed at most this often. */
+        /** The glass's blur of the preview is refreshed at most this often: between recordings (every 2nd frame at 24–30 fps) and while recording. */
+        private const val GLASS_REFRESH_IDLE_NS = 50_000_000L
         private const val GLASS_REFRESH_RECORDING_NS = 500_000_000L
         /** Frames taken from the reader at most (it has 6; the camera needs some). */
         private const val MAX_PENDING = 4
