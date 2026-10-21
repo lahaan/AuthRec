@@ -193,6 +193,11 @@ class Renderer(
     @Volatile var previewFullRes: Boolean = false
     /** 0 off, 1 fix defect pixels, 2 + temporal colour NR, 3 + stronger temporal colour NR. */
     @Volatile var cleanup: Int = 2
+    /**
+     * Colour NR's Fast variant (PipelineShaders.fastNr: per pixel, ~0.5.0's cost) instead of
+     * Quality (the neighbourhood clamp, ~7 ms more per 4K frame on the X14).
+     */
+    @Volatile var nrFast: Boolean = false
 
     /**
      * Called (on the GL thread) when colour NR is switched off for the current recording because
@@ -233,7 +238,11 @@ class Renderer(
         if (!pipeTiming || ++stageFrames < 60) return
         val t = developTarget()
         android.util.Log.i("AuthRec", "pipeline %s%s%s: CPU reads %.1f, upload %.1f, prep %.1f, develop %.1f, encode %.1f ms".format(
-            when (t.program) { superpixelProgram -> "superpixel"; scaledProgram -> "scaled ${t.width}x${t.height}"; else -> "full size" },
+            when (t.program) {
+                superpixelProgram, fastSuperpixelProgram -> "superpixel"
+                scaledProgram, fastScaledProgram -> "scaled ${t.width}x${t.height}"
+                else -> "full size"
+            } + if (nrFast) " (fast NR)" else "",
             if (recording != null) " recording" else "",
             if (activeCleanup() >= 2) " colour NR" else "",
             *stageNs.filterIndexed { i, _ -> i != 4 }.map { it / 60 / 1e6 }.toTypedArray()))
@@ -288,11 +297,24 @@ class Renderer(
     /** Where the develop pass writes this frame, and with which program. */
     private class DevelopTarget(val program: Int, val view: Int, val log: Int, val width: Int, val height: Int)
 
-    private fun developTarget(): DevelopTarget = when {
-        activeSuperpixel() -> DevelopTarget(superpixelProgram, spViewTex, spLogTex, w / 2, h / 2)
-        recording?.scaled == true && scViewTex != 0 -> DevelopTarget(scaledProgram, scViewTex, scLogTex, scW, scH)
-        else -> DevelopTarget(developProgram, viewTex, logTex, w, h)
+    private fun developTarget(): DevelopTarget {
+        val fast = nrFast
+        if (fast && fastDevelopProgram == 0) {
+            // Compiled when first chosen: three more large shaders at every renderer start for a
+            // setting most leave alone would slow lens switches.
+            fastDevelopProgram = Gl.computeProgram(PipelineShaders.developFast)
+            fastSuperpixelProgram = Gl.computeProgram(PipelineShaders.developSuperpixelFast)
+            fastScaledProgram = Gl.computeProgram(PipelineShaders.developScaledFast)
+        }
+        return when {
+            activeSuperpixel() -> DevelopTarget(if (fast) fastSuperpixelProgram else superpixelProgram, spViewTex, spLogTex, w / 2, h / 2)
+            recording?.scaled == true && scViewTex != 0 -> DevelopTarget(if (fast) fastScaledProgram else scaledProgram, scViewTex, scLogTex, scW, scH)
+            else -> DevelopTarget(if (fast) fastDevelopProgram else developProgram, viewTex, logTex, w, h)
+        }
     }
+    private var fastDevelopProgram = 0
+    private var fastSuperpixelProgram = 0
+    private var fastScaledProgram = 0
 
     private fun releaseScaled() {
         if (scViewTex == 0) return
@@ -367,10 +389,13 @@ class Renderer(
         var clipFrames = 0
         var viewFrames = 0
         var clipMs = 0.0
+        /** Frames this thread let go undeveloped to keep the camera supplied (see fillPending). */
+        var skipped = 0
 
         /** One line for the event log: when frames were lost and what the GL thread was doing. */
         fun timingSummary() = "Recording timing: $dropped frames lost" +
             (if (gaps.isNotEmpty()) " (at$gaps)" else "") +
+            (if (skipped > 0) ", $skipped skipped here to keep the camera supplied" else "") +
             ", average frame %.1f ms, slowest frame %.0f ms at %.2f s, slowest encoder hand-over %.0f ms, slowest pre-roll frame %.0f ms (%d lost), preview showed %d of %d frames"
                 .format(if (clipFrames > 0) clipMs / clipFrames else 0.0, slowestFrameMs, slowestFrameAt, slowestSwapMs, prerollSlowestMs, prerollLost, viewFrames, clipFrames)
     }
@@ -578,7 +603,7 @@ class Renderer(
         var processed = 0
         var behind = false
         val rec = recording
-        fillPending()
+        fillPending(rec)
         if (rec != null) {
             // Every frame goes to the encoder, oldest first, but for at most PASS_BUDGET_NS per pass:
             // an encoder that can't keep up (Xiaomi 12 choking on 4096×3072: ~250 ms a frame) kept
@@ -595,6 +620,7 @@ class Renderer(
                 val f0 = SystemClock.elapsedRealtimeNanos()
                 val ts = image.timestamp
                 meta = processFrame(image)
+                if (debugSlowFrameMs > 0) SystemClock.sleep(debugSlowFrameMs.toLong())
                 processed++
                 val ms = (SystemClock.elapsedRealtimeNanos() - f0) / 1e6
                 watchBudget(rec, ms)
@@ -611,7 +637,7 @@ class Renderer(
                 // Only when caught up, a warm X14 at 4K (frames ~33 ms) drew 6 of 439 frames, "view
                 // 0 fps" (owner: "choppy as hell"); drawing it costs a hot phone the odd frame, and
                 // losing frames sheds colour NR (watchBudget), which gives the time back.
-                fillPending()
+                fillPending(rec)
                 val caughtUp = pending.firstOrNull()?.let { !readyToDevelop(it, rec.frameNs) } ?: true
                 if (caughtUp || SystemClock.elapsedRealtimeNanos() - lastViewNs >= VIEW_INTERVAL_NS) drawView(rec)
             }
@@ -655,9 +681,27 @@ class Renderer(
      */
     private val pending = ArrayDeque<Image>()
 
-    /** Takes what the reader has, leaving room in it for the camera. */
-    private fun fillPending() {
-        while (pending.size < MAX_PENDING) pending.addLast(acquireNext() ?: return)
+    /**
+     * Takes what the reader has, leaving room in it for the camera. While recording ([rec]) a
+     * backlog beyond [MAX_PENDING] frames lets the oldest go: left waiting in the reader, they
+     * used up the camera's buffers when a hot phone fell behind (X14 at 45 °C: 4K frames took
+     * 43–58 ms), so the camera failed captures instead, and the 0.6x's HAL stopped delivering
+     * altogether ("no frames for 2.5 s" ended the clip; feedback item 83). Those frames were lost
+     * either way; this way the camera keeps running. Recordings take frames oldest first, so the
+     * preview (which shows the newest) never builds a backlog.
+     */
+    private fun fillPending(rec: Recording? = null) {
+        while (true) {
+            if (pending.size < MAX_PENDING) {
+                pending.addLast(acquireNext() ?: return)
+                continue
+            }
+            if (rec == null) return
+            val next = acquireNext() ?: return
+            pending.removeFirst().close()
+            if (!rec.preroll) rec.skipped++
+            pending.addLast(next)
+        }
     }
 
     /**
@@ -1032,14 +1076,15 @@ class Renderer(
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, linearTex)
         GLES31.glBindImageTexture(0, target.view, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
         GLES31.glBindImageTexture(1, target.log, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
-        if (prog == scaledProgram) GLES30.glUniform2f(Gl.uniform(prog, "uRawPerOut"), w.toFloat() / outW, h.toFloat() / outH)
+        if (prog == scaledProgram || prog == fastScaledProgram) GLES30.glUniform2f(Gl.uniform(prog, "uRawPerOut"), w.toFloat() / outW, h.toFloat() / outH)
         setViewUniforms(prog, p)
         setColourNr(prog, meta, outW, outH, p)
         GLES30.glUniform2i(Gl.uniform(prog, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
         GLES30.glUniformMatrix3fv(Gl.uniform(prog, "uCamToTarget"), 1, false, ColorMath.toGlColumnMajor(camToTarget), 0)
         GLES30.glUniform1f(Gl.uniform(prog, "uExposure"), currentGain())
         GLES30.glUniform1i(Gl.uniform(prog, "uCurve"), p.shaderId)
-        GLES31.glDispatchCompute((outW + 15) / 16, (outH + 15) / 16, 1)
+        val g = PipelineShaders.DEVELOP_GROUP
+        GLES31.glDispatchCompute((outW + g - 1) / g, (outH + g - 1) / g, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
         stage(3)
         if (activeCleanup() >= 2) logColourNrMotion()
@@ -1185,17 +1230,23 @@ class Renderer(
 
     /** History images for a develop output of [outW]×[outH] (new ones start over). */
     private fun ensureHistory(outW: Int, outH: Int) {
-        if (historyW == outW && historyH == outH) return
+        val fast = nrFast
+        if (historyW == outW && historyH == outH && historyFast == fast) return
         if (historyW != 0) {
             GLES30.glDeleteTextures(2, history, 0)
             historyW = 0
         }
-        // Sampled bilinearly: the colour between quads comes out smooth, like a 4:2:0 decode.
-        for (i in 0..1) history[i] = Gl.texture2D(GLES30.GL_RGBA16F, (outW + 1) / 2, (outH + 1) / 2, linear = true)
+        // Quality: one colour per 2×2 quad, sampled bilinearly (the colour between quads comes out
+        // smooth, like a 4:2:0 decode). Fast: one per pixel, its own layout, read as 2×2 means
+        // (see PipelineShaders.fastNr).
+        val (hw, hh) = if (fast) outW to outH else (outW + 1) / 2 to (outH + 1) / 2
+        for (i in 0..1) history[i] = Gl.texture2D(GLES30.GL_RGBA16F, hw, hh, linear = true)
         historyW = outW
         historyH = outH
+        historyFast = fast
         historyFresh = true
     }
+    private var historyFast = false
 
     /** For a lens that doesn't report SENSOR_NOISE_PROFILE: roughly the X14 main camera's, by ISO. */
     private fun fallbackNoise(iso: Int): Pair<Float, Float> = (iso * 6.6e-7f) to (iso * iso * 1.2e-12f)
@@ -1522,6 +1573,8 @@ class Renderer(
         private const val GLASS_REFRESH_RECORDING_NS = 500_000_000L
         /** Frames taken from the reader at most (it has 6; the camera needs some). */
         private const val MAX_PENDING = 4
+        /** Debug (adb slowframe=ms): each recorded frame holds this thread that much longer, as a hot phone's GPU would. */
+        @Volatile var debugSlowFrameMs = 0
         /** For the preview's waiting rule (recordings use their own frame rate). */
         private const val PREVIEW_FRAME_NS = 33_333_333L
         /** Time spent on recorded frames before the GL thread looks at its other work again. */

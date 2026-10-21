@@ -524,6 +524,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         choice("Record", true, listOf("Look" to true, "Log" to false), { a.bakeLut }) { a.setBake(it) }
         choice("Log profile", true, LogProfile.entries.map { it.label to it }, { a.profile }) { a.setProfile(it) }
         choice("Clean-up", true, listOf("Off" to 0, "Pixels" to 1, "+ Colour" to 2, "+ Colour+" to 3), { a.cleanup }) { a.setCleanup(it) }
+        // Quality: the history checked against each pixel's neighbours (best against trails, the
+        // GPU's heaviest pass gets ~7 ms more at 4K); Fast: against the pixel's own noise.
+        choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }) { a.setNrFast(it) }
         choice("Audio", false, listOf("On" to true, "Off" to false), { a.audioOn }) { if (it != a.audioOn) a.toggleAudio() }
         choice("Layout", false, listOf("Glass" to false, "Classic" to true), { a.classicUi }) { a.setClassicUi(it) }
         fun buttons(pro: Boolean, vararg items: Pair<String, () -> Unit>) {

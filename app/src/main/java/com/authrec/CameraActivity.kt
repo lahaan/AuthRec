@@ -110,6 +110,9 @@ class CameraActivity : Activity() {
     /** See [Renderer.cleanup]. */
     internal var cleanup = 2
         private set
+    /** Colour NR's Fast variant instead of Quality (Settings → Colour NR; see Renderer.nrFast). */
+    internal var nrFast = false
+        private set
     /**
      * eDR (extended dynamic range of the view; not HDR): a tone curve that pulls the highlights
      * down and lifts the shadows before the look/LUT (see [Renderer.toneHighlights]). Xiaomi's AE
@@ -298,6 +301,7 @@ class CameraActivity : Activity() {
         bitrateMbps = prefs.getInt("bitrate", 150)
         bakeLut = prefs.getBoolean("recordLook", true)
         cleanup = prefs.getInt("cleanup", 2)
+        nrFast = prefs.getBoolean("nrFast", false)
         if (prefs.contains("edrOn")) {
             edrOn = prefs.getBoolean("edrOn", false)
             edrHighlights = prefs.getInt("edrHi", EDR_HIGHLIGHTS)
@@ -339,6 +343,7 @@ class CameraActivity : Activity() {
             .putInt("bitrate", bitrateMbps)
             .putBoolean("recordLook", bakeLut)
             .putInt("cleanup", cleanup)
+            .putBoolean("nrFast", nrFast)
             .putBoolean("edrOn", edrOn)
             .putInt("edrHi", edrHighlights)
             .putInt("edrLo", edrShadows)
@@ -712,6 +717,11 @@ class CameraActivity : Activity() {
     internal fun setCleanup(level: Int) {
         cleanup = level.coerceIn(0, 3)
         renderer?.cleanup = cleanup
+        settingsChanged()
+    }
+    internal fun setNrFast(on: Boolean) {
+        nrFast = on
+        renderer?.nrFast = on
         settingsChanged()
     }
     internal fun toggleAwbLock() = setCapture(capture.copy(awbLock = !capture.awbLock))
@@ -1605,6 +1615,7 @@ class CameraActivity : Activity() {
         r.profile = profile
         r.superpixel = superpixel
         r.cleanup = cleanup
+        r.nrFast = nrFast
         camera = cam
         renderer = r
         // After the swap: these write to the current renderer (exposure was lost on lens switches
@@ -2232,7 +2243,9 @@ class CameraActivity : Activity() {
      * open = settings | adjust | ae | iso | shutter | wb | fps | recordings (open that panel or
      * screen, for screenshots on phones that refuse injected taps),
      * recscale = 30..99 (`--ei`: record at that % of the size, to time the scaled develop path; 0 = off),
-     * nightiso = effective ISO where the night limit starts (`--ei`, until the next lens switch; 0 = off).
+     * slowframe = ms (`--ei`: each recorded frame takes that much longer, a hot phone's backlog; 0 = off),
+     * nightiso = effective ISO where the night limit starts (`--ei`, until the next lens switch; 0 = off),
+     * nrfast = true|false (`--ez`: colour NR's Fast variant instead of Quality).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -2288,6 +2301,7 @@ class CameraActivity : Activity() {
             cleanup = extras.getInt("clean").coerceIn(0, 3)
             renderer?.cleanup = cleanup
         }
+        if (extras.containsKey("nrfast")) setNrFast(extras.getBoolean("nrfast"))
         if (extras.containsKey("view")) {
             viewIndex = extras.getInt("view").coerceIn(0, views.lastIndex)
             applyView()
@@ -2335,6 +2349,7 @@ class CameraActivity : Activity() {
         extras.getString("aspect")?.let { v -> FrameAspect.entries.firstOrNull { it.label == v || it.name == v }?.let { setAspect(it) } }
         extras.getString("ui")?.let { setClassicUi(it == "classic") }
         if (extras.containsKey("recscale")) debugRecScale = extras.getInt("recscale")
+        if (extras.containsKey("slowframe")) Renderer.debugSlowFrameMs = extras.getInt("slowframe")
         extras.getString("open")?.let { name ->
             info.postDelayed({ if (name == "recordings") openRecordings() else ui.openForTest(name) }, 1200)
         }

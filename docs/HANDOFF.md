@@ -1,4 +1,4 @@
-# Handoff: state as of 0.7.0 (2026-10-21, GitHub pre-release v0.7.0)
+# Handoff: state as of 0.7.1 (2026-10-21, GitHub pre-release v0.7.1)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -104,6 +104,13 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
   verified unmirrored).
 
 ## Start here (next session)
+
+000. **0.7.1 (2026-10-21)**: feedback/notes.md items 82–83. Colour NR gets a Fast variant
+    (Settings → Colour NR; Quality stays the default): per-pixel trail clamp, no barriers, 4K
+    develop 14 vs 20 ms, idle preview GPU 50 vs 75 %, still-scene colour noise −56 vs −65 %;
+    owner to judge trails on moving scenes. A hot phone's backlog no longer starves the camera
+    (the 0.6x stopped recording at 45 °C): the renderer drops its oldest frames itself while
+    recording, verified with `slowframe=40`. Next: heat (item 81), the realme issues (item 79).
 
 00. **0.7.0 (2026-10-21)**: feedback/notes.md items 69–81. One GL context for preview and encoder
     (the Adreno crash, reproduced and verified gone), pause/resume, 4K AV1 Compress (memory cut

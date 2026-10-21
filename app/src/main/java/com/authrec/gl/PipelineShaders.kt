@@ -14,6 +14,13 @@ package com.authrec.gl
  */
 internal object PipelineShaders {
 
+    /**
+     * Work-group side of the develop pass. 8×8 (one Adreno wave, so its barriers cost nothing)
+     * left Quality colour NR as slow as 16×16 and made the pass without NR ~2.7 ms slower at 4K
+     * (X14, 2026-10-21): the NR's cost is the state held across its barriers, not the barriers.
+     */
+    const val DEVELOP_GROUP = 16
+
     val prep = """
         #version 310 es
         precision highp float;
@@ -387,7 +394,7 @@ internal object PipelineShaders {
         #version 310 es
         precision highp float;
         precision highp int;
-        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(local_size_x = $DEVELOP_GROUP, local_size_y = $DEVELOP_GROUP) in;
 
         layout(binding = 0) uniform highp sampler2D uLinear;     // r32f from the prep pass
         layout(binding = 2) uniform highp sampler2D uHistIn;     // previous frames: colour (rgb), smoothed brightness (a)
@@ -426,13 +433,20 @@ internal object PipelineShaders {
                 return 5.367655 * x + 0.092809;
             }
         }
-    """.trimIndent() + "\n" + viewCommon + """
-        // Colour NR works on each 16×16 work group in three steps (developA, B, C) with the
+    """.trimIndent() + "\n" + viewCommon
+
+    /**
+     * Quality colour NR (the default): see [developBase]'s notes; the history's colour is clamped
+     * to its 3×3 neighbourhood, which needs the work group's colours shared (barriers). At 4K it
+     * adds ~7 ms to the develop pass on the X14 (0.5.0's per-pixel NR: ~2 ms).
+     */
+    private val qualityNr = """
+        // Colour NR works on each work group (DEVELOP_GROUP²) in three steps (developA, B, C) with the
         // pixels' colours shared between them; every main() calls them with barriers in between
         // (GLSL ES allows barrier() only in main, outside any branch, before any return).
-        shared mediump vec4 sCur[256];   // the NR target's colour (rgb) and 3×3 brightness (a) per pixel
-        shared mediump vec4 sOut[256];   // its blended colour (rgb) and the history's weight (a)
-        shared float sValid[256];
+        shared mediump vec4 sCur[${DEVELOP_GROUP * DEVELOP_GROUP}];   // the NR target's colour (rgb) and 3×3 brightness (a) per pixel
+        shared mediump vec4 sOut[${DEVELOP_GROUP * DEVELOP_GROUP}];   // its blended colour (rgb) and the history's weight (a)
+        shared float sValid[${DEVELOP_GROUP * DEVELOP_GROUP}];
 
         ivec2 gP;
         bool gValid;
@@ -447,7 +461,7 @@ internal object PipelineShaders {
 
         int quadIndex(int x, int y) {
             ivec2 l = ivec2(gl_LocalInvocationID.xy) / 2 * 2;
-            return (l.y + y) * 16 + l.x + x;
+            return (l.y + y) * $DEVELOP_GROUP + l.x + x;
         }
 
         /** Step A: develop the pixel and share its colour. [rawUv]: where it is on the sensor (0..1). */
@@ -500,8 +514,8 @@ internal object PipelineShaders {
             float n = 0.0;
             for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
                 ivec2 q = l + ivec2(x, y);
-                if (q.x < 0 || q.y < 0 || q.x > 15 || q.y > 15) continue;
-                int j = q.y * 16 + q.x;
+                if (q.x < 0 || q.y < 0 || q.x >= $DEVELOP_GROUP || q.y >= $DEVELOP_GROUP) continue;
+                int j = q.y * $DEVELOP_GROUP + q.x;
                 if (sValid[j] < 0.5) continue;
                 vec3 c = sCur[j].rgb;
                 s1 += c;
@@ -555,6 +569,72 @@ internal object PipelineShaders {
         }
     """.trimIndent() + "\n"
 
+    /**
+     * Fast colour NR: the same temporal blend and motion tests, but every pixel alone, so no
+     * barriers and nothing held across them. Its history is full resolution (read as 2×2 means
+     * through the bilinear filter, so noise is averaged in space as well): colour in two
+     * channels (the third follows from the Rec.709 weights, as the colour sums to zero with
+     * them), the running 3×3 brightness, and the running variance of the pixel's colour about
+     * its history, learned where nothing moved. The trail guard clamps the history's colour to
+     * the current one ± 2 σ of that variance (Quality uses the 3×3 neighbours' spread instead):
+     * an old colour that this pixel's own noise can't explain doesn't linger. Variance grows only
+     * 1 % a frame while the clamp is engaged, so a trail can't teach it to look like noise; it
+     * starts wide (no clamping until learned, ~1 s) so NR works from the first frame.
+     */
+    private val fastNr = """
+        const vec3 W709 = vec3(0.2126, 0.7152, 0.0722);
+
+        void developA(ivec2 p, vec3 cam, float smoothed, vec2 rawUv, bool valid) {
+            if (!valid) return;
+            vec3 lin = uCamToTarget * cam * uExposure;
+            vec3 logc = vec3(encodeLog(lin.r), encodeLog(lin.g), encodeLog(lin.b));
+            vec3 t = uTnrOnLog ? logc : viewOf(logc);
+            if (uTnr != 0) {
+                float luma = dot(t, W709);
+                vec2 cur = vec2(t.r - luma, t.b - luma);
+                vec2 col = cur;
+                float bright = smoothed;
+                float var = 0.01; // starting over: wide, so nothing is clamped until learned
+                if (uTnr == 1) {
+                    // Read at a pixel corner through the bilinear filter: the mean of 2×2 history
+                    // pixels, the corner alternating each frame so the history doesn't drift.
+                    // Colour noise is then averaged in space too (Quality's half-res history does
+                    // the same); the clamp below keeps edges from bleeding.
+                    vec4 h = texture(uHistIn, (vec2(p) + float(uSlot)) / vec2(textureSize(uHistIn, 0)));
+                    // How far the 3×3 brightness moved from its running average, in units of one
+                    // sample's noise (that difference has ~0.4 of it).
+                    float sigma = sqrt(max(smoothed, 0.0) * uNoise.x + uNoise.y);
+                    float moved = abs(smoothed - h.b) / max(sigma, 1e-7);
+                    float windowKeep = texture(uChange, rawUv + 2.0 / vec2(textureSize(uLinear, 0))).r;
+                    float excess = float(motion[uSlot]) / (16.0 * uWindows) - 2.0;
+                    float alpha = uTnrAlpha * (1.0 - 0.7 * smoothstep(1.0, 3.0, excess));
+                    float keep = (1.0 - smoothstep(1.0, 2.0, moved)) * windowKeep;
+                    vec2 d = cur - h.rg;
+                    float len = length(d);
+                    float lim = 2.0 * sqrt(h.a + 1e-7);
+                    vec2 hc = len > lim ? cur - d * (lim / len) : h.rg;
+                    float blend = alpha * keep;
+                    col = mix(cur, hc, blend);
+                    bright = mix(smoothed, h.b, blend);
+                    var = len > lim ? min(h.a * 1.01, 1.0) : (keep > 0.5 ? mix(len * len, h.a, 0.9) : h.a);
+                }
+                imageStore(uHistOut, p, vec4(col, bright, var));
+                float g = -(W709.r * col.x + W709.b * col.y) / W709.g;
+                t = vec3(luma) + vec3(col.x, g, col.y);
+            }
+            if (uTnrOnLog) {
+                if (uWriteLog) imageStore(uOutLog, p, vec4(t, 1.0));
+                imageStore(uOutView, p, vec4(viewOf(t), 1.0));
+            } else {
+                if (uWriteLog) imageStore(uOutLog, p, vec4(logc, 1.0));
+                imageStore(uOutView, p, vec4(t, 1.0));
+            }
+        }
+    """.trimIndent() + "\n"
+
+    /** Where a main() runs the NR steps after [developA]; Quality fills in [DEVELOP_STEPS], Fast nothing. */
+    private const val STEPS = "/*STEPS*/"
+
     /** The three steps of [developBase] around a main()'s own sampling; GLSL needs them in main itself. */
     private const val DEVELOP_STEPS = """
             memoryBarrierShared();
@@ -604,7 +684,7 @@ internal object PipelineShaders {
             ivec2 size = textureSize(uLinear, 0);
             bool valid = p.x < size.x && p.y < size.y;
             vec4 m = mhcAt(p); // clamped reads: harmless outside the image
-            developA(p, m.rgb, m.a, (vec2(p) + 0.5) / vec2(size), valid);$DEVELOP_STEPS
+            developA(p, m.rgb, m.a, (vec2(p) + 0.5) / vec2(size), valid);$STEPS
         }
     """.trimIndent()
 
@@ -672,7 +752,7 @@ internal object PipelineShaders {
             vec3 cam = vec3(latticeAt(p, c, 0), green, latticeAt(p, c, 1));
             // The 2×2 mean around the position: a quiet brightness for colour NR's motion test.
             float smoothed = 0.25 * (at(1, 1) + at(2, 1) + at(1, 2) + at(2, 2));
-            developA(o, cam, smoothed, (c + 0.5) / vec2(textureSize(uLinear, 0)), valid);$DEVELOP_STEPS
+            developA(o, cam, smoothed, (c + 0.5) / vec2(textureSize(uLinear, 0)), valid);$STEPS
         }
     """.trimIndent()
 
@@ -688,13 +768,20 @@ internal object PipelineShaders {
                 px(base + uRedOffset),
                 0.5 * (px(base + ivec2(1 - uRedOffset.x, uRedOffset.y)) + px(base + ivec2(uRedOffset.x, 1 - uRedOffset.y))),
                 px(base + ivec2(1) - uRedOffset));
-            developA(o, cam, 0.25 * (cam.r + 2.0 * cam.g + cam.b), (vec2(base) + 1.0) / vec2(size * 2), valid);$DEVELOP_STEPS
+            developA(o, cam, 0.25 * (cam.r + 2.0 * cam.g + cam.b), (vec2(base) + 1.0) / vec2(size * 2), valid);$STEPS
         }
     """.trimIndent()
 
-    val develop = developBase + demosaicMain
-    val developSuperpixel = developBase + superpixelMain
-    val developScaled = developBase + scaledMain
+    private fun variant(fast: Boolean, main: String) =
+        developBase + (if (fast) fastNr else qualityNr) + main.replace(STEPS, if (fast) "" else DEVELOP_STEPS)
+
+    val develop = variant(false, demosaicMain)
+    val developSuperpixel = variant(false, superpixelMain)
+    val developScaled = variant(false, scaledMain)
+    // Fast colour NR (Settings → Colour NR → Fast), compiled when first chosen.
+    val developFast get() = variant(true, demosaicMain)
+    val developSuperpixelFast get() = variant(true, superpixelMain)
+    val developScaledFast get() = variant(true, scaledMain)
 
     val displayVertex = """
         #version 300 es

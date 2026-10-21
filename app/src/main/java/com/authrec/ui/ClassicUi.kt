@@ -44,6 +44,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val audioButton = kit.button("") { a.toggleAudio() }
     private val bakeButton = kit.button("") { a.setBake(!a.bakeLut) }
     private val cleanButton = kit.button("") { a.cycleCleanup() }
+    /** Colour NR's variant (Quality / Fast), shown while colour NR is on. */
+    private val nrButton = kit.button("") { a.setNrFast(!a.nrFast) }
     private val prioGear = kit.button("⚙") { a.togglePriorityPanel() }
     private val aeButton = kit.button("") { a.cycleAe() }.apply {
         // Long-press in Priority mode opens the limits.
@@ -82,7 +84,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         addView(fpsButton)
         addView(resetButton)
     }
-    private val proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, exposureBar,
+    private val proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, nrButton, exposureBar,
         aspectButton)
     private val lockedWhileRecording = listOf(profileButton, fpsButton, codecButton, bitrateButton, resButton, audioButton, bakeButton,
         importButton, modeSwitch, lensButton, settingsButton, aspectButton, mirrorButton)
@@ -96,7 +98,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
         }
         val left = column(profileButton, viewButton, importButton, adjustButton, edrButton)
-        val right = column(recButton, pauseButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton)
+        val right = column(recButton, pauseButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton, nrButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = a.exposureSlider.layoutParams as FrameLayout.LayoutParams
             val margin = v.width + 48 + 12
@@ -234,6 +236,10 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         edrButton.isEnabled = a.edrAvailable()
         bakeButton.text = if (a.bakeLut) "Record: Look" else "Record: Log"
         cleanButton.text = a.cleanupLabel()
+        nrButton.text = if (a.nrFast) "NR: Fast" else "NR: Quality"
+        // Hidden while recording: Pause takes a row in this column then (and a switch mid-clip
+        // would restart the NR's history).
+        if (!a.simple) nrButton.visibility = if (a.cleanup >= 2 && !recording) View.VISIBLE else View.GONE
 
         aeButton.text = a.aeLabel()
         afButton.text = a.afLabel()
