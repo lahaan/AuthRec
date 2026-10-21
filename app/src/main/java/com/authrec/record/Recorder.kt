@@ -233,6 +233,29 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
     }
 
     /**
+     * The clip's pauses (see [pause]): the renderer and the audio drop what falls inside one and
+     * move what comes after back by the time paused, so the file plays on without a gap.
+     */
+    val pauses = PauseTimeline()
+
+    /** Now, on the clock the camera's frames (and the audio) are timestamped with. */
+    private fun clockNs() = if (config.timestampsAreBoottime) SystemClock.elapsedRealtimeNanos() else System.nanoTime()
+
+    /**
+     * Pauses the clip: what the camera and the mic capture from now on isn't recorded until
+     * [resume]. The encoder keeps running (no new start-up, no warm-up), it just gets nothing.
+     */
+    fun pause() = pauses.pause(clockNs())
+
+    /** Records again; the first frame after the pause is a key frame (handy for cutting there). */
+    fun resume() {
+        pauses.resume(clockNs())
+        handler.post {
+            if (!finished) runCatching { videoCodec.setParameters(android.os.Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
+        }
+    }
+
+    /**
      * Ends the pre-roll: the clip starts at the first key frame from the frame with sensor time
      * [timestampNs] on (one is requested now). Called from the GL thread before that frame is drawn.
      */
@@ -474,10 +497,11 @@ class Recorder(context: Context, val config: RecordConfig, val width: Int, val h
                         }
                         framesRead += n / bytesPerFrame
                         val first = firstVideoNs
-                        if (first >= 0 && startNs >= first) {
+                        val paused = if (first >= 0 && startNs >= first) pauses.shift(startNs) else null
+                        if (paused != null) {
                             // The two clocks above can disagree by a chunk: never step back in
                             // time (the muxer stops a track whose timestamps go backwards).
-                            val ptsUs = maxOf((startNs - first) / 1000, nextUs)
+                            val ptsUs = maxOf((startNs - first - paused) / 1000, nextUs)
                             if (queue(chunk, n, ptsUs, 0)) nextUs = ptsUs + (n / bytesPerFrame) * 1_000_000L / sampleRate
                         }
                     }
@@ -674,3 +698,44 @@ internal object Nal {
         return key
     }
 }
+
+/**
+ * A recording's pauses on the camera's clock (ns): when each began and ended. Written from the
+ * UI thread, read by the GL thread (video) and the audio thread, so both drop the same span and
+ * shift what follows by the same amount: sound stays in sync with the picture.
+ */
+class PauseTimeline {
+    private val starts = ArrayList<Long>()
+    private val ends = ArrayList<Long>()
+
+    @Volatile var paused = false
+        private set
+
+    @Synchronized fun pause(atNs: Long) {
+        if (paused) return
+        starts += atNs
+        paused = true
+    }
+
+    @Synchronized fun resume(atNs: Long) {
+        if (!paused) return
+        ends += maxOf(atNs, starts.last())
+        paused = false
+    }
+
+    /** null while [ns] falls inside a pause (drop it), else the time paused before it (subtract it). */
+    @Synchronized fun shift(ns: Long): Long? {
+        var total = 0L
+        for (i in starts.indices) {
+            if (ns < starts[i]) break
+            val end = ends.getOrNull(i) ?: return null
+            if (ns < end) return null
+            total += end - starts[i]
+        }
+        return total
+    }
+
+    /** How many pauses so far. */
+    @Synchronized fun count() = starts.size
+}
+

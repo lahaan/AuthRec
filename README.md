@@ -1,68 +1,51 @@
 # AuthRec
 
-Android camera app that records log video straight from the sensor's RAW stream, with real-time
-LUTs. The phone's ISP only supplies metering (exposure, white balance, colour matrix, lens
-shading); demosaicing, colour, log encoding and LUTs all run on the GPU.
+![AuthRec: cinematography made easier](docs/banner.webp)
 
-- Open gate 4096×3072 (or 2048×1536 superpixel) from 14-bit RAW
-- Apple Log / S-Log3 / LogC3, HEVC 10-bit / HEVC 8-bit / H.264, up to 150 Mbps, AAC audio
-- Live 3D LUTs (tetrahedral), built-in film-style looks, look editor (with a colour mixer) that exports `.cube`
-- eDR: pulls blown highlights back and lifts shadows in the view (a curve to shape it in Pro)
-- Lens discovery (incl. lenses hidden from normal apps), native or contrast-detect AF, focus peaking
-- Tap to focus and follow a spot, long-press to lock focus, double-tap for automatic focus
-- AE: Auto / Priority (shutter & ISO limits) / Locked / Manual; optional colour noise reduction
-- Imported LUTs are fed the log format they were built for (e.g. an S-Log3 LUT while recording LogC3)
-- Warns when the phone gets hot and stops recording cleanly before the system would close the app
-- Simple mode (look, tap to focus, exposure, record) and Pro mode (drag dials for ISO and shutter)
-- Two layouts: Glass (default) and Classic (Settings → Layout)
+Android camera app that records **log video straight from the sensor's RAW stream**. The GPU
+does demosaic → colour → log → LUT in real time; the phone's ISP only meters (exposure, white
+balance, colour matrix, lens shading).
 
-Developed and tested on a Xiaomi 14 (Android 16 / HyperOS 3). Needs Android 12+ and a camera with
-RAW support. CameraAPI2 L3 access necessary & SoC w GPU powerful enough (ie 8gen2 & above preferred)
+## Features
 
-## Toknow
+- Open gate 4096×3072 (or 2K superpixel) from 14-bit RAW, 24/25/30 fps
+- Apple Log / S-Log3 / LogC3
+- HEVC 10-bit, HEVC 8-bit, H.264 ; up to 150 Mbps
+- 16:9, 2:1, 2.39:1 and vertical support
+- Live 3D LUTs and looks; look editor that exports `.cube`; LUT import available
+- eDR (extended dynamic range) - customizable highlight and shadow recovery
+- Temporal colour noise reduction with hot pixel fix
+- AE Auto / Priority / Locked / Manual, ISO and shutter
+- Tap to focus and follow, long-press to lock; native or contrast-detect AF; focus peaking
+- Pause / resume recording support
+- Finds lenses hidden from normal apps (ultrawide, telephoto where the phone allows)
+- Recordings screen with Compress (HEVC / H.264 / AV1 on the CPU, size-capped for grain)
+- Simple and Pro mode
 
-Currently EV, Exposure and AF is a bit iffy and needs work and so does the whole UI/UX. Right now in just alpha/poc stage. Unknown how well works on other devices.
+## Status
 
-## Installing (no computer needed)
+Alpha. Developed on a Xiaomi 14 (Android 16 / HyperOS 3); tested on a Xiaomi 15 Ultra, Xiaomi 12
+and realme GT Master Edition. Needs Android 12+, Camera2 RAW support (L3), and a strong GPU
+(Snapdragon 8 Gen 2 or stronger recommended). Notes: Causes heat relatively quickly due to intense load, and support for other SoC families such as MediaTek, Google Tensor is unconfirmed. 
 
-1. On the phone, download `AuthRec-<version>.apk`.
-2. Open it. Android will ask to allow installing apps from your browser or file manager: allow it.
-3. Xiaomi phones may show a security scan warning for apps not from the store: choose to install anyway.
-4. Open AuthRec, allow camera and microphone. The first launch spends a few seconds finding lenses.
+## Install
 
-### Sending a report
+1. Pre-release available at `AuthRec-<version>.apk` from [Releases](https://github.com/lahaan/AuthRec/releases) and open it.
 
-Tap **Settings** (bottom left) → **Send diagnostics…** and share the file through any chat app
-(Classic layout: the lens button, top right, → Send diagnostics…). It contains the phone model,
-what each camera reports, the lens scan and the app's log. For a problem in a recording, send the
-clip itself as a file too (chat apps that re-encode videos hide what went wrong).
 
-## Building
+**Reporting a problem:** Settings → **Send diagnostics…** and share the file (plus the clip itself,
+as a file, if a recording looks wrong).
 
-Open in Android Studio, or `./gradlew assembleDebug` (needs the Android NDK and CMake from the SDK
-manager, versions in `app/build.gradle.kts`; the first build compiles x265, x264 and SVT-AV1, a few minutes). Release builds are signed when a
-`keystore.properties` file (not in git) points at the signing key:
+## Build
 
-```
-storeFile=/path/to/authrec-release.jks
-storePassword=…
-keyAlias=authrec
-keyPassword=…
-```
-
-Useful adb hooks for testing are documented on `CameraActivity.handleCommands`.
+`./gradlew assembleDebug` (Android Studio's JDK; NDK and CMake from the SDK manager, versions in
+`app/build.gradle.kts`). The first build compiles x265, x264 and SVT-AV1 (a few minutes). Release
+builds are signed when a git-ignored `keystore.properties` sets `storeFile`, `storePassword`,
+`keyAlias` and `keyPassword`. adb test hooks: `CameraActivity.handleCommands`.
 
 ## Licence
 
-AuthRec is free software under the [GNU General Public License v3](LICENSE) (GPL-3.0). For
-compressing recordings it includes, in `app/src/main/cpp/third_party`:
-
-- [x265](https://x265.org) 4.2 (HEVC), GPL-2.0-or-later, © MulticoreWare, Inc. and contributors
-- [x264](https://www.videolan.org/developers/x264.html) (H.264, "stable" 2025-06-08), GPL-2.0-or-later,
-  © the x264 project / VideoLAN and contributors
-- [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.2.0 (AV1), BSD-3-Clause-Clear and the Alliance
-  for Open Media Patent License 1.0, © Alliance for Open Media
-
-Their licence texts ship in the app too (Settings → About & licences → Licence texts;
-`app/src/main/assets/licences`).
-
+[GPL-3.0](LICENSE). Bundled for Compress (`app/src/main/cpp/third_party`):
+[x265](https://x265.org) 4.2 and [x264](https://www.videolan.org/developers/x264.html) (GPL-2.0-or-later),
+[SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.2.0 (BSD-3-Clause-Clear + AOM patent licence).
+Their licence texts ship in the app (Settings → About & licences).

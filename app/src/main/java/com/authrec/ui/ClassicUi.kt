@@ -21,6 +21,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
 
     private val kit = a.kit
     private val recButton = kit.button("") { a.toggleRecording() }.apply { textSize = 16f }
+    /** Pause / resume, under REC while a clip records. */
+    private val pauseButton = kit.button("") { a.togglePause() }
     private val modeSwitch = kit.button("") { a.setSimple(!a.simple) }
     // The way back to Glass (and the lens tools) where it can be seen: this layout has no
     // settings sheet, and the same items in the lens menu went unnoticed.
@@ -94,7 +96,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
         }
         val left = column(profileButton, viewButton, importButton, adjustButton, edrButton)
-        val right = column(recButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton)
+        val right = column(recButton, pauseButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = a.exposureSlider.layoutParams as FrameLayout.LayoutParams
             val margin = v.width + 48 + 12
@@ -204,6 +206,9 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         }
         recButton.setTextColor(if (recording) Color.RED else Color.WHITE)
         recButton.isEnabled = !a.stopping
+        pauseButton.visibility = if (recording) View.VISIBLE else View.GONE
+        pauseButton.text = if (a.paused) "▶ Resume" else "❚❚ Pause"
+        pauseButton.isEnabled = !a.stopping
         lockedWhileRecording.forEach { it.isEnabled = !recording && !a.stopping && !a.warmingUp }
         proOnly.forEach { it.visibility = if (a.simple) View.GONE else View.VISIBLE }
         a.info.visibility = View.VISIBLE // Glass hides it behind its settings sheet

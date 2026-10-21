@@ -202,6 +202,39 @@ class CameraActivity : Activity() {
 
     /** A clip is being recorded (past the pre-roll that follows pressing REC, see [startRecording]). */
     internal val recording get() = recorder != null && !warmingUp
+    /** The clip is paused (see [togglePause]). */
+    internal val paused get() = recorder?.pauses?.paused == true
+    /** Time spent paused in the current clip, closed pauses only, and when the open one began. */
+    private var pausedMs = 0L
+    private var pauseStartMs = 0L
+
+    /** How long the current clip has recorded so far, pauses left out. */
+    internal fun recordedMs(): Long {
+        val now = SystemClock.elapsedRealtime()
+        return now - recordStartMs - pausedMs - if (paused) now - pauseStartMs else 0L
+    }
+
+    /**
+     * Pause / resume the clip being recorded: nothing captured while paused goes into the file, and
+     * it plays on without a gap. The encoder keeps running (no new warm-up, no key-frame wait), so
+     * resuming is instant; the camera and GPU keep running too (the preview stays live), so the
+     * phone keeps warming as while recording. Not during the pre-roll.
+     */
+    internal fun togglePause() {
+        val rec = recorder ?: return
+        if (warmingUp || stopping) return
+        val now = SystemClock.elapsedRealtime()
+        if (paused) {
+            rec.resume()
+            pausedMs += now - pauseStartMs
+            EventLog.log("Recording resumed at %.1f s (paused %.1f s)".format(recordedMs() / 1000.0, (now - pauseStartMs) / 1000.0))
+        } else {
+            rec.pause()
+            pauseStartMs = now
+            EventLog.log("Recording paused at %.1f s".format(recordedMs() / 1000.0))
+        }
+        updateUi()
+    }
     /** Frames lost while recording (from the renderer's stats). */
     internal var droppedFrames = 0
         private set
@@ -650,7 +683,17 @@ class CameraActivity : Activity() {
 
     /** What a recording uses: the 8-bit HEVC where 10-bit isn't possible (the setting stays). */
     internal fun effectiveCodec() = if (codecOffered(codec)) codec else VideoCodec.HEVC_8
-    internal fun setCodec(c: VideoCodec) { codec = c; settingsChanged() }
+    internal fun setCodec(c: VideoCodec) {
+        codec = c
+        settingsChanged()
+        // The renderer's GL config is made for the recording's bit depth (EglCore): rebuild it for
+        // the other one, or recordings would need a second GL context (Adreno crashed with that).
+        val wantTenBit = c.tenBit && recordingLimits?.tenBit != false
+        if (wantTenBit != rendererTenBit && recorder == null && !stopping && renderer != null && !scanning) restartPipeline()
+    }
+
+    /** The bit depth the current renderer's GL config was made for. */
+    private var rendererTenBit = false
     /** Bitrates offered for the current resolution: 2K needs far less (owner asked for 25 and 75). */
     internal fun bitrateOptions(): List<Int> {
         val all = if (superpixel) BITRATES_2K else BITRATES_4K
@@ -1544,7 +1587,10 @@ class CameraActivity : Activity() {
             info.text = "Camera unavailable: ${e.message}"
             return
         }
-        val r = Renderer(cam.info, cam.reader, { ts -> cam.metaFor(ts) }, { ts -> cam.metaArrived(ts) }, { cam.ispLinearLogAverage }) { stats ->
+        // One GL context for preview and encoder needs the recording's bit depth up front (EglCore).
+        rendererTenBit = codec.tenBit && recordingLimits?.tenBit != false
+        val r = Renderer(cam.info, cam.reader, { ts -> cam.metaFor(ts) }, { ts -> cam.metaArrived(ts) }, { cam.ispLinearLogAverage },
+            rendererTenBit) { stats ->
             runOnUiThread { showStats(stats) }
         }
         r.onNrShed = { why ->
@@ -1848,6 +1894,7 @@ class CameraActivity : Activity() {
         warmingUp = false
         renderer?.commitRecording()
         recordStartMs = SystemClock.elapsedRealtime()
+        pausedMs = 0L
         updateUi()
     }
 
@@ -1931,6 +1978,9 @@ class CameraActivity : Activity() {
         warmingUp = false
         val rec = recorder ?: return
         val r = renderer ?: return
+        // Measured now: recordedMs() leaves pauses out, and needs the recorder for an open one.
+        val secs = recordedMs() / 1000.0
+        val pauseCount = rec.pauses.count()
         recorder = null
         stopping = true
         updateUi()
@@ -1950,10 +2000,10 @@ class CameraActivity : Activity() {
                     }
                     return@stop
                 }
-                val secs = (SystemClock.elapsedRealtime() - recordStartMs) / 1000.0
                 val msg = (why?.let { "$it. " } ?: "") + "Saved ${result.frames} frames, ${result.bytes / 1_000_000} MB, " +
                     "≈%.0f Mbps".format(result.bytes * 8 / secs / 1e6) +
                     (if (result.audio) " + audio" else "") +
+                    (if (pauseCount > 0) " ($pauseCount ${if (pauseCount == 1) "pause" else "pauses"})" else "") +
                     (result.error?.let { " — $it" } ?: "")
                 EventLog.log("Recording: $msg → ${result.uri}")
                 runOnUiThread {
@@ -2106,6 +2156,8 @@ class CameraActivity : Activity() {
                 append("$out · ${profile.label}\n")
                 append("ISO ${m?.iso ?: "-"} (≈${effectiveIso ?: "-"} with gain) · $shutter · gain %+.1f EV · %.1f fps · frame %.1f ms".format(
                     gainEv, stats.fps, stats.gpuMs))
+                // A viewfinder drawing fewer frames than are recorded looks choppy (the GL thread is behind).
+                if (stats.viewFps < stats.fps - 2) append(" · view %.0f fps".format(stats.viewFps))
                 renderer?.lutInput?.takeIf { it != profile && views.getOrNull(viewIndex) is ViewEntry.CubeFile }
                     ?.let { append("\nLUT expects ${it.label}: converting from ${profile.label}") }
                 if (capture.ae == AeMode.PRIORITY && priorityAtLimit) append("\n⚠ priority limits reached: image darker than target")
@@ -2114,9 +2166,9 @@ class CameraActivity : Activity() {
                 if (m != null && m.shading == null) append("\nno lens shading map")
             }
             recorder?.takeIf { !warmingUp && (classicUi || !simple) }?.let {
-                val secs = (SystemClock.elapsedRealtime() - recordStartMs) / 1000
+                val secs = recordedMs() / 1000
                 if (isNotEmpty()) append("\n")
-                append("● REC %d:%02d · %s".format(secs / 60, secs % 60, if (bakeLut || simple) "look baked in" else "clean log"))
+                append("%s %d:%02d · %s".format(if (paused) "❚❚ PAUSED" else "● REC", secs / 60, secs % 60, if (bakeLut || simple) "look baked in" else "clean log"))
                 if (!simple) append(" · %d frames · %d MB · dropped %d".format(it.framesWritten, it.bytesWritten / 1_000_000, stats.droppedWhileRecording))
             }
             lastResult?.let { if (isNotEmpty()) append("\n"); append(it) }
@@ -2189,7 +2241,7 @@ class CameraActivity : Activity() {
         val extras = intent?.extras ?: return
         if (recorder == null) {
             if (extras.containsKey("simple")) setSimple(extras.getBoolean("simple"))
-            extras.getString("codec")?.let { codec = VideoCodec.valueOf(it) }
+            extras.getString("codec")?.let { setCodec(VideoCodec.valueOf(it)) }
             if (extras.containsKey("bitrate")) bitrateMbps = extras.getInt("bitrate")
             if (extras.containsKey("bake")) bakeLut = extras.getBoolean("bake")
             if (extras.containsKey("superpixel")) setSuperpixel(extras.getBoolean("superpixel"))

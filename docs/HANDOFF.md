@@ -1,4 +1,4 @@
-# Handoff: state as of 0.6.2 (2026-10-16, released as GitHub pre-release v0.6.2)
+# Handoff: state as of 0.7.0 (2026-10-21, GitHub pre-release v0.7.0)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -104,6 +104,15 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
   verified unmirrored).
 
 ## Start here (next session)
+
+00. **0.7.0 (2026-10-21)**: feedback/notes.md items 69–81. One GL context for preview and encoder
+    (the Adreno crash, reproduced and verified gone), pause/resume, 4K AV1 Compress (memory cut
+    from 7.2 to ~2 GB, verified), 0.6x 4K recording fixed (priming removed, 6 RAW buffers), frames
+    wait for late capture results (15 Ultra), viewfinder drawn ≥10 fps while recording, REC pill
+    in the Simple/Pro spot, Send diagnostics with Android's exit reasons. **Next: heat** — the idle
+    preview keeps the GPU ~70 % busy (prep pass on the full 16 MP RAW + colour NR's change test +
+    glass every frame, even for the half-res preview); 4K recording uses ~33 ms of a 33 ms budget
+    when warm. Plan in item 81. Then the realme issues (item 79).
 
 0. **0.6.2 (pre-release v0.6.2, 2026-10-16; built, not tested on the phone before release):**
    feedback/notes.md items 61–68. Mid-recording driver crash hardening (realtime encoder, EGL

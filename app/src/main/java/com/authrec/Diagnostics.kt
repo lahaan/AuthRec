@@ -58,13 +58,16 @@ object Diagnostics {
         appendLine("== Cameras ==")
         append(runCatching { cameraReport(context) }.getOrElse { "failed: $it\n" })
         appendLine()
-        for (name in listOf("lenses", "authrec")) {
+        for (name in listOf("lenses", "authrec", "reccheck")) {
             appendLine("== Settings: $name ==")
             context.getSharedPreferences(name, Context.MODE_PRIVATE).all.toSortedMap().forEach { (k, v) -> appendLine("$k = $v") }
             appendLine()
         }
         appendLine("== Video encoders ==")
         append(encoderReport())
+        appendLine()
+        appendLine("== How the app last ended (Android's record) ==")
+        append(runCatching { exitReport(context) }.getOrElse { "unavailable: $it\n" })
         appendLine()
         appendLine("== Events (this and earlier launches) ==")
         appendLine(EventLog.tail(500))
@@ -75,6 +78,37 @@ object Diagnostics {
             ProcessBuilder("logcat", "-d", "-v", "time", "--pid=${Process.myPid()}", "-t", "3000")
                 .redirectErrorStream(true).start().inputStream.bufferedReader().readText()
         }.getOrElse { "log unavailable: $it\n" })
+    }
+
+    /**
+     * Why the app's last processes ended, from Android: killed for memory, crashed (Java or
+     * native), not responding, swiped away, updated, with its memory then. The event log can't
+     * tell these apart (the app just "started" again); on the X14 this showed 4K AV1 Compress
+     * getting the app killed for low memory at 5.7–7.4 GB (2026-10-19). ANRs add their main thread.
+     */
+    private fun exitReport(context: Context): String = buildString {
+        val am = context.getSystemService(android.app.ActivityManager::class.java)
+        val reasons = mapOf(
+            0 to "unknown", 1 to "exited itself", 2 to "signalled", 3 to "LOW MEMORY", 4 to "CRASH (Java)",
+            5 to "CRASH (native)", 6 to "ANR (not responding)", 7 to "start-up failed", 8 to "permission changed",
+            9 to "excessive resource use", 10 to "user requested (force stop)", 11 to "user stopped", 12 to "dependency died",
+            13 to "other system kill", 14 to "freezer", 15 to "package state changed", 16 to "package updated",
+        )
+        val time = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
+        val exits = am.getHistoricalProcessExitReasons(context.packageName, 0, 15)
+        if (exits.isEmpty()) appendLine("(none recorded)")
+        for (e in exits) {
+            appendLine("${time.format(Date(e.timestamp))} ${reasons[e.reason] ?: "reason ${e.reason}"}" +
+                (e.description?.let { " ($it)" } ?: "") + ", importance ${e.importance}" +
+                ", pss ${e.pss / 1024} MB, rss ${e.rss / 1024} MB")
+            if (e.reason == android.app.ApplicationExitInfo.REASON_ANR) {
+                runCatching {
+                    e.traceInputStream?.bufferedReader()?.useLines { lines ->
+                        lines.dropWhile { !it.startsWith("\"main\"") }.take(25).forEach { appendLine("    $it") }
+                    }
+                }
+            }
+        }
     }
 
     /** Writes the report to Download/AuthRec and opens the share sheet. Call off the main thread. */

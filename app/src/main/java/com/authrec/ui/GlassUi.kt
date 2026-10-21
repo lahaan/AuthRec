@@ -65,6 +65,11 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         foreground = FlipIcon(this, a.dp(2).toFloat())
         contentDescription = "Front / back camera"
     }
+    /** Pause / resume, in the flip button's place while a clip records (flip can't be used then). */
+    private val pauseButton = roundChip("") { a.togglePause() }.apply {
+        foreground = PauseIcon(this, a.dp(2).toFloat()) { a.paused }
+        contentDescription = "Pause recording"
+    }
     /** Selfie-style mirror, next to the flip button while the front camera is on. */
     private val mirrorButton = roundChip("") { a.setMirrorFront(!a.mirrorFront) }.apply {
         foreground = MirrorIcon(this, a.dp(2).toFloat())
@@ -238,8 +243,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         addView(a.info, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
             setMargins(side + a.dp(14), a.dp(10), 0, 0)
         })
-        addView(recPill, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
-            topMargin = a.dp(10)
+        // In the Simple/Pro switch's place (locked while recording): over the image it covered
+        // Pro's statistics (owner, 2026-10-21).
+        addView(recPill, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
+            setMargins(a.dp(20), a.dp(16), 0, 0)
         })
         addView(hint, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
             topMargin = a.dp(52)
@@ -274,6 +281,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             topMargin = lensTop
         })
         addView(flipButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
+            setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18))
+        })
+        addView(pauseButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
             setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18))
         })
         // Under the EV slider (which ends 17 % of the height above the bottom), level with flip.
@@ -614,6 +624,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         updateRecPill()
 
         modeRow.second(if (a.simple) 0 else 1)
+        modeRow.first.visibility = if (recording) View.INVISIBLE else View.VISIBLE // the REC pill sits there
         modeRow.first.isEnabled = !busy
         for (i in 0 until modeRow.first.childCount) modeRow.first.getChildAt(i).isEnabled = !busy
         setCaption(lookChip, a.currentView()?.label ?: "")
@@ -634,8 +645,13 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         lensChips.values.forEach { it.isEnabled = !busy && !a.scanning }
         // The accent pill rides from the old lens to the new one (none on the front camera).
         lensColumn.select(lensChips[a.lensIndex])
-        flipButton.visibility = if (a.lenses.any { it.front }) View.VISIBLE else View.GONE
+        flipButton.visibility = if (a.lenses.any { it.front } && !recording) View.VISIBLE else View.GONE
         kit.setOn(flipButton, current?.front == true)
+        pauseButton.visibility = if (recording) View.VISIBLE else View.GONE
+        pauseButton.isEnabled = !a.stopping
+        kit.setOn(pauseButton, a.paused)
+        pauseButton.contentDescription = if (a.paused) "Resume recording" else "Pause recording"
+        pauseButton.invalidate()
         flipButton.isEnabled = !busy && !a.scanning
         mirrorButton.visibility = if (current?.front == true) View.VISIBLE else View.GONE
         kit.setOn(mirrorButton, a.mirrorFront)
@@ -755,11 +771,21 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             recPill.visibility = View.GONE
             recPulse?.cancel()
             recPulse = null
+            recDot.alpha = 1f
         }
         if (on) {
-            val secs = (SystemClock.elapsedRealtime() - a.recordStartMs) / 1000
-            val dropped = a.droppedFrames
-            recTime.text = "%02d:%02d".format(secs / 60, secs % 60) + if (!a.simple && dropped > 0) "  ·  $dropped dropped" else ""
+            // Just the time: Pro's info line has the frames, size and drops.
+            val secs = a.recordedMs() / 1000
+            recTime.text = (if (a.paused) "PAUSED  " else "") + "%02d:%02d".format(secs / 60, secs % 60)
+            // A paused clip's dot stops pulsing and dims.
+            if (a.paused && recPulse != null) {
+                recPulse?.cancel()
+                recPulse = null
+                recDot.alpha = 0.4f
+            } else if (!a.paused && recPulse == null) {
+                recDot.alpha = 1f
+                recPulse = UiKit.pulse(recDot)
+            }
         }
     }
 
@@ -856,6 +882,48 @@ private class FlipIcon(private val view: TextView, private val stroke: Float) : 
         head.close()
         paint.style = Paint.Style.FILL
         canvas.drawPath(head, paint)
+    }
+
+    override fun setAlpha(alpha: Int) {
+        paint.alpha = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        paint.colorFilter = colorFilter
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity() = PixelFormat.TRANSLUCENT
+}
+
+/** Pause symbol (two bars) while recording, a play triangle while paused ([paused]). */
+private class PauseIcon(private val view: TextView, private val stroke: Float, private val paused: () -> Boolean) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeJoin = Paint.Join.ROUND }
+    private val path = Path()
+
+    override fun draw(canvas: Canvas) {
+        val s = minOf(bounds.width(), bounds.height()) * 0.5f
+        val cx = bounds.exactCenterX()
+        val cy = bounds.exactCenterY()
+        paint.color = view.currentTextColor
+        paint.style = Paint.Style.FILL
+        paint.strokeWidth = stroke
+        if (paused()) {
+            // Optically centred: a triangle's weight sits left of its box centre.
+            val h = s * 0.42f
+            path.reset()
+            path.moveTo(cx - h * 0.7f, cy - h)
+            path.lineTo(cx - h * 0.7f, cy + h)
+            path.lineTo(cx + h * 1.0f, cy)
+            path.close()
+            canvas.drawPath(path, paint)
+        } else {
+            val h = s * 0.38f
+            val w = s * 0.15f
+            val gap = s * 0.13f
+            canvas.drawRoundRect(cx - gap - w, cy - h, cx - gap, cy + h, w * 0.3f, w * 0.3f, paint)
+            canvas.drawRoundRect(cx + gap, cy - h, cx + gap + w, cy + h, w * 0.3f, w * 0.3f, paint)
+        }
     }
 
     override fun setAlpha(alpha: Int) {

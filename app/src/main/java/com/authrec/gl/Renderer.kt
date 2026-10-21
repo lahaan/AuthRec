@@ -45,14 +45,18 @@ class Renderer(
     private val reader: ImageReader,
     /** The metadata of the capture with this sensor timestamp (or the latest). */
     private val metaSource: (Long) -> FrameMeta?,
-    /** Whether the capture result with this sensor timestamp has arrived (see [held]). */
+    /** Whether the capture result with this sensor timestamp has arrived (see [pending]). */
     private val metaArrived: (Long) -> Boolean,
     /** Log-average linear brightness of the ISP's rendering (NaN if unknown); drives auto gain. */
     private val ispBrightness: () -> Float,
+    /** Recordings will be 10-bit: the main EGL config is made for that (see EglCore). */
+    private val tenBitSurfaces: Boolean,
     private val onStats: (Stats) -> Unit,
 ) {
     /** [gpuMs]: thread time per frame (submission + any blocking on the GPU or encoder). */
-    data class Stats(val gpuMs: Double, val fps: Double, val meta: FrameMeta?, val droppedWhileRecording: Int)
+    /** [viewFps]: preview frames actually drawn per second (fewer than [fps] when the GL thread is behind). */
+    data class Stats(val gpuMs: Double, val fps: Double, val meta: FrameMeta?, val droppedWhileRecording: Int,
+                     val viewFps: Double)
 
     /** Settings read on the GL thread each frame; written from the UI thread. */
     /**
@@ -326,6 +330,8 @@ class Renderer(
         val scaled: Boolean,
         /** On the GL thread when the encoder's surface stops taking frames. */
         val onFailed: (String) -> Unit,
+        /** [context] is a second context made for this recording (else it's the main one). */
+        val ownContext: Boolean,
     ) {
         /** The encoder surface failed: nothing more is drawn into it (and it's already destroyed). */
         var failed = false
@@ -355,15 +361,22 @@ class Renderer(
         var prerollLastTs = -1L
         /** Frames lost after the clip's first second (its start can stall whatever runs). */
         var droppedSettled = 0
+        /** Time paused before the frames now being recorded (see Recorder.pauses). */
+        var shiftNs = 0L
+        /** The clip's frames, how many preview frames were drawn meanwhile (a choppy viewfinder shows here), and their total time on this thread. */
+        var clipFrames = 0
+        var viewFrames = 0
+        var clipMs = 0.0
 
         /** One line for the event log: when frames were lost and what the GL thread was doing. */
         fun timingSummary() = "Recording timing: $dropped frames lost" +
             (if (gaps.isNotEmpty()) " (at$gaps)" else "") +
-            ", slowest frame %.0f ms at %.2f s, slowest encoder hand-over %.0f ms, slowest pre-roll frame %.0f ms"
-                .format(slowestFrameMs, slowestFrameAt, slowestSwapMs, prerollSlowestMs)
+            ", average frame %.1f ms, slowest frame %.0f ms at %.2f s, slowest encoder hand-over %.0f ms, slowest pre-roll frame %.0f ms (%d lost), preview showed %d of %d frames"
+                .format(if (clipFrames > 0) clipMs / clipFrames else 0.0, slowestFrameMs, slowestFrameAt, slowestSwapMs, prerollSlowestMs, prerollLost, viewFrames, clipFrames)
     }
 
     private var frameCount = 0
+    private var viewCount = 0
     private var fpsWindowStart = 0L
     private var gpuMsAvg = 0.0
 
@@ -377,6 +390,10 @@ class Renderer(
     fun attachSurface(surface: Surface, width: Int, height: Int, rotationQuarterTurns: Int) = post {
         releaseWindowSurface()
         windowSurface = egl.createWindowSurface(surface)
+        // A viewfinder swap needn't wait for the display: with a full queue the newest frame
+        // replaces the waiting one instead of blocking the thread that also feeds the encoder.
+        egl.makeCurrent(windowSurface)
+        EGL14.eglSwapInterval(egl.display, 0)
         viewW = width
         viewH = height
         rotation = rotationQuarterTurns
@@ -439,16 +456,21 @@ class Renderer(
         if (released) return@post onFailed("camera closed")
         try {
             val tenBit = recorder.config.codec.tenBit
+            // The main context draws into the encoder too when its config fits (the usual case,
+            // see EglCore); a second, shared context only after a bit-depth change it doesn't fit.
+            val direct = egl.recordableBits == (if (tenBit) 10 else 8)
             // Recordable only: a 10-bit window without the flag got past EGL on the Xiaomi 12, and
             // its encoder failed on the first frame.
-            val config = egl.chooseConfig(tenBit = tenBit, recordable = true)
+            val config = if (direct) egl.mainConfig else egl.chooseConfig(tenBit = tenBit, recordable = true)
             if (config == null) {
                 if (tenBit) tenBitRecording = false
                 error("no ${if (tenBit) "10" else "8"}-bit recordable EGL config")
             }
-            val ctx = egl.createContext(config, egl.mainContext)
+            val ctx = if (direct) egl.mainContext else egl.createContext(config, egl.mainContext)
             val surface = runCatching { egl.createWindowSurface(recorder.inputSurface, config) }
-                .onFailure { egl.destroyContext(ctx) }.getOrThrow()
+                .onFailure { if (!direct) egl.destroyContext(ctx) }.getOrThrow()
+            if (!direct) EventLog.log("Recording through a second GL context (${if (tenBit) 10 else 8}-bit recording, " +
+                "${egl.recordableBits}-bit main config)")
             // Narrower than the image (an encoder that takes less): develop at that size instead.
             val scaled = !superpixel && outW < w * 0.95f
             releaseScaled()
@@ -460,7 +482,8 @@ class Renderer(
             }
             // Half turns can be baked in at the same frame size (front camera is upside down in landscape).
             recording = Recording(recorder, bakeLut, superpixel, if (rotation == 2) 2 else 0, outW, outH,
-                floatArrayOf(0f, (1f - cropHeight) / 2f, 1f, cropHeight), ctx, surface, 1_000_000_000L / fps, mirror, scaled, onFailed)
+                floatArrayOf(0f, (1f - cropHeight) / 2f, 1f, cropHeight), ctx, surface, 1_000_000_000L / fps, mirror, scaled, onFailed,
+                ownContext = !direct)
             // Colour NR's history at the recorded size now, rather than inside the pre-roll's frames.
             if (cleanup >= 2) developTarget().let { ensureHistory(it.width, it.height) }
         } catch (e: Exception) {
@@ -481,7 +504,7 @@ class Renderer(
             if (!it.failed) {
                 egl.makeCurrent(EGL14.EGL_NO_SURFACE)
                 egl.destroySurface(it.surface)
-                egl.destroyContext(it.context)
+                if (it.ownContext) egl.destroyContext(it.context)
             }
             it.timingSummary()
         }
@@ -495,11 +518,11 @@ class Renderer(
         val done = java.util.concurrent.CountDownLatch(1)
         handler.post {
             released = true
-            held?.close()
-            held = null
+            pending.forEach { it.close() }
+            pending.clear()
             recording?.takeIf { !it.failed }?.let {
                 egl.destroySurface(it.surface)
-                egl.destroyContext(it.context)
+                if (it.ownContext) egl.destroyContext(it.context)
             }
             recording = null
             releaseScaled()
@@ -516,7 +539,7 @@ class Renderer(
     }
 
     private fun setupGl() {
-        egl = EglCore()
+        egl = EglCore(preferTenBit = tenBitSurfaces)
         if (egl.chooseConfig(tenBit = true, recordable = true) == null) {
             tenBitRecording = false
             if (!tenBitLogged) {
@@ -555,26 +578,20 @@ class Renderer(
         var processed = 0
         var behind = false
         val rec = recording
+        fillPending()
         if (rec != null) {
             // Every frame goes to the encoder, oldest first, but for at most PASS_BUDGET_NS per pass:
             // an encoder that can't keep up (Xiaomi 12 choking on 4096×3072: ~250 ms a frame) kept
             // this loop going for as long as the camera delivered, and the stop posted behind it
             // never ran. (A cap of 3 frames instead cost the X14 frames at the start of 4K clips.)
-            var next: Image? = held ?: acquireNext()
-            held = null
-            while (next != null) {
-                val image: Image = next
+            while (true) {
                 if (SystemClock.elapsedRealtimeNanos() - t0 > PASS_BUDGET_NS) {
-                    held = image // first in line next pass
-                    behind = true
+                    behind = pending.isNotEmpty()
                     break
                 }
-                // One ahead: a frame with nothing behind it waits for its own capture result.
-                next = acquireNext()
-                if (next == null && !metaArrived(image.timestamp)) {
-                    held = image
-                    break
-                }
+                val image = pending.firstOrNull() ?: break
+                if (!readyToDevelop(image, rec.frameNs)) break // its capture result wakes us
+                pending.removeFirst()
                 val f0 = SystemClock.elapsedRealtimeNanos()
                 val ts = image.timestamp
                 meta = processFrame(image)
@@ -583,49 +600,77 @@ class Renderer(
                 watchBudget(rec, ms)
                 if (rec.preroll) {
                     rec.prerollSlowestMs = maxOf(rec.prerollSlowestMs, ms)
-                } else if (ms > rec.slowestFrameMs) {
-                    rec.slowestFrameMs = ms
-                    rec.slowestFrameAt = (ts - rec.firstTimestamp) / 1e9
+                } else if (!rec.recorder.pauses.paused) {
+                    rec.clipMs += ms
+                    if (ms > rec.slowestFrameMs) {
+                        rec.slowestFrameMs = ms
+                        rec.slowestFrameAt = (ts - rec.firstTimestamp) / 1e9
+                    }
                 }
+                // The viewfinder: once caught up, and at least every VIEW_INTERVAL_NS whatever waits.
+                // Only when caught up, a warm X14 at 4K (frames ~33 ms) drew 6 of 439 frames, "view
+                // 0 fps" (owner: "choppy as hell"); drawing it costs a hot phone the odd frame, and
+                // losing frames sheds colour NR (watchBudget), which gives the time back.
+                fillPending()
+                val caughtUp = pending.firstOrNull()?.let { !readyToDevelop(it, rec.frameNs) } ?: true
+                if (caughtUp || SystemClock.elapsedRealtimeNanos() - lastViewNs >= VIEW_INTERVAL_NS) drawView(rec)
             }
         } else {
-            val newest = reader.acquireLatestImage()
-            val waiting = held
-            held = null
-            fun ready(i: Image) = metaArrived(i.timestamp)
-            val image = when {
-                newest == null -> waiting?.takeIf { ready(it) }.also { if (it == null) held = waiting }
-                waiting == null -> newest.takeIf { ready(it) }.also { if (it == null) held = newest }
-                // Both: the newer one if it's ready (the preview needn't show every frame),
-                // else the one that waited (it can't wait longer), and the newer one waits instead.
-                ready(newest) -> newest.also { waiting.close() }
-                else -> waiting.also { held = newest }
-            }
-            image?.let {
-                meta = processFrame(it)
+            // The preview needn't show every frame: the newest one whose result is in, else the
+            // newest once the oldest can't wait any longer.
+            val ready = pending.indexOfLast { metaArrived(it.timestamp) }
+            val pick = if (ready >= 0) ready else pending.lastIndex.takeIf { it >= 0 && readyToDevelop(pending.first(), PREVIEW_FRAME_NS) }
+            if (pick != null) {
+                repeat(pick) { pending.removeFirst().close() }
+                meta = processFrame(pending.removeFirst())
                 processed++
+                drawView(null)
             }
         }
         if (processed == 0) return
-        // More are waiting: come back after whatever else was posted meanwhile, and leave the
-        // preview (its swap waits for the display) until caught up.
+        // More are waiting: come back after whatever else was posted meanwhile.
         if (behind && frameQueued.compareAndSet(false, true)) post { renderFrames() }
-        if (!behind && windowSurface != EGL14.EGL_NO_SURFACE) {
-            drawToScreen()
-            egl.swapWindow()
-        }
         updateStats((SystemClock.elapsedRealtimeNanos() - t0) / 1e6 / processed, meta, processed)
     }
 
+    /** Draws the preview of the frame just developed (if there's a screen to draw on). */
+    private fun drawView(rec: Recording?) {
+        if (windowSurface == EGL14.EGL_NO_SURFACE) return
+        drawToScreen()
+        egl.swapWindow()
+        lastViewNs = SystemClock.elapsedRealtimeNanos()
+        viewCount++
+        rec?.let { if (!it.preroll && !it.recorder.pauses.paused) it.viewFrames++ }
+    }
+
+    private var lastViewNs = 0L
+    private var lastGlassNs = 0L
+
     /**
-     * A frame kept back (open) until its capture result arrives: the HAL delivers a RAW buffer
-     * before its result, so a frame developed at once got the previous frame's exposure, colour
-     * and noise (the event log: "0 of 90 frames matched" in preview), which undid the per-frame
-     * exposure evening (Priority's steps showed) and mismatched the auto gain's measurements.
-     * [onFrameAvailable] also runs on every result. A frame waits at most until the next frame
-     * arrives: lenses whose results never match lose one frame of latency, nothing more.
+     * Frames taken from the reader, oldest first, waiting for their capture results: the HAL
+     * delivers a RAW buffer before its result, so a frame developed at once got the previous
+     * frame's exposure, colour and noise (the event log: "0 of 90 frames matched" in preview),
+     * which undid the per-frame exposure evening (Priority's steps showed) and mismatched the auto
+     * gain's measurements. [onFrameAvailable] also runs on every result.
      */
-    private var held: Image? = null
+    private val pending = ArrayDeque<Image>()
+
+    /** Takes what the reader has, leaving room in it for the camera. */
+    private fun fillPending() {
+        while (pending.size < MAX_PENDING) pending.addLast(acquireNext() ?: return)
+    }
+
+    /**
+     * Whether [image] may be developed now: its result is in, or it can't wait longer: two newer
+     * frames behind it, or older than 2.5 frame intervals ([frameNs]). Waiting only until the next
+     * frame wasn't enough on the Xiaomi 15 Ultra, whose results come more than a frame late
+     * (0–14 of 90 matched, 2026-10-19).
+     */
+    private fun readyToDevelop(image: Image, frameNs: Long): Boolean {
+        val ts = image.timestamp
+        if (metaArrived(ts) || pending.size >= 3) return true
+        return sensor.timestampsAreBoottime && SystemClock.elapsedRealtimeNanos() - ts > frameNs * 5 / 2
+    }
 
     /** acquireNextImage throws instead of returning null when all buffers are held; treat both as "none". */
     private fun acquireNext(): Image? = try {
@@ -671,23 +716,28 @@ class Renderer(
     }
 
     /**
-     * Colour NR off for the rest of the clip once frames get lost: 2 in the pre-roll (past its
-     * first frames, while the GPU clocks up), so the clip starts without it rather than changing
-     * look, or 3 in the clip past its first second (the X14 lost 3 in a 4K clip's first half
-     * second, the start hiccup that happens with or without it, then none). The Xiaomi 12 at 4K (2880×2160 from the full RAW) lost 21 of 160
-     * frames with it, none of 310 without. The time a frame takes on this thread is only a hint
-     * (GL work overlaps; the X14 averaged 34 ms in a 4K pre-roll and lost nothing), so it counts
-     * only when clearly hopeless, and not under pipetiming, whose glFinish calls inflate it.
+     * Colour NR off for the rest of the clip once frames get lost: 3 in the clip past its first
+     * second (the X14 lost 3 in a 4K clip's first half second, the start hiccup that happens with
+     * or without it, then none), or frames taking clearly too long on average. The Xiaomi 12 at
+     * 4K (2880×2160 from the full RAW) lost 21 of 160 frames with it, none of 310 without. The
+     * time a frame takes on this thread is only a hint (GL work overlaps; the X14 averaged 34 ms
+     * in a 4K pre-roll and lost nothing), so it counts only when clearly hopeless, and not under
+     * pipetiming, whose glFinish calls inflate it.
+     *
+     * The pre-roll doesn't count: its stalls are the encoder's input queue allocating buffers
+     * lazily inside the first draws (ten 50 MB ones at 4K) and the GPU clocking up, which is what
+     * it's there to absorb. (Priming the encoder with a burst of frames at REC allocated only 6 of
+     * them and held this thread 200–500 ms, which starved the camera: 2026-10-18/19.) Counting 2 lost frames there switched NR
+     * off in nearly every X14 4K clip (2026-10-18), where it otherwise runs without losses.
      */
     private fun watchBudget(rec: Recording, ms: Double) {
-        if (rec.nrShed || activeCleanup() < 2) return
+        if (rec.nrShed || activeCleanup() < 2 || rec.preroll) return
         rec.recentMs[rec.timedFrames % BUDGET_WINDOW] = ms
         rec.timedFrames++
         if (rec.timedFrames < BUDGET_SKIP + BUDGET_WINDOW) return
         val mean = rec.recentMs.average()
         val why = when {
-            rec.preroll && rec.prerollLost >= 2 -> "${rec.prerollLost} frames lost in the pre-roll"
-            !rec.preroll && rec.droppedSettled >= 3 -> "${rec.droppedSettled} frames lost after the first second"
+            rec.droppedSettled >= 3 -> "${rec.droppedSettled} frames lost after the first second"
             !pipeTiming && mean > 1.25 * rec.frameNs / 1e6 -> "frames took %.0f ms on average (%.0f ms between frames)".format(mean, rec.frameNs / 1e6)
             else -> return
         }
@@ -695,8 +745,16 @@ class Renderer(
         onNrShed?.invoke(why)
     }
 
-    private fun encodeFrame(rec: Recording, timestamp: Long) {
+    private fun encodeFrame(rec: Recording, captured: Long) {
         if (rec.failed) return
+        // Paused (Recorder.pause): this frame isn't recorded; after a pause, frames move back by
+        // the time paused so the clip runs on without a gap.
+        val shift = rec.recorder.pauses.shift(captured) ?: return
+        if (shift != rec.shiftNs) {
+            rec.shiftNs = shift
+            rec.lastTimestamp = -1L // the frame interval across the pause isn't a loss
+        }
+        val timestamp = captured - shift
         if (rec.originNs < 0) {
             rec.originNs = timestamp
             rec.recorder.onFirstVideoFrame(timestamp)
@@ -724,19 +782,26 @@ class Renderer(
             }
         }
         rec.lastTimestamp = timestamp
+        if (!rec.preroll) rec.clipFrames++
 
-        // The encoder context shares our textures; wait on the GPU (not the CPU) for the compute passes.
-        val fence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
-        GLES30.glFlush()
+        // A second context shares our textures: it waits on the GPU (not the CPU) for the compute
+        // passes. The main context's own commands are in order anyway.
+        val fence = if (rec.ownContext) GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0).also { GLES30.glFlush() } else null
         // An abandoned encoder surface fails here (an uncaught exception on this thread before).
         runCatching { egl.makeCurrent(rec.surface, rec.context) }.onFailure {
-            GLES30.glDeleteSync(fence)
+            fence?.let { f -> GLES30.glDeleteSync(f) }
             return encoderSurfaceFailed(rec, it.message ?: "eglMakeCurrent failed")
         }
-        GLES30.glWaitSync(fence, 0, GLES30.GL_TIMEOUT_IGNORED)
-        GLES30.glDeleteSync(fence)
+        fence?.let {
+            GLES30.glWaitSync(it, 0, GLES30.GL_TIMEOUT_IGNORED)
+            GLES30.glDeleteSync(it)
+        }
 
         val target = developTarget()
+        // The main context comes from the glass and the frame mask: draw into the surface itself, plainly.
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glDisable(GLES30.GL_BLEND)
+        GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
         GLES30.glViewport(0, 0, rec.outW, rec.outH)
         drawTexture(
             if (rec.bakeLut) target.view else target.log,
@@ -745,10 +810,15 @@ class Renderer(
             mirror = rec.mirror,
         )
         if (Recorder.debugBars) drawTestBars(rec.outW, rec.outH)
-        // The next frame's develop pass rewrites the texture this draw reads: the main context
-        // waits (on the GPU) for the draw before going on.
-        val drawn = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
-        GLES30.glFlush()
+        // A second context: the next frame's develop pass rewrites the texture this draw reads, so
+        // the main context waits (on the GPU) for the draw; and the texture is unbound again, so
+        // the next frame's bind is a real one (bound for good, the driver kept state it had for it).
+        val drawn = if (rec.ownContext) {
+            Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, 0)
+            GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0).also { GLES30.glFlush() }
+        } else {
+            null
+        }
         EGLExt.eglPresentationTimeANDROID(egl.display, rec.surface, timestamp - rec.originNs)
         val s0 = SystemClock.elapsedRealtimeNanos()
         // Blocks when the encoder hasn't taken the previous frames yet.
@@ -757,8 +827,10 @@ class Renderer(
         val swapMs = (SystemClock.elapsedRealtimeNanos() - s0) / 1e6
         if (!rec.preroll) rec.slowestSwapMs = maxOf(rec.slowestSwapMs, swapMs)
         egl.makeCurrent(windowSurface)
-        GLES30.glWaitSync(drawn, 0, GLES30.GL_TIMEOUT_IGNORED)
-        GLES30.glDeleteSync(drawn)
+        drawn?.let {
+            GLES30.glWaitSync(it, 0, GLES30.GL_TIMEOUT_IGNORED)
+            GLES30.glDeleteSync(it)
+        }
         if (!swapped) encoderSurfaceFailed(rec, "eglSwapBuffers failed: 0x%x".format(swapError))
     }
 
@@ -772,7 +844,7 @@ class Renderer(
         rec.failed = true
         egl.makeCurrent(windowSurface)
         egl.destroySurface(rec.surface)
-        egl.destroyContext(rec.context)
+        if (rec.ownContext) egl.destroyContext(rec.context)
         android.util.Log.e("AuthRec", "recording surface: $why")
         EventLog.log("Recording stopped: the encoder's surface failed ($why)")
         rec.onFailed(why)
@@ -1202,12 +1274,15 @@ class Renderer(
         val rects = glassRects
         val glass = if (rects.isNotEmpty()) (backdrop ?: GlassBackdrop().also { backdrop = it }) else null
         val timingStart = if (glassTiming && glass == null) { GLES30.glFinish(); SystemClock.elapsedRealtimeNanos() } else 0L
-        // The glass's offscreen passes go first so the window's render pass stays in one piece. While
-        // recording, a fresh blur every third frame is plenty behind the controls.
+        // The glass's offscreen passes go first so the window's render pass stays in one piece.
         glass?.let {
             it.timing = glassTiming
-            it.prepare(tex, target.width, target.height, rotation, mirror, letterbox, viewW, viewH,
-                frameCrop, refresh = recording == null || frameCounter % 3 == 0L)
+            // While recording, a fresh blur twice a second is plenty behind the controls, and every
+            // millisecond of a viewfinder frame then comes out of the encoder's budget.
+            val now = SystemClock.elapsedRealtimeNanos()
+            val refresh = recording == null || now - lastGlassNs >= GLASS_REFRESH_RECORDING_NS
+            if (refresh) lastGlassNs = now
+            it.prepare(tex, target.width, target.height, rotation, mirror, letterbox, viewW, viewH, frameCrop, refresh = refresh)
         }
 
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
@@ -1411,9 +1486,11 @@ class Renderer(
         if (fpsWindowStart == 0L) fpsWindowStart = now
         if (now - fpsWindowStart >= 1000) {
             val fps = frameCount * 1000.0 / (now - fpsWindowStart)
+            val viewFps = viewCount * 1000.0 / (now - fpsWindowStart)
             frameCount = 0
+            viewCount = 0
             fpsWindowStart = now
-            onStats(Stats(gpuMsAvg, fps, meta, recording?.dropped ?: 0))
+            onStats(Stats(gpuMsAvg, fps, meta, recording?.dropped ?: 0, viewFps))
         }
     }
 
@@ -1439,6 +1516,14 @@ class Renderer(
         /** Frames over which a recording's frame time is averaged (see watchBudget), and those skipped first. */
         private const val BUDGET_WINDOW = 15
         private const val BUDGET_SKIP = 10
+        /** While recording and behind, the preview is still drawn this often (~10 fps). */
+        private const val VIEW_INTERVAL_NS = 100_000_000L
+        /** While recording, the glass's blur of the preview is refreshed at most this often. */
+        private const val GLASS_REFRESH_RECORDING_NS = 500_000_000L
+        /** Frames taken from the reader at most (it has 6; the camera needs some). */
+        private const val MAX_PENDING = 4
+        /** For the preview's waiting rule (recordings use their own frame rate). */
+        private const val PREVIEW_FRAME_NS = 33_333_333L
         /** Time spent on recorded frames before the GL thread looks at its other work again. */
         private const val PASS_BUDGET_NS = 500_000_000L
         /** Frames the auto gain needs to settle on a new lens (~1.5 s at 30 fps). */

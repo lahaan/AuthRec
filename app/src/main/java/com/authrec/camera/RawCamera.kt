@@ -250,7 +250,11 @@ class RawCamera(
         staticBlack = FloatArray(4) { i -> pattern?.getOffsetForIndex(i % 2, i / 2)?.toFloat() ?: 0f }
         staticWhite = (chars.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023).toFloat()
 
-        reader = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 4)
+        // 6, not 4: at 4K a GL frame now and then takes 80–150 ms (the encoder's buffers being
+        // allocated at a clip's start, the odd slow frame later), and with 4 buffers, one of them
+        // held back for its capture result, the camera ran out and failed captures in bursts;
+        // the 0.6x once stopped delivering altogether after one (2026-10-19).
+        reader = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 6)
 
         // A small processed stream nobody looks at: on some lenses (Xiaomi's front and hidden
         // telephoto) the ISP only runs auto exposure / white balance while it has processed

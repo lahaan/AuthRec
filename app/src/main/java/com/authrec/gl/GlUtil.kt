@@ -11,18 +11,32 @@ import android.opengl.GLES31
 import android.view.Surface
 
 /**
- * EGL display with the main GLES 3.2 context (8-bit RGBA, for compute and the preview surface)
- * and, while recording, a second context sharing its textures whose config matches the encoder
- * surface (10-bit RGBA1010102 for 10-bit recording).
+ * EGL display with the main GLES 3.2 context (compute, the preview surface and, when their
+ * configs match, the encoder surface) and, only when they don't, a second context sharing its
+ * textures for the encoder surface.
+ *
+ * The main config is recordable, of the bit depth recordings will use ([preferTenBit]: 10-bit
+ * RGBA1010102), so one context draws the preview and the encoder frames. The second, shared
+ * context crashed the Adreno driver (X14) inside the encoder draw, 1–15 s into 4K clips, writing
+ * state for the shared texture to unmapped memory (2026-10-15/17, reproduced 2026-10-18).
  */
-internal class EglCore {
+internal class EglCore(preferTenBit: Boolean = false) {
     val display: EGLDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-    private val mainConfig: EGLConfig
+    val mainConfig: EGLConfig
     val mainContext: EGLContext
+    /** What an encoder surface may be to use [mainContext] directly: 10 or 8 (bits), 0 = none (not recordable). */
+    val recordableBits: Int
 
     init {
         check(EGL14.eglInitialize(display, IntArray(2), 0, IntArray(2), 1)) { "eglInitialize failed" }
-        mainConfig = chooseConfig(tenBit = false, recordable = false) ?: error("no GLES3 window config")
+        val ten = if (preferTenBit) chooseConfig(tenBit = true, recordable = true) else null
+        val eight = if (ten == null) chooseConfig(tenBit = false, recordable = true) else null
+        mainConfig = ten ?: eight ?: chooseConfig(tenBit = false, recordable = false) ?: error("no GLES3 window config")
+        recordableBits = when {
+            ten != null -> 10
+            eight != null -> 8
+            else -> 0
+        }
         mainContext = createContext(mainConfig, EGL14.EGL_NO_CONTEXT)
         makeCurrent(EGL14.EGL_NO_SURFACE, mainContext)
     }

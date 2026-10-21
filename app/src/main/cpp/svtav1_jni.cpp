@@ -165,6 +165,15 @@ Java_com_authrec_record_SvtAv1Encoder_nativeOpen(JNIEnv*, jclass, jint width, ji
         std::string m = std::to_string(maxKbps);
         svt_av1_enc_parse_parameter(&c, "mbr", m.c_str());
     }
+    // 4K: fewer frames in flight. With its defaults (8 cores: parallelism level 4, 32-frame
+    // mini-GOPs) SVT-AV1 at 4096x3072 10-bit peaked at 7.2 GB (measured on a Mac with this
+    // build, 128 frames); on the X14 Compress crawled to a halt around 30 % and the system killed
+    // the app (owner, 2026-10-19). Level 3 with 4-frame mini-GOPs: 2.0 GB (4096x2304: 1.5 GB),
+    // under 2K's default 2.4 GB, which works; about half the speed, temporal filtering kept.
+    if ((int64_t) width * height > 5'000'000) {
+        svt_av1_enc_parse_parameter(&c, "lp", "3");
+        svt_av1_enc_parse_parameter(&c, "hierarchical-levels", "2");
+    }
     if (svt_av1_enc_set_parameter(s->encoder, &c) != EB_ErrorNone || svt_av1_enc_init(s->encoder) != EB_ErrorNone) {
         LOGW("SVT-AV1: settings refused");
         svt_av1_enc_deinit_handle(s->encoder);
