@@ -186,6 +186,8 @@ class CameraActivity : Activity() {
     private var cameraFailures = 0
     /** [RawCamera.variant] for the current lens; steps down when a layout fails before any frame. */
     private var sessionVariant = 0
+    /** Failures of the current layout that got as far as asking for a session, with no frame. */
+    private var layoutFailures = 0
     private var retryPending = false
     private var retryWaitStartMs = 0L
 
@@ -1306,6 +1308,7 @@ class CameraActivity : Activity() {
                 selectSavedLens()
                 cameraFailures = 0
                 sessionVariant = 0
+                layoutFailures = 0
                 note("Found ${found.size} lens${if (found.size == 1) "" else "es"}: " + found.joinToString { it.label })
                 setupPipeline()
                 if (resumed) camera?.open(capture)
@@ -1472,6 +1475,7 @@ class CameraActivity : Activity() {
         if (remember) prefs.edit().putString("lens", l.key).apply()
         cameraFailures = 0
         sessionVariant = 0
+        layoutFailures = 0
         restartPipeline()
     }
 
@@ -1544,8 +1548,13 @@ class CameraActivity : Activity() {
         val lens = lenses.getOrNull(lensIndex)
         val noFrames = (renderer?.frameCounter ?: 0L) == 0L
         cameraFailures++
-        if (noFrames && cameraFailures % 2 == 0 && sessionVariant < cam.lastVariant) {
+        // Only failures where this layout was actually tried count against it: an open refused
+        // while the camera service restarts (IN_USE, disconnected: realme GT ME after its HAL
+        // crashed) stepped a working layout down.
+        if (noFrames && cam.layoutTried) layoutFailures++
+        if (noFrames && cam.layoutTried && layoutFailures % 2 == 0 && sessionVariant < cam.lastVariant) {
             sessionVariant++
+            layoutFailures = 0
             EventLog.log("Lens ${lens?.key}: no frames with this session layout twice; trying layout $sessionVariant")
         }
         if (cameraFailures <= MAX_CAMERA_RETRIES) {
@@ -1674,6 +1683,7 @@ class CameraActivity : Activity() {
                     cameraFailures > 0 && last >= cam.openRequestedMs && now - cam.openRequestedMs > 5000 && now - last < 500 -> {
                         EventLog.log("Lens ${lenses.getOrNull(lensIndex)?.key} streaming again (layout $sessionVariant)")
                         cameraFailures = 0
+                        layoutFailures = 0
                         if (lastResult?.startsWith("Camera problem") == true) lastResult = null
                     }
                 }
@@ -1806,6 +1816,10 @@ class CameraActivity : Activity() {
      * on the Xiaomi 14: "mAllowedKillBatteryTempThreshhold is 48"; Android's own thermal status
      * still said "none" at 50 °C), and a recording cut off that way is lost. So the battery
      * temperature is watched: a warning as it climbs, and recording stops cleanly at [HOT_STOP_C].
+     * Other makers do report a thermal status, some early: the realme GT Master Edition reached
+     * SEVERE (heavy throttling) at 37.5–40 °C battery, which stopped every longer recording. A
+     * throttled phone only records fewer frames (the renderer skips what it can't keep up with),
+     * so recording stops at CRITICAL, where the system starts shutting things down.
      */
     private var batteryTempC = Float.NaN
     private var thermalStatus = PowerManager.THERMAL_STATUS_NONE
@@ -1834,9 +1848,10 @@ class CameraActivity : Activity() {
             EventLog.log("Battery %.1f °C (heat level $heatLevel → $level)".format(tempC))
             heatLevel = level
         }
-        if (recorder != null && (tempC >= HOT_STOP_C || status >= PowerManager.THERMAL_STATUS_SEVERE)) {
+        if (recorder != null && (tempC >= HOT_STOP_C || status >= PowerManager.THERMAL_STATUS_CRITICAL)) {
             EventLog.log("Stopping recording: battery %.1f °C, thermal status $status".format(tempC))
-            stopRecording("Stopped: phone too hot (%.1f °C; the system closes apps at about 48 °C)".format(tempC))
+            stopRecording(if (tempC >= HOT_STOP_C) "Stopped: phone too hot (%.1f °C; the system closes apps at about 48 °C)".format(tempC)
+                else "Stopped: phone too hot (the system reports critical heat)")
         }
     }
 
@@ -1845,6 +1860,8 @@ class CameraActivity : Activity() {
         batteryTempC >= HOT_STOP_C -> "🌡 %.1f °C: too hot to record, let the phone cool".format(batteryTempC)
         batteryTempC >= HOT_WARN_C -> "🌡 %.1f °C: recording stops at %.0f °C".format(batteryTempC, HOT_STOP_C)
         batteryTempC >= WARM_C -> "🌡 %.1f °C".format(batteryTempC)
+        thermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> "🌡 critical heat: too hot to record, let the phone cool"
+        thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> "🌡 phone is throttling hard: frames will be skipped"
         thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> "🌡 phone is throttling (thermal status $thermalStatus)"
         else -> null
     }
@@ -1915,6 +1932,10 @@ class CameraActivity : Activity() {
         if (stopping) return
         if (batteryTempC >= HOT_STOP_C) {
             showMessage("Phone too hot to record (%.1f °C); the system would close the app mid-recording".format(batteryTempC))
+            return
+        }
+        if (thermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL) {
+            showMessage("Phone too hot to record (the system reports critical heat); let it cool")
             return
         }
         val (fullW, fullH, keep) = frameSize(cam)

@@ -197,6 +197,12 @@ class RawCamera(
     private var session: CameraCaptureSession? = null
     /** An open is in flight or done; makes repeated open() calls harmless. */
     private var opened = false
+    /**
+     * A session with this layout was asked for: failures before that (an open refused while the
+     * camera service restarts) say nothing about the layout (see CameraActivity.onCameraFailure).
+     */
+    @Volatile var layoutTried = false
+        private set
     /** Bumped by every open and close: callbacks from an older open are ignored. */
     private var generation = 0
     private var capturesFailed = 0
@@ -212,7 +218,9 @@ class RawCamera(
                     c.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK &&
                         c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                             ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
-                } ?: error("No back camera with RAW support")
+                // Shown as "Camera unavailable: …". Some makers keep RAW for their own camera app
+                // (Samsung's A-series: every camera LIMITED, no RAW capability), which no app can change.
+                } ?: error("this phone doesn't give apps RAW from any back camera (AuthRec needs it)")
         }
 
         characteristics = chars
@@ -343,6 +351,7 @@ class RawCamera(
 
     private fun createSession(d: CameraDevice) {
         val gen = generation
+        layoutTried = true
         // With zoom routing, the metering stream stays on the logical camera: that's where its
         // 3A (and the active lens's native AF) runs, and HALs want a logical stream anyway.
         val outputs = listOfNotNull(

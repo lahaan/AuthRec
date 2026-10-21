@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
 import android.os.Process
 import android.provider.MediaStore
 import java.text.SimpleDateFormat
@@ -48,12 +49,41 @@ object Diagnostics {
         }
     }
 
+    /** The maker's own OS version properties (which skin, which release). */
+    private val osProperties = setOf(
+        "ro.build.version.oneui", "ro.miui.ui.version.name", "ro.mi.os.version.name", "ro.build.version.opporom",
+        "ro.build.version.oplusrom", "ro.build.version.realmeui", "ro.vivo.os.version", "ro.build.version.magic",
+        "ro.build.version.emui", "ro.build.version.nothing", "ro.product.marketname",
+    )
+
+    /**
+     * The maker's OS version and its camera allow-list properties, where an app may read them (many
+     * `vendor.*` ones are SELinux-protected and simply don't show): most makers hide extra lenses
+     * from apps not named in a list like `vendor.camera.aux.packagelist` (Xiaomi, Motorola, Asus),
+     * `persist.camera.privapp.list` (Oplus) or `ro.camera.aux.packagelist` (Honor).
+     */
+    private fun systemProperties(): String = buildString {
+        val line = Regex("""^\[([^\]]+)]: \[(.*)]$""")
+        ProcessBuilder("getprop").redirectErrorStream(true).start().inputStream.bufferedReader().useLines { lines ->
+            lines.mapNotNull { line.find(it)?.destructured }.forEach { (name, value) ->
+                val camera = "camera" in name && listOf("aux", "packagelist", "privapp", "multicam", "expose").any { it in name }
+                if (value.isNotEmpty() && (name in osProperties || camera)) appendLine("$name = $value")
+            }
+        }
+    }
+
     private fun report(context: Context): String = buildString {
         val app = context.packageManager.getPackageInfo(context.packageName, 0)
         appendLine("AuthRec ${app.versionName} diagnostics, ${Date()}")
         appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE}), SoC ${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}")
         appendLine("Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.DISPLAY}")
         appendLine("Fingerprint: ${Build.FINGERPRINT}")
+        // 33+ guarantees RAW on the main back camera; 34+ a logical camera over the back lenses.
+        appendLine("Media performance class: ${Build.VERSION.MEDIA_PERFORMANCE_CLASS.takeIf { it > 0 } ?: "none"}")
+        context.getSystemService(PowerManager::class.java)?.let { pm ->
+            appendLine("Thermal status ${pm.currentThermalStatus}, headroom ${runCatching { "%.2f".format(pm.getThermalHeadroom(10)) }.getOrDefault("?")}")
+        }
+        append(runCatching { systemProperties() }.getOrElse { "properties unavailable: $it\n" })
         appendLine()
         appendLine("== Cameras ==")
         append(runCatching { cameraReport(context) }.getOrElse { "failed: $it\n" })

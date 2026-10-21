@@ -246,7 +246,10 @@ class LensProbe(private val context: Context) {
 
     /** Every id that answers, plus physical sub-lenses of logical cameras, that offers RAW; in test order. */
     private fun candidates(listed: List<String>): List<Candidate> {
-        val ids = (listed + (0..31).map { it.toString() }).distinct()
+        // Hidden ids go past 31 on some phones (a Galaxy A54's framework log named 23, 56, 58 and
+        // 60; MotionCam's lens discovery tries 0–99). An id that doesn't exist costs one quick
+        // failed lookup.
+        val ids = (listed + (0..99).map { it.toString() }).distinct()
         val direct = mutableListOf<Candidate>()
         val routes = mutableListOf<Candidate>()
         for (id in ids) {
@@ -345,11 +348,20 @@ class LensProbe(private val context: Context) {
         val d = deviceRef.get() ?: return openError.get() ?: Outcome(false, "open failed", transient = true)
 
         val reader = ImageReader.newInstance(lens.rawWidth, lens.rawHeight, ImageFormat.RAW_SENSOR, 3)
-        // Physical RAW needs a stream on the logical camera too (a RAW-only physical session took
-        // the 15 Ultra's camera HAL down).
-        val logicalYuv = if (lens.zoomRatio != 1f || logicalStream) ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2).apply {
+        // A small YUV stream next to the RAW, as real sessions have (RawCamera's metering stream):
+        // RAW alone took the realme GT Master Edition's camera HAL down on its main camera in every
+        // scan, and a RAW-only physical session the 15 Ultra's. On zoom routes and physical lenses
+        // it's on the logical camera, where the HAL wants a stream anyway.
+        val yuvSize = try {
+            cm.getCameraCharacteristics(lens.openId).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(ImageFormat.YUV_420_888)
+                ?.let { sizes -> sizes.firstOrNull { it.width == 640 && it.height == 480 } ?: sizes.filter { it.width >= 320 }.minByOrNull { it.width * it.height } }
+        } catch (e: Exception) {
+            null
+        } ?: Size(640, 480)
+        val yuv = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 2).apply {
             setOnImageAvailableListener({ it.acquireLatestImage()?.close() }, handler)
-        } else null
+        }
         val frames = AtomicInteger(0)
         val firstFrameMs = AtomicLong(0L)
         val stats = AtomicReference<Pair<Double, Double>?>(null)
@@ -372,7 +384,7 @@ class LensProbe(private val context: Context) {
                 SessionConfiguration.SESSION_REGULAR,
                 listOfNotNull(
                     OutputConfiguration(reader.surface).apply { lens.physicalId?.let { setPhysicalCameraId(it) } },
-                    logicalYuv?.let { OutputConfiguration(it.surface) },
+                    OutputConfiguration(yuv.surface),
                 ),
                 { handler.post(it) },
                 object : CameraCaptureSession.StateCallback() {
@@ -394,7 +406,7 @@ class LensProbe(private val context: Context) {
                     }
                     fun stream() = s.setRepeatingRequest(d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         addTarget(reader.surface)
-                        logicalYuv?.let { addTarget(it.surface) }
+                        addTarget(yuv.surface)
                         if (zoom != 1f) set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
                     }.build(), callback, handler)
                     stream()
@@ -448,7 +460,7 @@ class LensProbe(private val context: Context) {
             // The next test (or the real session) opens a camera right away; let this one shut down first.
             closed.await(3, TimeUnit.SECONDS)
             reader.close()
-            logicalYuv?.close()
+            yuv.close()
         }
         return outcome
     }
@@ -529,8 +541,8 @@ class LensProbe(private val context: Context) {
     }
 
     companion object {
-        /** Bump to force a rescan after changing how lenses are found. */
-        private const val VERSION = 8
+        /** Bump to force a rescan after changing how lenses are found (9: test streams carry a YUV stream, ids 0–99). */
+        private const val VERSION = 9
         private const val ERROR_CAMERA_DISABLED = CameraDevice.StateCallback.ERROR_CAMERA_DISABLED
 
         /** RAW size closest to 4096×3072 (binned open gate). */
