@@ -20,9 +20,10 @@ class GlassRect(val left: Float, val top: Float, val right: Float, val bottom: F
  * white labels stay readable. The views then draw only a light tint and a hairline rim on top.
  *
  * Cost on the X14 (`glasstiming` adb hook, which glFinishes around the screen draw): screen draw
- * 1.8 ms a frame without glass, ~3.3 ms with ~18 shapes, so about 1.5 ms; a third of that while
- * recording (the blur is refreshed every third frame). Nothing at all while [GlassRect]s are
- * empty (Classic layout). GL thread only; created on first use.
+ * 1.8 ms a frame without glass, ~3.3 ms with ~18 shapes and a fresh blur every frame. The
+ * renderer refreshes the blur every other frame between recordings (the whole screen pass 1.9 →
+ * 1.45 ms of GPU time, 2026-10-21) and twice a second while recording. Nothing at all while
+ * [GlassRect]s are empty (Classic layout). GL thread only; created on first use.
  */
 internal class GlassBackdrop {
     private val downProgram = Gl.renderProgram(PipelineShaders.displayVertex, DOWN_FRAGMENT)

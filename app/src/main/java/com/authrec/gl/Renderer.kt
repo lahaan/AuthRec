@@ -237,7 +237,7 @@ class Renderer(
     private fun logStages() {
         if (!pipeTiming || ++stageFrames < 60) return
         val t = developTarget()
-        android.util.Log.i("AuthRec", "pipeline %s%s%s: CPU reads %.1f, upload %.1f, prep %.1f, develop %.1f, encode %.1f ms".format(
+        android.util.Log.i("AuthRec", "pipeline %s%s%s: CPU reads %.1f, upload %.1f, prep %.1f, change test %.1f, develop %.1f, encode %.1f ms".format(
             when (t.program) {
                 superpixelProgram, fastSuperpixelProgram -> "superpixel"
                 scaledProgram, fastScaledProgram -> "scaled ${t.width}x${t.height}"
@@ -245,7 +245,7 @@ class Renderer(
             } + if (nrFast) " (fast NR)" else "",
             if (recording != null) " recording" else "",
             if (activeCleanup() >= 2) " colour NR" else "",
-            *stageNs.filterIndexed { i, _ -> i != 4 }.map { it / 60 / 1e6 }.toTypedArray()))
+            *intArrayOf(0, 1, 2, 4, 3, 5).map { stageNs[it] / 60 / 1e6 }.toTypedArray()))
         stageNs.fill(0)
         stageFrames = 0
     }
@@ -327,6 +327,7 @@ class Renderer(
     private var lutSize = 0
     private var shadingDims = 0 to 0
     private var prepProgram = 0
+    private var prepFixProgram = 0
     private var developProgram = 0
     private var coarseProgram = 0
     private var changeProgram = 0
@@ -573,6 +574,7 @@ class Renderer(
             }
         }
         prepProgram = Gl.computeProgram(PipelineShaders.prep)
+        prepFixProgram = Gl.computeProgram(PipelineShaders.prepFixDefects)
         developProgram = Gl.computeProgram(PipelineShaders.develop)
         coarseProgram = Gl.computeProgram(PipelineShaders.coarseColour)
         changeProgram = Gl.computeProgram(PipelineShaders.colourChange)
@@ -582,6 +584,8 @@ class Renderer(
         GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, motionBuffer)
         superpixelProgram = Gl.computeProgram(PipelineShaders.developSuperpixel)
         scaledProgram = Gl.computeProgram(PipelineShaders.developScaled)
+        // Here rather than at REC, so a clip's start never waits for a shader compile.
+        viewLogProgram = Gl.computeProgram(PipelineShaders.viewFromLog)
         displayProgram = Gl.renderProgram(PipelineShaders.displayVertex, PipelineShaders.displayFragment)
 
         rawTex = Gl.texture2D(GLES30.GL_R16UI, w, h, linear = false)
@@ -1042,27 +1046,28 @@ class Renderer(
             updateShading(meta.shading)
         }
 
-        val groupsX = (w + 15) / 16
-        val groupsY = (h + 15) / 16
-        val sp = activeSuperpixel()
-
-        // Pass 1: normalise RAW.
-        GLES30.glUseProgram(prepProgram)
-        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, rawTex)
-        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, shadingTex)
-        GLES31.glBindImageTexture(0, linearTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
-        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uBlack"), 1, meta?.blackLevel ?: floatArrayOf(0f, 0f, 0f, 0f), 0)
-        GLES30.glUniform1f(Gl.uniform(prepProgram, "uWhite"), meta?.whiteLevel ?: 1023f)
         val shift = wbShift
         val wb = meta?.wbGains ?: floatArrayOf(1f, 1f, 1f, 1f)
         val prepWb = FloatArray(4) { wb[it] * shift[it] }
-        GLES30.glUniform4fv(Gl.uniform(prepProgram, "uWb"), 1, prepWb, 0)
-        GLES30.glUniform2i(Gl.uniform(prepProgram, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
-        GLES30.glUniform1i(Gl.uniform(prepProgram, "uFixDefects"), if (activeCleanup() >= 1) 1 else 0)
-        GLES31.glDispatchCompute(groupsX, groupsY, 1)
+
+        // Pass 1: normalise RAW: with the pixel fix one thread per 2×2 quad, without one per pixel
+        // (see PipelineShaders.prepFixDefects).
+        val fix = activeCleanup() >= 1
+        val prep = if (fix) prepFixProgram else prepProgram
+        GLES30.glUseProgram(prep)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, rawTex)
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, shadingTex)
+        GLES31.glBindImageTexture(0, linearTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
+        GLES30.glUniform4fv(Gl.uniform(prep, "uBlack"), 1, meta?.blackLevel ?: floatArrayOf(0f, 0f, 0f, 0f), 0)
+        GLES30.glUniform1f(Gl.uniform(prep, "uWhite"), meta?.whiteLevel ?: 1023f)
+        GLES30.glUniform4fv(Gl.uniform(prep, "uWb"), 1, prepWb, 0)
+        GLES30.glUniform2i(Gl.uniform(prep, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
+        if (fix) GLES31.glDispatchCompute((w / 2 + 15) / 16, (h / 2 + 15) / 16, 1)
+        else GLES31.glDispatchCompute((w + 15) / 16, (h + 15) / 16, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
-        if (activeCleanup() >= 2) updateColourChange(prepWb, meta)
         stage(2)
+        if (activeCleanup() >= 2) updateColourChange(prepWb, meta)
+        stage(4)
 
         // Pass 2: demosaic, colour noise reduction, colour, log, the view (and the clean log).
         val p = profile
@@ -1282,6 +1287,7 @@ class Renderer(
         Gl.bindTexture(1, GLES30.GL_TEXTURE_3D, if (baked) bakedTex else lutTex)
         // Writing the full-size log image costs ~100 MB of memory traffic a frame; skip it unless used.
         GLES30.glUniform1i(Gl.uniform(prog, "uWriteLog"), if (recording?.bakeLut == false || pendingLogCapture != null) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(prog, "uWriteView"), if (viewFromLog()) 0 else 1)
         GLES30.glUniform1i(Gl.uniform(prog, "uUseLut"), if (lutEnabled) 1 else 0)
         if (baked) {
             GLES30.glUniform1i(Gl.uniform(prog, "uLutConvert"), 0)
@@ -1320,7 +1326,11 @@ class Renderer(
         val viewAspect = viewW.toFloat() / viewH
         val (vw, vh) = if (viewAspect > imgAspect) (viewH * imgAspect).toInt() to viewH else viewW to (viewW / imgAspect).toInt()
         val target = developTarget()
-        val tex = target.view
+        val fromLog = viewFromLog()
+        if (fromLog) makeViewFromLog(target)
+        val tex = if (fromLog) spViewTex else target.view
+        val texW = if (fromLog) w / 2 else target.width
+        val texH = if (fromLog) h / 2 else target.height
         val letterbox = intArrayOf((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
         val rects = glassRects
         val glass = if (rects.isNotEmpty()) (backdrop ?: GlassBackdrop().also { backdrop = it }) else null
@@ -1328,12 +1338,14 @@ class Renderer(
         // The glass's offscreen passes go first so the window's render pass stays in one piece.
         glass?.let {
             it.timing = glassTiming
-            // While recording, a fresh blur twice a second is plenty behind the controls, and every
-            // millisecond of a viewfinder frame then comes out of the encoder's budget.
+            // Only frosted panels and the darkening over bright scenes use the blur (clear glass
+            // shows the image itself), so it needn't be fresh every frame: every other frame
+            // between recordings (half of its ~1 ms), twice a second while recording, where every
+            // millisecond of a viewfinder frame comes out of the encoder's budget.
             val now = SystemClock.elapsedRealtimeNanos()
-            val refresh = recording == null || now - lastGlassNs >= GLASS_REFRESH_RECORDING_NS
+            val refresh = now - lastGlassNs >= if (recording == null) GLASS_REFRESH_IDLE_NS else GLASS_REFRESH_RECORDING_NS
             if (refresh) lastGlassNs = now
-            it.prepare(tex, target.width, target.height, rotation, mirror, letterbox, viewW, viewH, frameCrop, refresh = refresh)
+            it.prepare(tex, texW, texH, rotation, mirror, letterbox, viewW, viewH, frameCrop, refresh = refresh)
         }
 
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
@@ -1341,8 +1353,8 @@ class Renderer(
         GLES30.glClearColor(0f, 0f, 0f, 1f)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glViewport(letterbox[0], letterbox[1], vw, vh)
-        val across = if (quarter) target.height else target.width
-        drawTexture(tex, rotation, peakingTexel = if (peaking) w.toFloat() / target.width else 0f,
+        val across = if (quarter) texH else texW
+        drawTexture(tex, rotation, peakingTexel = if (peaking) w.toFloat() / texW else 0f,
             smooth = beatsWithNoise(across.toFloat() / vw), mirror = mirror)
         drawFrameMask(letterbox[0], letterbox[1], vw, vh)
         glass?.drawShapes(rects, viewW, viewH, density)
@@ -1359,6 +1371,27 @@ class Renderer(
 
     private var screenFrames = 0
     private var screenNs = 0L
+
+    /**
+     * Recording log at full size: the develop pass writes only the log, and the viewfinder's
+     * image is made from it at half size when it's drawn ([makeViewFromLog]).
+     */
+    private fun viewFromLog() = recording?.let { !it.bakeLut && !it.superpixel && !it.scaled } == true
+
+    private var viewLogProgram = 0
+
+    /** The view of the develop pass's log at half size, into the superpixel view texture (unused while recording full size). */
+    private fun makeViewFromLog(target: DevelopTarget) {
+        GLES30.glUseProgram(viewLogProgram)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, target.log)
+        GLES31.glBindImageTexture(0, spViewTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        val p = profile
+        setViewUniforms(viewLogProgram, p)
+        GLES30.glUniform1i(Gl.uniform(viewLogProgram, "uCurve"), p.shaderId)
+        GLES31.glDispatchCompute((w / 2 + 15) / 16, (h / 2 + 15) / 16, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+    }
+
     /** For the glass's hairline sizes. */
     private val density = android.content.res.Resources.getSystem().displayMetrics.density
 
@@ -1569,7 +1602,8 @@ class Renderer(
         private const val BUDGET_SKIP = 10
         /** While recording and behind, the preview is still drawn this often (~10 fps). */
         private const val VIEW_INTERVAL_NS = 100_000_000L
-        /** While recording, the glass's blur of the preview is refreshed at most this often. */
+        /** The glass's blur of the preview is refreshed at most this often: between recordings (every 2nd frame at 24–30 fps) and while recording. */
+        private const val GLASS_REFRESH_IDLE_NS = 50_000_000L
         private const val GLASS_REFRESH_RECORDING_NS = 500_000_000L
         /** Frames taken from the reader at most (it has 6; the camera needs some). */
         private const val MAX_PENDING = 4
