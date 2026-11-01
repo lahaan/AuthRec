@@ -894,6 +894,128 @@ internal object PipelineShaders {
     val developSuperpixelFast get() = variant(true, superpixelMain)
     val developScaledFast get() = variant(true, scaledMain)
 
+    /**
+     * Photo mode's burst merge, on the prep pass's mosaic (shared by [photoMerge] and [photoNoise]):
+     * how much a 2×2 quad of this frame differs from the burst's first frame, the reference, in
+     * units of the sensor's noise. The noise of each prep sample follows from the noise profile
+     * and that pixel's own gain (white balance × lens shading), for both frames.
+     */
+    private val photoCommon = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+
+        layout(binding = 0) uniform highp sampler2D uLinear;     // this frame's prep output
+        layout(binding = 1) uniform mediump sampler2D uShading;  // R, G_even, G_odd, B gains, as in prep
+
+        uniform vec4 uWb;         // the prep pass's white balance (with the user's trim)
+        uniform vec2 uNoise;      // variance of normalised RAW at x: x * S + O
+        uniform float uGain;      // the reference's exposure over this frame's
+        uniform ivec2 uRedOffset;
+
+        float cur[4];
+        float ref[4];
+
+        /** z² of quad [q0]'s change from the reference (its 4 samples in [ref]); fills [cur] too. */
+        float quadZ2(ivec2 q0, ivec2 size) {
+            vec4 gains = texture(uShading, (vec2(q0) + 1.0) / vec2(size)) * uWb;
+            float d = 0.0;
+            float v = 0.0;
+            for (int i = 0; i < 4; i++) {
+                ivec2 p = q0 + ivec2(i & 1, i >> 1);
+                ivec2 site = (p + uRedOffset) & 1;
+                float g = gains[site == ivec2(0, 0) ? 0 : site == ivec2(1, 1) ? 3 : site == ivec2(1, 0) ? 1 : 2];
+                cur[i] = texelFetch(uLinear, p, 0).r * uGain;
+                d += cur[i] - ref[i];
+                // Prep value y = g · x: variance g·y·S + g²·O, for this frame and the reference.
+                v += g * (max(cur[i], 0.0) + max(ref[i], 0.0)) * uNoise.x + 2.0 * g * g * uNoise.y;
+            }
+            return d * d / max(v, 1e-12);
+        }
+    """.trimIndent() + "\n"
+
+    /**
+     * Photo mode: each burst frame averaged into the first (the moment the shutter was pressed)
+     * where it matches it within noise, one weight per 2×2 quad: full up to z 1.5, none from 3. No
+     * alignment: where the hand moved the picture, edges and texture differ by far more than noise
+     * and keep the first frame alone, while flat areas (where noise shows most) average them all;
+     * what a moved texture faint enough to pass leaves is within the noise it replaces.
+     * Modes: 0 the first frame (reference, sum and weight), 2 merge, 3 resolve (sum / weight into
+     * the image at binding 0, the prep image then, for the final develop).
+     */
+    val photoMerge = photoCommon + """
+        layout(r32f, binding = 0) uniform highp image2D uRef;     // the first frame; mode 3: the prep image
+        layout(r32f, binding = 1) uniform highp image2D uSum;     // Σ weight × value per pixel
+        layout(r32f, binding = 2) uniform highp image2D uWeight;  // Σ weight per 2×2 quad
+
+        uniform int uMode;
+        uniform float uScale;     // the lens's real noise (variance) over the profile's (photoNoise)
+
+        void main() {
+            ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = imageSize(uSum);
+            ivec2 q0 = q * 2;
+            if (q0.x + 1 >= size.x || q0.y + 1 >= size.y) return; // even sizes; an odd edge stays the first frame's
+            if (uMode == 0) {
+                for (int i = 0; i < 4; i++) {
+                    ivec2 p = q0 + ivec2(i & 1, i >> 1);
+                    float v = texelFetch(uLinear, p, 0).r;
+                    imageStore(uRef, p, vec4(v));
+                    imageStore(uSum, p, vec4(v));
+                }
+                imageStore(uWeight, q, vec4(1.0));
+                return;
+            }
+            if (uMode == 3) {
+                float w = imageLoad(uWeight, q).r;
+                for (int i = 0; i < 4; i++) {
+                    ivec2 p = q0 + ivec2(i & 1, i >> 1);
+                    imageStore(uRef, p, vec4(imageLoad(uSum, p).r / w));
+                }
+                return;
+            }
+            for (int i = 0; i < 4; i++) ref[i] = imageLoad(uRef, q0 + ivec2(i & 1, i >> 1)).r;
+            float w = 1.0 - smoothstep(1.5, 3.0, sqrt(quadZ2(q0, size) / uScale));
+            if (w <= 0.0) return;
+            for (int i = 0; i < 4; i++) {
+                ivec2 p = q0 + ivec2(i & 1, i >> 1);
+                imageStore(uSum, p, vec4(imageLoad(uSum, p).r + w * cur[i]));
+            }
+            imageStore(uWeight, q, vec4(imageLoad(uWeight, q).r + w));
+        }
+    """.trimIndent()
+
+    /**
+     * Photo mode: a histogram of [photoCommon]'s z² over every 4th quad each way (quarter-stop
+     * bins, bin 32 = z² 1), before a frame is merged. Its lower quartile gives the lens's real
+     * noise: the profiles are off ×0.2–×3 per lens (X14), which would merge real differences on
+     * one lens and refuse pure noise on another, and moving parts only raise the upper bins.
+     */
+    val photoNoise = photoCommon + """
+        layout(r32f, binding = 0) readonly uniform highp image2D uRef;
+        layout(std430, binding = 1) buffer Hist { uint hist[]; };
+
+        shared uint sHist[64];
+
+        void main() {
+            uint li = gl_LocalInvocationIndex;
+            if (li < 64u) sHist[li] = 0u;
+            memoryBarrierShared();
+            barrier();
+            ivec2 size = imageSize(uRef);
+            ivec2 q0 = ivec2(gl_GlobalInvocationID.xy) * 8;
+            if (q0.x + 1 < size.x && q0.y + 1 < size.y) {
+                for (int i = 0; i < 4; i++) ref[i] = imageLoad(uRef, q0 + ivec2(i & 1, i >> 1)).r;
+                float z2 = quadZ2(q0, size);
+                atomicAdd(sHist[clamp(int(floor(log2(max(z2, 1e-6)) * 4.0)) + 32, 0, 63)], 1u);
+            }
+            memoryBarrierShared();
+            barrier();
+            if (li < 64u && sHist[li] > 0u) atomicAdd(hist[li], sHist[li]);
+        }
+    """.trimIndent()
+
     val displayVertex = """
         #version 300 es
         out vec2 vUv;

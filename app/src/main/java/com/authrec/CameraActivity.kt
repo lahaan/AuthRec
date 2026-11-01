@@ -42,6 +42,7 @@ import com.authrec.color.LogProfile
 import com.authrec.color.Look
 import com.authrec.color.Looks
 import com.authrec.gl.Renderer
+import com.authrec.record.PhotoSaver
 import com.authrec.record.RecordConfig
 import com.authrec.record.Recorder
 import com.authrec.record.RecordingCheck
@@ -58,8 +59,9 @@ import kotlin.math.roundToInt
 
 /**
  * Live open-gate RAW → log preview with real-time looks/LUTs, and recording to HEVC/H.264 with
- * audio. Two modes: Simple (look, tap to focus, record) and Pro (everything); two layouts
- * ([GlassUi], [ClassicUi]) over the same state and actions, which live here.
+ * audio. Three modes: Simple (look, tap to focus, record), Pro (everything) and Photo (Simple's
+ * controls, the record button takes a still: [takePhoto]); two layouts ([GlassUi], [ClassicUi])
+ * over the same state and actions, which live here.
  *
  * Looks: built-in film-style presets, looks made in [LookEditorActivity], and imported .cube
  * files (in Android/data/com.authrec/files/luts/).
@@ -106,6 +108,18 @@ class CameraActivity : Activity() {
     internal var audioOn = true
         private set
     internal var simple = true
+        private set
+    /**
+     * Photo mode: Simple's controls ([simple] is true, fully automatic) and the record button
+     * takes a still (see [takePhoto]).
+     */
+    internal var photo = false
+        private set
+    /** Photo mode also saves the burst's first RAW frame as a DNG (Settings → Photo). */
+    internal var photoRaw = false
+        private set
+    /** A photo is being taken or saved: the shutter, lenses and modes wait for it. */
+    internal var photoBusy = false
         private set
     /** See [Renderer.cleanup]. */
     internal var cleanup = 2
@@ -296,6 +310,8 @@ class CameraActivity : Activity() {
 
     private fun loadPrefs() {
         simple = prefs.getBoolean("simple", true)
+        photo = simple && prefs.getBoolean("photo", false)
+        photoRaw = prefs.getBoolean("photoRaw", false)
         classicUi = prefs.getString("uiStyle", "glass") == "classic"
         aspect = runCatching { FrameAspect.valueOf(prefs.getString("aspect", null)!!) }.getOrDefault(FrameAspect.OPEN_GATE)
         profile = runCatching { LogProfile.valueOf(prefs.getString("profile", null)!!) }.getOrDefault(LogProfile.APPLE_LOG)
@@ -338,6 +354,8 @@ class CameraActivity : Activity() {
     private fun savePrefs() {
         prefs.edit()
             .putBoolean("simple", simple)
+            .putBoolean("photo", photo)
+            .putBoolean("photoRaw", photoRaw)
             .putString("uiStyle", if (classicUi) "classic" else "glass")
             .putString("aspect", aspect.name)
             .putString("profile", profile.name)
@@ -496,11 +514,16 @@ class CameraActivity : Activity() {
      * A mirrored front recording turns the other way round.
      */
     private fun recordingRotation(): Int {
-        val held = heldDegrees.takeIf { it >= 0 } ?: return 0
-        val reference = (360 - display.rotation * 90) % 360 // the listener's degrees in the screen's landscape
-        val turn = (held - reference + 360) % 360
+        val turn = poseTurn()
         val front = camera?.info?.front == true
         return if (front && !mirrored()) (360 - turn) % 360 else turn
+    }
+
+    /** How far the phone is turned clockwise from the screen's landscape (0 when unknown). */
+    private fun poseTurn(): Int {
+        val held = heldDegrees.takeIf { it >= 0 } ?: return 0
+        val reference = (360 - display.rotation * 90) % 360 // the listener's degrees in the screen's landscape
+        return (held - reference + 360) % 360
     }
 
     internal fun setEdr(on: Boolean) {
@@ -663,10 +686,30 @@ class CameraActivity : Activity() {
         updateUi()
     }
 
-    internal fun setSimple(on: Boolean) {
-        simple = on
-        // Simple mode is fully automatic.
-        if (on) setCapture(capture.copy(ae = AeMode.AUTO, af = AfMode.CONTINUOUS, focusPoint = null, evSteps = 0, awbLock = false))
+    internal fun setSimple(on: Boolean) = setMode(simple = on, photo = false)
+
+    /** Photo mode (see [photo]); off goes back to Simple. */
+    internal fun setPhoto(on: Boolean) = setMode(simple = true, photo = on)
+
+    /** 0 Simple, 1 Pro, 2 Photo: the mode switches' choice. */
+    internal val modeIndex get() = if (photo) 2 else if (simple) 0 else 1
+
+    internal fun setModeIndex(i: Int) = when (i) {
+        2 -> setPhoto(true)
+        else -> setSimple(i == 0)
+    }
+
+    private fun setMode(simple: Boolean, photo: Boolean) {
+        if (photoBusy || recorder != null || stopping) return
+        this.simple = simple
+        this.photo = photo
+        // Simple and Photo are fully automatic.
+        if (simple) setCapture(capture.copy(ae = AeMode.AUTO, af = AfMode.CONTINUOUS, focusPoint = null, evSteps = 0, awbLock = false))
+        settingsChanged()
+    }
+
+    internal fun setPhotoRaw(on: Boolean) {
+        photoRaw = on
         settingsChanged()
     }
 
@@ -1470,6 +1513,7 @@ class CameraActivity : Activity() {
     /** Switches to lens [index] with a fresh start (failure count, session layout). */
     internal fun switchLens(index: Int, remember: Boolean = true) {
         val l = lenses.getOrNull(index) ?: return
+        if (photoBusy) return
         EventLog.log("Switching to ${l.label} (${l.key})")
         lensIndex = index
         if (remember) prefs.edit().putString("lens", l.key).apply()
@@ -1776,6 +1820,7 @@ class CameraActivity : Activity() {
         getSystemService(PowerManager::class.java).removeThermalStatusListener(thermalListener)
         orientationListener.disable()
         stopRecording() // also cancels a warm-up
+        if (photoBusy) renderer?.cancelPhoto() // one already saving finishes on its own
         info.removeCallbacks(retryCamera)
         retryPending = false
         camera?.close()
@@ -1868,7 +1913,78 @@ class CameraActivity : Activity() {
 
     // ---- Recording ----
 
-    internal fun toggleRecording() = if (recorder == null) startRecording() else stopRecording()
+    internal fun toggleRecording() = when {
+        photo -> takePhoto()
+        recorder == null -> startRecording()
+        else -> stopRecording()
+    }
+
+    // ---- Photo ----
+
+    /** adb photoframes: burst length (debug; 0 = [PHOTO_FRAMES]). */
+    private var debugPhotoFrames = 0
+
+    /**
+     * Photo mode's shutter: a short burst from the running RAW stream, developed off the
+     * realtime path (full size, Quality colour NR warmed over the burst, the frames merged where
+     * they match: Renderer.takePhoto), saved as a JPEG of the view and optionally the first
+     * frame's DNG ([PhotoSaver]). The viewfinder keeps running; the shutter waits until saved.
+     */
+    internal fun takePhoto() {
+        val r = renderer ?: return
+        val cam = camera ?: return
+        if (photoBusy || recorder != null || stopping || scanning) return
+        photoBusy = true
+        val keep = frameSize(cam).third
+        val turn = recordingRotation()
+        // The RAW is the sensor's image: never mirrored, and the front camera's half turn not applied.
+        val rawTurn = ((if (cam.info.front) (360 - poseTurn()) % 360 else poseTurn()) + if (displayQuarterTurns == 2) 180 else 0) % 360
+        val lens = lenses.getOrNull(lensIndex)?.key
+        val frames = debugPhotoFrames.takeIf { it > 0 } ?: PHOTO_FRAMES
+        val battery = batteryTempC
+        val raw = photoRaw
+        info.postDelayed(photoTimeout, PHOTO_TIMEOUT_MS)
+        updateUi()
+        r.takePhoto(frames, keepRaw = raw, cropHeight = keep, onReference = { if (raw) cam.keepResult(it) }) { shot ->
+            // GL thread. Saving takes a second or two (JPEG of 12 MP, maybe a 25 MB DNG): its own thread.
+            if (shot == null) {
+                EventLog.log("Photo not taken (the camera stopped or switched)")
+                runOnUiThread { photoDone("Photo not taken") }
+                return@takePhoto
+            }
+            val dng = if (raw) cam.dngSource(shot.timestamp) else null
+            Thread {
+                val t0 = SystemClock.elapsedRealtime()
+                val saved = runCatching { PhotoSaver.save(this, shot, turn, dng, rawTurn) }
+                    .getOrElse { PhotoSaver.Result(null, 0, null, it.message ?: it.javaClass.simpleName) }
+                EventLog.log("${shot.summary} on $lens, " + (if (turn != 0) "turned $turn°, " else "") + "battery %.1f °C; ".format(battery) +
+                    "saved in ${SystemClock.elapsedRealtime() - t0} ms: " +
+                    (saved.jpeg?.let { "JPEG ${saved.jpegBytes / 1000} KB → $it" } ?: "no JPEG") +
+                    (saved.dng?.let { ", DNG → $it" } ?: "") + (saved.error?.let { " ($it)" } ?: ""))
+                val msg = when {
+                    saved.jpeg == null -> "Photo not saved: ${saved.error}"
+                    saved.error != null -> "Photo saved (${saved.error})"
+                    saved.dng != null -> "Photo saved (JPEG + DNG)"
+                    else -> "Photo saved"
+                }
+                runOnUiThread { photoDone(msg) }
+            }.start()
+        }
+    }
+
+    private val photoTimeout = Runnable {
+        if (!photoBusy) return@Runnable
+        EventLog.log("Photo timed out")
+        renderer?.cancelPhoto()
+        photoDone("Photo not taken (timed out)")
+    }
+
+    private fun photoDone(msg: String) {
+        info.removeCallbacks(photoTimeout)
+        photoBusy = false
+        note(msg)
+        updateUi()
+    }
 
     /**
      * Pre-roll: between pressing REC and the clip's first frame. The encoder already runs (its
@@ -2266,7 +2382,10 @@ class CameraActivity : Activity() {
      * recscale = 30..99 (`--ei`: record at that % of the size, to time the scaled develop path; 0 = off),
      * slowframe = ms (`--ei`: each recorded frame takes that much longer, a hot phone's backlog; 0 = off),
      * nightiso = effective ISO where the night limit starts (`--ei`, until the next lens switch; 0 = off),
-     * nrfast = true|false (`--ez`: colour NR's Fast variant instead of Quality).
+     * nrfast = true|false (`--ez`: colour NR's Fast variant instead of Quality),
+     * photo = true|false (`--ez`: Photo mode), cmd = photo (take one, in Photo mode), photoraw =
+     * true|false (`--ez`: a DNG too), photoframes = burst length (`--ei`, 0 = default),
+     * photomerge = false (`--ez`: no burst merge, to compare; colour NR still warms over the burst).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -2275,6 +2394,8 @@ class CameraActivity : Activity() {
         val extras = intent?.extras ?: return
         if (recorder == null) {
             if (extras.containsKey("simple")) setSimple(extras.getBoolean("simple"))
+            if (extras.containsKey("photo")) setPhoto(extras.getBoolean("photo"))
+            if (extras.containsKey("photoraw")) setPhotoRaw(extras.getBoolean("photoraw"))
             extras.getString("codec")?.let { setCodec(VideoCodec.valueOf(it)) }
             if (extras.containsKey("bitrate")) bitrateMbps = extras.getInt("bitrate")
             if (extras.containsKey("bake")) bakeLut = extras.getBoolean("bake")
@@ -2371,12 +2492,19 @@ class CameraActivity : Activity() {
         extras.getString("ui")?.let { setClassicUi(it == "classic") }
         if (extras.containsKey("recscale")) debugRecScale = extras.getInt("recscale")
         if (extras.containsKey("slowframe")) Renderer.debugSlowFrameMs = extras.getInt("slowframe")
+        if (extras.containsKey("photoframes")) debugPhotoFrames = extras.getInt("photoframes")
+        if (extras.containsKey("photomerge")) Renderer.debugPhotoMerge = extras.getBoolean("photomerge")
         extras.getString("open")?.let { name ->
             info.postDelayed({ if (name == "recordings") openRecordings() else ui.openForTest(name) }, 1200)
         }
         when (extras.getString("cmd")) {
             // Give the camera a moment to start when launched and told to record in one go.
             "rec" -> info.postDelayed({ if (recorder == null) startRecording() }, 1500)
+            // Photo mode's shutter (switches to Photo mode first); after 2.5 s, so AE and the auto gain have settled.
+            "photo" -> {
+                if (!photo) setPhoto(true)
+                info.postDelayed({ takePhoto() }, 2500)
+            }
             "stop" -> stopRecording()
             "edit" -> info.postDelayed({ openLookEditor() }, 1500)
             "dumpcams" -> Thread { dumpCameras() }.start()
@@ -2442,6 +2570,9 @@ class CameraActivity : Activity() {
         private const val TAP_AF_HALF = 0.06f
         /** Effective ISO from which the exposure slider's value turns amber. */
         private const val NOISY_ISO = 3200
+        /** Photo mode: frames in a burst (~0.3–0.5 s), and how long a photo may take before it's given up. */
+        private const val PHOTO_FRAMES = 8
+        private const val PHOTO_TIMEOUT_MS = 10_000L
         /** Pre-roll before a clip starts (see [warmingUp]): 4K, and 2K superpixel. */
         private const val PRE_ROLL_MS = 1000L
         private const val PRE_ROLL_2K_MS = 500L

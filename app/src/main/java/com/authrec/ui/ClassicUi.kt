@@ -15,7 +15,8 @@ import kotlin.math.abs
 
 /**
  * The original layout (Settings → Interface → Classic): plain buttons in two side columns, an
- * exposure bar at the bottom, every setting one tap away as a cycling button.
+ * exposure bar at the bottom, every setting one tap away as a cycling button. The mode button
+ * cycles Simple → Pro → Photo; in Photo, REC takes a still.
  */
 internal class ClassicUi(private val a: CameraActivity) : CameraUi {
 
@@ -23,7 +24,9 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val recButton = kit.button("") { a.toggleRecording() }.apply { textSize = 16f }
     /** Pause / resume, under REC while a clip records. */
     private val pauseButton = kit.button("") { a.togglePause() }
-    private val modeSwitch = kit.button("") { a.setSimple(!a.simple) }
+    private val modeSwitch = kit.button("") { a.setModeIndex((a.modeIndex + 1) % 3) }
+    /** Photo mode: a DNG too (Glass: Settings → Photo). */
+    private val rawButton = kit.button("") { a.setPhotoRaw(!a.photoRaw) }
     // The way back to Glass (and the lens tools) where it can be seen: this layout has no
     // settings sheet, and the same items in the lens menu went unnoticed.
     private val settingsButton = kit.button("⚙") { showSettingsMenu() }
@@ -98,7 +101,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
         }
         val left = column(profileButton, viewButton, importButton, adjustButton, edrButton)
-        val right = column(recButton, pauseButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton, nrButton)
+        val right = column(recButton, pauseButton, rawButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton, nrButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = a.exposureSlider.layoutParams as FrameLayout.LayoutParams
             val margin = v.width + 48 + 12
@@ -201,20 +204,30 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     override fun update() {
         val recording = a.recording
         recButton.text = when {
-            a.stopping -> "Saving…"
+            a.stopping || a.photoBusy -> "Saving…"
             a.warmingUp -> "Starting…"
             recording -> "■ STOP"
+            a.photo -> "◉ PHOTO"
             else -> "● REC"
         }
         recButton.setTextColor(if (recording) Color.RED else Color.WHITE)
-        recButton.isEnabled = !a.stopping
+        recButton.isEnabled = !a.stopping && !a.photoBusy
         pauseButton.visibility = if (recording) View.VISIBLE else View.GONE
         pauseButton.text = if (a.paused) "▶ Resume" else "❚❚ Pause"
         pauseButton.isEnabled = !a.stopping
-        lockedWhileRecording.forEach { it.isEnabled = !recording && !a.stopping && !a.warmingUp }
+        lockedWhileRecording.forEach { it.isEnabled = !recording && !a.stopping && !a.warmingUp && !a.photoBusy }
         proOnly.forEach { it.visibility = if (a.simple) View.GONE else View.VISIBLE }
+        // Photo mode: no video resolution (a photo is always the full RAW); its own RAW switch.
+        resButton.visibility = if (a.photo) View.GONE else View.VISIBLE
+        rawButton.visibility = if (a.photo) View.VISIBLE else View.GONE
+        rawButton.text = if (a.photoRaw) "RAW: DNG" else "RAW: off"
+        rawButton.isEnabled = !a.photoBusy
         a.info.visibility = View.VISIBLE // Glass hides it behind its settings sheet
-        modeSwitch.text = if (a.simple) "Pro ▸" else "Simple ▸"
+        modeSwitch.text = when (a.modeIndex) {
+            0 -> "Pro ▸"
+            1 -> "Photo ▸"
+            else -> "Simple ▸"
+        }
         // Always shown, even with one lens: its menu is also where Rescan and Send diagnostics live.
         lensButton.text = a.lenses.getOrNull(a.lensIndex)?.label?.takeIf { it.isNotEmpty() } ?: "Lens"
         mirrorButton.visibility = if (a.lenses.getOrNull(a.lensIndex)?.front == true) View.VISIBLE else View.GONE

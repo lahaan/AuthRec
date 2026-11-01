@@ -20,7 +20,8 @@ import kotlin.math.min
  * GL backdrop, see [glassBox]). Recording turns the core into a rounded square; while the pipeline
  * warms up or the file is being saved the ring dims and a white arc runs round it (a press while
  * starting cancels; saving ignores presses). Replaces a glossy core with a pulsing halo that the
- * owner found scuffed.
+ * owner found scuffed. In Photo mode ([photo]) the core is white, a shutter; SAVING is the photo
+ * being developed and saved.
  */
 internal class RecordButton(context: Context, private val onPress: () -> Unit) : View(context) {
 
@@ -30,15 +31,28 @@ internal class RecordButton(context: Context, private val onPress: () -> Unit) :
         set(v) {
             if (field == v) return
             field = v
-            animateMorph(if (v == State.RECORDING || v == State.SAVING) 1f else 0f)
-            contentDescription = when (v) {
-                State.IDLE -> "Record"
-                State.STARTING -> "Starting"
-                State.RECORDING -> "Stop"
-                State.SAVING -> "Saving"
-            }
+            // A shutter stays round while its photo is saved.
+            animateMorph(if (v == State.RECORDING || (v == State.SAVING && !photo)) 1f else 0f)
+            describe()
             invalidate()
         }
+
+    var photo = false
+        set(v) {
+            if (field == v) return
+            field = v
+            describe()
+            invalidate()
+        }
+
+    private fun describe() {
+        contentDescription = when (state) {
+            State.IDLE -> if (photo) "Take photo" else "Record"
+            State.STARTING -> "Starting"
+            State.RECORDING -> "Stop"
+            State.SAVING -> "Saving"
+        }
+    }
 
     /** 0 = round core (ready), 1 = square core (recording). */
     private var morph = 0f
@@ -103,8 +117,13 @@ internal class RecordButton(context: Context, private val onPress: () -> Unit) :
         val corner = half * (1f - 0.72f * morph)
         rect.set(cx - half, cy - half, cx + half, cy + half)
         val dim = (if (busy) 0.6f else 1f) * en
-        core.shader = LinearGradient(0f, rect.top, 0f, rect.bottom,
-            Color.argb((255 * dim).toInt(), 255, 77, 66), Color.argb((255 * dim).toInt(), 224, 38, 28), Shader.TileMode.CLAMP)
+        core.shader = if (photo) {
+            LinearGradient(0f, rect.top, 0f, rect.bottom,
+                Color.argb((255 * dim).toInt(), 255, 255, 255), Color.argb((255 * dim).toInt(), 226, 228, 232), Shader.TileMode.CLAMP)
+        } else {
+            LinearGradient(0f, rect.top, 0f, rect.bottom,
+                Color.argb((255 * dim).toInt(), 255, 77, 66), Color.argb((255 * dim).toInt(), 224, 38, 28), Shader.TileMode.CLAMP)
+        }
         c.drawRoundRect(rect, corner, corner, core)
     }
 

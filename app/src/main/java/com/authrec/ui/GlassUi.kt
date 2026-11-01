@@ -36,7 +36,8 @@ import kotlin.math.roundToInt
  * on the right the lenses, the big record button and the EV slider (where the right thumb rests
  * while filming); on the left mode, look, eDR, adjustments and settings. Pro adds a bar along
  * the bottom of the image with the exposure, ISO, shutter, white balance, focus and frame rate;
- * ISO and shutter open a dial to drag through the stops. Rarely changed options (codec, bitrate,
+ * ISO and shutter open a dial to drag through the stops. Photo (under Simple / Pro) has Simple's
+ * controls and makes the record button a shutter. Rarely changed options (codec, bitrate,
  * profile, clean-up, layout, lens tools) sit in the settings sheet.
  */
 internal class GlassUi(private val a: CameraActivity) : CameraUi {
@@ -81,7 +82,25 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private var lastBack: String? = null
 
     // ---- Left: mode, look, eDR, adjust, settings ----
-    private val modeRow = kit.segmented(listOf("Simple", "Pro")) { a.setSimple(it == 0) }
+    // Simple | Pro, and Photo under them (owner: "under Pro/Simple … just 'Photo'"): one pill
+    // slides between all three; a third button in the row would reach into the image.
+    private val modeButtons = listOf("Simple", "Pro", "Photo").mapIndexed { i, label ->
+        kit.button(label) { a.setModeIndex(i) }.apply {
+            setPadding(a.dp(12), a.dp(7), a.dp(12), a.dp(7))
+            textSize = 12f
+        }
+    }
+    private val modeBox = SelectionLayout(a).apply {
+        orientation = LinearLayout.VERTICAL
+        // Wrapped explicitly: a vertical LinearLayout's default (match_parent) squeezed the row to
+        // Photo's width ("Sim", no Pro).
+        addView(LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(modeButtons[0], LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = a.dp(6) })
+            addView(modeButtons[1])
+        }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        addView(modeButtons[2], LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = a.dp(6) })
+    }
     private val lookChip = captionChip("LOOK") { a.showViewMenu(it) }
     private val edrChip = kit.button("eDR") { a.setEdr(!a.edrOn) }.apply {
         setOnLongClickListener { if (!a.simple) toggle(adjustPanel); true }
@@ -227,6 +246,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     // ---- Settings sheet ----
     private val settingsRows = mutableListOf<() -> Unit>()
     private val proSettings = mutableListOf<View>()
+    /** Rows only video uses (hidden in Photo mode), and Photo's own. */
+    private val videoRows = mutableListOf<View>()
+    private val photoRows = mutableListOf<View>()
     private val settingsSheet: View = buildSettings()
 
     private val panels: List<View> = listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel, adjustPanel, settingsSheet)
@@ -254,7 +276,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
         // Left margin.
         val leftW = side.coerceAtLeast(a.dp(150))
-        addView(modeRow.first, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
+        addView(modeBox, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
             setMargins(a.dp(20), a.dp(16), 0, 0)
         })
         addView(LinearLayout(a).apply {
@@ -480,9 +502,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         /** [offered]: options shown; [usable]: options shown but greyed out where this phone can't. */
         fun <T> choice(label: String, pro: Boolean, options: List<Pair<String, T>>, current: () -> T,
                        offered: ((T) -> Boolean)? = null, usable: ((T) -> Boolean)? = null, note: TextView? = null,
-                       pick: (T) -> Unit) {
+                       pick: (T) -> Unit): View {
             val (seg, mark) = kit.segmented(options.map { it.first }) { i -> pick(options[i].second) }
-            row(label, pro, seg)
+            val r = row(label, pro, seg)
             // Its own visibility (shown only when it has something to say), so not in proSettings.
             note?.let { content.addView(it) }
             settingsRows += {
@@ -495,6 +517,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
                 }
                 mark(options.indexOfFirst { it.second == current() })
             }
+            return r
         }
         // Fixed above the rows, which scroll beneath it.
         val header = LinearLayout(a).apply {
@@ -503,16 +526,18 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             addView(title("Settings"), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             addView(kit.button("✕") { toggle(settingsSheet) })
         }
-        choice("Mode", false, listOf("Simple" to true, "Pro" to false), { a.simple }) { a.setSimple(it) }
+        choice("Mode", false, listOf("Simple" to 0, "Pro" to 1, "Photo" to 2), { a.modeIndex }) { a.setModeIndex(it) }
+        photoRows += choice("Photo", false, listOf("JPEG" to false, "JPEG + RAW" to true), { a.photoRaw }) { a.setPhotoRaw(it) }
         val resNote = kit.label("", 11f, dim = true)
-        choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), {
+        videoRows += resNote
+        videoRows += choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), {
             val limit = a.fourKLimit()
             resNote.text = limit?.let { "4K records at ${it.first}×${it.second} on this phone (its video encoder's limit)." } ?: ""
             resNote.visibility = if (resNote.text.isEmpty()) View.GONE else View.VISIBLE
             a.superpixel
         }, note = resNote) { a.setSuperpixel(it) }
         choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
-        choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
+        videoRows += choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
         val codecNote = kit.label("", 11f, dim = true)
         choice("Codec", true, VideoCodec.entries.map { it.label to it }, {
             codecNote.text = if (a.codec != a.effectiveCodec()) "This phone can't record 10-bit: it records ${a.effectiveCodec().label}." else ""
@@ -527,7 +552,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         // Quality: the history checked against each pixel's neighbours (best against trails, the
         // GPU's heaviest pass gets ~7 ms more at 4K); Fast: against the pixel's own noise.
         choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }) { a.setNrFast(it) }
-        choice("Audio", false, listOf("On" to true, "Off" to false), { a.audioOn }) { if (it != a.audioOn) a.toggleAudio() }
+        videoRows += choice("Audio", false, listOf("On" to true, "Off" to false), { a.audioOn }) { if (it != a.audioOn) a.toggleAudio() }
         choice("Layout", false, listOf("Glass" to false, "Classic" to true), { a.classicUi }) { a.setClassicUi(it) }
         fun buttons(pro: Boolean, vararg items: Pair<String, () -> Unit>) {
             val r = LinearLayout(a).apply {
@@ -617,26 +642,26 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
     override fun update() {
         val recording = a.recording
-        val busy = recording || a.stopping || a.warmingUp
+        val busy = recording || a.stopping || a.warmingUp || a.photoBusy
+        recordButton.photo = a.photo
         recordButton.state = when {
-            a.stopping -> RecordButton.State.SAVING
+            a.stopping || a.photoBusy -> RecordButton.State.SAVING
             a.warmingUp -> RecordButton.State.STARTING
             recording -> RecordButton.State.RECORDING
             else -> RecordButton.State.IDLE
         }
         updateRecPill()
 
-        modeRow.second(if (a.simple) 0 else 1)
-        modeRow.first.visibility = if (recording) View.INVISIBLE else View.VISIBLE // the REC pill sits there
-        modeRow.first.isEnabled = !busy
-        for (i in 0 until modeRow.first.childCount) modeRow.first.getChildAt(i).isEnabled = !busy
+        modeBox.select(modeButtons[a.modeIndex])
+        modeBox.visibility = if (recording) View.INVISIBLE else View.VISIBLE // the REC pill sits there
+        modeButtons.forEach { it.isEnabled = !busy }
         setCaption(lookChip, a.currentView()?.label ?: "")
         kit.setOn(edrChip, a.edrOn && a.edrAvailable())
         edrChip.isEnabled = a.edrAvailable()
         edrChip.text = if (a.edrOn) "eDR  on" else "eDR  off"
         kit.setOn(adjustChip, adjustPanel.visibility == View.VISIBLE)
         resChip.text = if (a.superpixel) "2K" else "4K"
-        resChip.visibility = if (a.simple) View.VISIBLE else View.GONE
+        resChip.visibility = if (a.simple && !a.photo) View.VISIBLE else View.GONE
         resChip.isEnabled = !busy
         settingsChip.isEnabled = !busy
         kit.setOn(settingsChip, settingsSheet.visibility == View.VISIBLE)
@@ -715,6 +740,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         // Settings.
         settingsRows.forEach { it() }
         proSettings.forEach { it.visibility = if (pro) View.VISIBLE else View.GONE }
+        // After the rows' own updates (the resolution note shows itself when it has something to say).
+        if (a.photo) videoRows.forEach { it.visibility = View.GONE } else videoRows.forEach { if (it is LinearLayout) it.visibility = View.VISIBLE }
+        photoRows.forEach { it.visibility = if (a.photo) View.VISIBLE else View.GONE }
     }
 
     /** ISO / shutter chips and dials: the camera's own values while auto exposure runs. */

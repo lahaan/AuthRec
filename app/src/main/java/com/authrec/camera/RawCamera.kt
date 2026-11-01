@@ -176,6 +176,30 @@ class RawCamera(
     private var metaLookups = 0
     private var metaMatched = 0
 
+    /** The last few capture results (the lens's own on physical routes), with [recentMeta]'s lock. */
+    private val recentResults = ArrayDeque<CaptureResult>()
+    /** A photo's first frame: its result is kept past [recentResults]' few (see [keepResult]). */
+    private var keptTimestamp = 0L
+    private var keptResult: CaptureResult? = null
+
+    /**
+     * Keeps the capture result of the RAW image with [timestamp] (now, or when it arrives) for
+     * [dngSource]: a photo's burst outlasts the few results held otherwise.
+     */
+    fun keepResult(timestamp: Long) = synchronized(recentMeta) {
+        keptTimestamp = timestamp
+        keptResult = recentResults.lastOrNull { it.get(CaptureResult.SENSOR_TIMESTAMP) == timestamp }
+    }
+
+    /**
+     * What DngCreator needs for the RAW image with [timestamp]: this lens's characteristics and
+     * its capture result (null if that result is gone or never came).
+     */
+    fun dngSource(timestamp: Long): Pair<CameraCharacteristics, CaptureResult>? = synchronized(recentMeta) {
+        keptResult?.takeIf { keptTimestamp == timestamp }
+            ?: recentResults.lastOrNull { it.get(CaptureResult.SENSOR_TIMESTAMP) == timestamp }
+    }?.let { characteristics to it }
+
     /** Whether the capture result for the RAW image with [timestamp] has arrived yet. */
     fun metaArrived(timestamp: Long): Boolean = synchronized(recentMeta) { recentMeta.any { it.timestamp == timestamp } }
 
@@ -715,6 +739,9 @@ class RawCamera(
                     synchronized(recentMeta) {
                         recentMeta.addLast(meta)
                         while (recentMeta.size > 12) recentMeta.removeFirst()
+                        recentResults.addLast(physical ?: result)
+                        while (recentResults.size > 12) recentResults.removeFirst()
+                        if (meta.timestamp == keptTimestamp && keptResult == null) keptResult = physical ?: result
                     }
                     onResult?.invoke()
                 }
