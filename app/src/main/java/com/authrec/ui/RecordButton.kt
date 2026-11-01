@@ -9,7 +9,6 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Shader
 import android.os.SystemClock
-import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.animation.DecelerateInterpolator
@@ -134,8 +133,8 @@ internal class RecordButton(context: Context, private val onPress: () -> Unit) :
             MotionEvent.ACTION_UP -> {
                 animate().scaleX(1f).scaleY(1f).setDuration(160).start()
                 // A press while starting cancels the start; saving can't be interrupted.
+                // The activity taps the vibrator for what the press does (record, stop, photo).
                 if (e.x in 0f..width.toFloat() && e.y in 0f..height.toFloat() && state != State.SAVING) {
-                    performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                     performClick()
                     onPress()
                 }

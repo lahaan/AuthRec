@@ -84,6 +84,10 @@ data class CaptureSettings(
     val focusPoint: PointF? = null,
     /** MANUAL only: 0 = infinity, [SensorInfo.minFocusDiopters] = closest. */
     val focusDiopters: Float = 0f,
+    /** Photo mode: MANUAL's shutter may stay open past a frame (to [RawCamera.PHOTO_LONGEST_NS]); the frame lasts as long. */
+    val longExposure: Boolean = false,
+    /** The flash unit lit steadily (a video light), where the lens has one ([RawCamera.hasTorch]). */
+    val torch: Boolean = false,
 )
 
 /** Per-frame metadata from the ISP's 3A, applied by our own pipeline instead of the ISP. */
@@ -480,11 +484,15 @@ class RawCamera(
                     set(CaptureRequest.CONTROL_AE_LOCK, st.ae == AeMode.LOCKED)
                 }
                 AeMode.MANUAL, AeMode.PRIORITY -> {
+                    // Exposure can't be longer than the frame, unless Photo mode lets the frame last longer.
+                    val longest = if (st.longExposure && st.ae == AeMode.MANUAL) {
+                        maxOf(frameNs, minOf(info.exposureRangeNs.upper, PHOTO_LONGEST_NS))
+                    } else frameNs
+                    val exposure = st.exposureNs.coerceIn(info.exposureRangeNs.lower, longest)
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                    set(CaptureRequest.SENSOR_FRAME_DURATION, frameNs)
+                    set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(frameNs, exposure))
                     set(CaptureRequest.SENSOR_SENSITIVITY, st.iso.coerceIn(info.isoRange.lower, info.isoRange.upper))
-                    // Exposure can't be longer than the frame.
-                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, st.exposureNs.coerceIn(info.exposureRangeNs.lower, frameNs))
+                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure)
                 }
             }
             when {
@@ -501,11 +509,28 @@ class RawCamera(
                     set(CaptureRequest.LENS_FOCUS_DISTANCE, st.focusDiopters.coerceIn(0f, info.minFocusDiopters))
                 }
             }
+            // The torch: on with AE on or off alike (never an AE flash mode), for as long as the stream runs.
+            if (hasTorch) set(CaptureRequest.FLASH_MODE, if (st.torch) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
             // A tapped spot also weights auto exposure, unless exposure is ours (manual / priority).
             if (st.ae in listOf(AeMode.AUTO, AeMode.LOCKED) && region != null && info.maxAeRegions > 0) {
                 set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
             }
         }
+    }
+
+    /**
+     * The camera we open has a flash unit (on zoom routes the logical camera's, which is where the
+     * request goes). Xiaomi 14: every back camera id reports one, the hidden ones too. No torch
+     * brightness: the X14 reports one level inside a session (FLASH_TORCH_STRENGTH_MAX_LEVEL; its
+     * 100 are the standalone flashlight's, refused while an app has a camera open).
+     */
+    val hasTorch: Boolean by lazy {
+        runCatching {
+            val chars = if (lens != null && lens.openId != lens.sensorId) {
+                context.getSystemService(CameraManager::class.java).getCameraCharacteristics(lens.openId)
+            } else characteristics
+            chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        }.getOrDefault(false)
     }
 
     /** True when the lens is reached through a logical camera's zoom (its native 3A/AF runs there). */
@@ -817,6 +842,8 @@ class RawCamera(
         private const val TAG = "AuthRec"
         /** Debug: this many upcoming opens fail right after opening (exercises the retry ladder). */
         @Volatile var debugFailOpens = 0
+        /** Photo mode's longest manual shutter: a few frames of it still fit a ~2 s burst. */
+        const val PHOTO_LONGEST_NS = 500_000_000L
         const val OPEN_GATE_W = 4096
         const val OPEN_GATE_H = 3072
         private val IDENTITY = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)

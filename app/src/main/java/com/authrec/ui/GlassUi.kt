@@ -36,8 +36,9 @@ import kotlin.math.roundToInt
  * on the right the lenses, the big record button and the EV slider (where the right thumb rests
  * while filming); on the left mode, look, eDR, adjustments and settings. Pro adds a bar along
  * the bottom of the image with the exposure, ISO, shutter, white balance, focus and frame rate;
- * ISO and shutter open a dial to drag through the stops. Photo (under Simple / Pro) has Simple's
- * controls and makes the record button a shutter. Rarely changed options (codec, bitrate,
+ * ISO and shutter open a dial to drag through the stops. Photo (under Simple / Pro) has Pro's
+ * controls without the video-only ones and makes the record button a shutter. Rarely changed
+ * options (codec, bitrate,
  * profile, clean-up, layout, lens tools) sit in the settings sheet.
  */
 internal class GlassUi(private val a: CameraActivity) : CameraUi {
@@ -75,6 +76,11 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val mirrorButton = roundChip("") { a.setMirrorFront(!a.mirrorFront) }.apply {
         foreground = MirrorIcon(this, a.dp(2).toFloat())
         contentDescription = "Mirror front camera"
+    }
+    /** Torch, in the mirror button's place on back lenses with a flash unit. */
+    private val torchButton = roundChip("") { a.setTorch(!a.capture.torch) }.apply {
+        foreground = TorchIcon(this, a.dp(2).toFloat()) { a.capture.torch }
+        contentDescription = "Torch"
     }
     private var lensKeys = emptyList<String>()
     private val lensChips = mutableMapOf<Int, Button>()
@@ -312,6 +318,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         addView(mirrorButton, FrameLayout.LayoutParams(a.dp(40), a.dp(40), Gravity.BOTTOM or Gravity.END).apply {
             setMargins(0, 0, rightColumnW + (sliderW - a.dp(40)) / 2, a.dp(21))
         })
+        addView(torchButton, FrameLayout.LayoutParams(a.dp(40), a.dp(40), Gravity.BOTTOM or Gravity.END).apply {
+            setMargins(0, 0, rightColumnW + (sliderW - a.dp(40)) / 2, a.dp(21))
+        })
 
         // Bottom of the image (Pro), with its panels above it.
         addView(proBar, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
@@ -539,19 +548,21 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
         videoRows += choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
         val codecNote = kit.label("", 11f, dim = true)
-        choice("Codec", true, VideoCodec.entries.map { it.label to it }, {
+        videoRows += codecNote
+        videoRows += choice("Codec", true, VideoCodec.entries.map { it.label to it }, {
             codecNote.text = if (a.codec != a.effectiveCodec()) "This phone can't record 10-bit: it records ${a.effectiveCodec().label}." else ""
             codecNote.visibility = if (codecNote.text.isEmpty() || a.simple) View.GONE else View.VISIBLE
             a.effectiveCodec()
         }, usable = { a.codecOffered(it) }, note = codecNote) { a.setCodec(it) }
-        choice("Bitrate (Mbps)", true, (CameraActivity.BITRATES_2K + CameraActivity.BITRATES_4K).distinct().sorted().map { "$it" to it },
+        videoRows += choice("Bitrate (Mbps)", true, (CameraActivity.BITRATES_2K + CameraActivity.BITRATES_4K).distinct().sorted().map { "$it" to it },
             { a.bitrateMbps }, offered = { it in a.bitrateOptions() }) { a.setBitrate(it) }
-        choice("Record", true, listOf("Look" to true, "Log" to false), { a.bakeLut }) { a.setBake(it) }
+        videoRows += choice("Record", true, listOf("Look" to true, "Log" to false), { a.bakeLut }) { a.setBake(it) }
         choice("Log profile", true, LogProfile.entries.map { it.label to it }, { a.profile }) { a.setProfile(it) }
-        choice("Clean-up", true, listOf("Off" to 0, "Pixels" to 1, "+ Colour" to 2, "+ Colour+" to 3), { a.cleanup }) { a.setCleanup(it) }
+        // Photos always get the full clean-up (Renderer.takePhoto).
+        videoRows += choice("Clean-up", true, listOf("Off" to 0, "Pixels" to 1, "+ Colour" to 2, "+ Colour+" to 3), { a.cleanup }) { a.setCleanup(it) }
         // Quality: the history checked against each pixel's neighbours (best against trails, the
         // GPU's heaviest pass gets ~7 ms more at 4K); Fast: against the pixel's own noise.
-        choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }) { a.setNrFast(it) }
+        videoRows += choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }) { a.setNrFast(it) }
         videoRows += choice("Audio", false, listOf("On" to true, "Off" to false), { a.audioOn }) { if (it != a.audioOn) a.toggleAudio() }
         choice("Layout", false, listOf("Glass" to false, "Classic" to true), { a.classicUi }) { a.setClassicUi(it) }
         fun buttons(pro: Boolean, vararg items: Pair<String, () -> Unit>) {
@@ -661,7 +672,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         edrChip.text = if (a.edrOn) "eDR  on" else "eDR  off"
         kit.setOn(adjustChip, adjustPanel.visibility == View.VISIBLE)
         resChip.text = if (a.superpixel) "2K" else "4K"
-        resChip.visibility = if (a.simple && !a.photo) View.VISIBLE else View.GONE
+        resChip.visibility = if (a.simple) View.VISIBLE else View.GONE
         resChip.isEnabled = !busy
         settingsChip.isEnabled = !busy
         kit.setOn(settingsChip, settingsSheet.visibility == View.VISIBLE)
@@ -684,6 +695,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         mirrorButton.visibility = if (current?.front == true) View.VISIBLE else View.GONE
         kit.setOn(mirrorButton, a.mirrorFront)
         mirrorButton.isEnabled = !busy
+        torchButton.visibility = if (current?.front != true && a.torchAvailable()) View.VISIBLE else View.GONE
+        kit.setOn(torchButton, a.capture.torch)
+        torchButton.contentDescription = if (a.capture.torch) "Torch on" else "Torch off"
+        torchButton.invalidate()
 
         // Pro bar.
         val pro = !a.simple
@@ -712,6 +727,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         setCaption(focusChip, a.afLabel().removePrefix("AF: ").let { if (it == "MF") "Manual" else it })
         kit.setOn(focusChip, a.capture.af == AfMode.MANUAL)
         setCaption(fpsChip, "${a.capture.fps}")
+        fpsChip.visibility = if (a.photo) View.GONE else View.VISIBLE
         fpsRow.second(fpsOptions.indexOf(a.capture.fps))
         fpsChip.isEnabled = !busy
         setCaption(resetChip, "All auto")
@@ -741,7 +757,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         settingsRows.forEach { it() }
         proSettings.forEach { it.visibility = if (pro) View.VISIBLE else View.GONE }
         // After the rows' own updates (the resolution note shows itself when it has something to say).
-        if (a.photo) videoRows.forEach { it.visibility = View.GONE } else videoRows.forEach { if (it is LinearLayout) it.visibility = View.VISIBLE }
+        if (a.photo) videoRows.forEach { it.visibility = View.GONE }
+        else videoRows.forEach { if (it is LinearLayout && it !in proSettings) it.visibility = View.VISIBLE }
         photoRows.forEach { it.visibility = if (a.photo) View.VISIBLE else View.GONE }
     }
 
@@ -1017,3 +1034,37 @@ private class MirrorIcon(private val view: TextView, private val stroke: Float) 
     override fun getOpacity() = PixelFormat.TRANSLUCENT
 }
 
+/** A lightning bolt in the button's text colour, filled while the torch is on. */
+private class TorchIcon(private val view: TextView, private val stroke: Float, private val on: () -> Boolean) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeJoin = Paint.Join.ROUND }
+    private val path = Path()
+
+    override fun draw(canvas: Canvas) {
+        val s = minOf(bounds.width(), bounds.height()) * 0.5f
+        val cx = bounds.exactCenterX()
+        val cy = bounds.exactCenterY()
+        paint.color = view.currentTextColor
+        paint.strokeWidth = stroke
+        paint.style = if (on()) Paint.Style.FILL_AND_STROKE else Paint.Style.STROKE
+        path.reset()
+        path.moveTo(cx + s * 0.10f, cy - s * 0.52f)
+        path.lineTo(cx - s * 0.26f, cy + s * 0.06f)
+        path.lineTo(cx - s * 0.02f, cy + s * 0.06f)
+        path.lineTo(cx - s * 0.12f, cy + s * 0.52f)
+        path.lineTo(cx + s * 0.26f, cy - s * 0.08f)
+        path.lineTo(cx + s * 0.02f, cy - s * 0.08f)
+        path.close()
+        canvas.drawPath(path, paint)
+    }
+
+    override fun setAlpha(alpha: Int) {
+        paint.alpha = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        paint.colorFilter = colorFilter
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity() = PixelFormat.TRANSLUCENT
+}

@@ -16,7 +16,7 @@ import kotlin.math.abs
 /**
  * The original layout (Settings → Interface → Classic): plain buttons in two side columns, an
  * exposure bar at the bottom, every setting one tap away as a cycling button. The mode button
- * cycles Simple → Pro → Photo; in Photo, REC takes a still.
+ * cycles Simple → Pro → Photo; Photo is Pro without the video-only buttons, and REC takes a still.
  */
 internal class ClassicUi(private val a: CameraActivity) : CameraUi {
 
@@ -36,6 +36,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val viewButton = kit.button("") { a.showViewMenu() }
     private val importButton = kit.button("+ LUT") { a.pickLut() }
     private val edrButton = kit.button("") { a.setEdr(!a.edrOn) }
+    /** The flash unit as a steady light (back lenses that have one). */
+    private val torchButton = kit.button("") { a.setTorch(!a.capture.torch) }
     private val adjustButton = kit.button("Adjust") {
         adjustPanel.visibility = if (adjustPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
     }
@@ -89,6 +91,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     }
     private val proOnly = listOf(profileButton, importButton, codecButton, bitrateButton, audioButton, bakeButton, cleanButton, nrButton, exposureBar,
         aspectButton)
+    private val videoOnly = listOf(codecButton, bitrateButton, audioButton, bakeButton, cleanButton, nrButton, fpsButton)
     private val lockedWhileRecording = listOf(profileButton, fpsButton, codecButton, bitrateButton, resButton, audioButton, bakeButton,
         importButton, modeSwitch, lensButton, settingsButton, aspectButton, mirrorButton)
 
@@ -100,7 +103,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             orientation = LinearLayout.VERTICAL
             views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
         }
-        val left = column(profileButton, viewButton, importButton, adjustButton, edrButton)
+        val left = column(profileButton, viewButton, importButton, adjustButton, edrButton, torchButton)
         val right = column(recButton, pauseButton, rawButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton, nrButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = a.exposureSlider.layoutParams as FrameLayout.LayoutParams
@@ -217,8 +220,11 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         pauseButton.isEnabled = !a.stopping
         lockedWhileRecording.forEach { it.isEnabled = !recording && !a.stopping && !a.warmingUp && !a.photoBusy }
         proOnly.forEach { it.visibility = if (a.simple) View.GONE else View.VISIBLE }
-        // Photo mode: no video resolution (a photo is always the full RAW); its own RAW switch.
+        // Photo mode: Pro without what only video uses (a photo is always the full RAW, fully
+        // cleaned up); its own RAW switch.
         resButton.visibility = if (a.photo) View.GONE else View.VISIBLE
+        if (a.photo) videoOnly.forEach { it.visibility = View.GONE }
+        fpsButton.visibility = if (a.photo) View.GONE else View.VISIBLE // inside the Pro-only exposure bar
         rawButton.visibility = if (a.photo) View.VISIBLE else View.GONE
         rawButton.text = if (a.photoRaw) "RAW: DNG" else "RAW: off"
         rawButton.isEnabled = !a.photoBusy
@@ -247,12 +253,14 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             else -> "eDR: %+d / %+d".format(a.edrHighlights, a.edrShadows)
         }
         edrButton.isEnabled = a.edrAvailable()
+        torchButton.visibility = if (a.torchAvailable()) View.VISIBLE else View.GONE
+        torchButton.text = if (a.capture.torch) "Torch: on" else "Torch: off"
         bakeButton.text = if (a.bakeLut) "Record: Look" else "Record: Log"
         cleanButton.text = a.cleanupLabel()
         nrButton.text = if (a.nrFast) "NR: Fast" else "NR: Quality"
         // Hidden while recording: Pause takes a row in this column then (and a switch mid-clip
         // would restart the NR's history).
-        if (!a.simple) nrButton.visibility = if (a.cleanup >= 2 && !recording) View.VISIBLE else View.GONE
+        if (!a.simple && !a.photo) nrButton.visibility = if (a.cleanup >= 2 && !recording) View.VISIBLE else View.GONE
 
         aeButton.text = a.aeLabel()
         afButton.text = a.afLabel()

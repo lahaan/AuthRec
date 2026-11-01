@@ -59,9 +59,9 @@ import kotlin.math.roundToInt
 
 /**
  * Live open-gate RAW → log preview with real-time looks/LUTs, and recording to HEVC/H.264 with
- * audio. Three modes: Simple (look, tap to focus, record), Pro (everything) and Photo (Simple's
- * controls, the record button takes a still: [takePhoto]); two layouts ([GlassUi], [ClassicUi])
- * over the same state and actions, which live here.
+ * audio. Three modes: Simple (look, tap to focus, record), Pro (everything) and Photo (Pro's
+ * controls without the video-only ones, the record button takes a still: [takePhoto]); two
+ * layouts ([GlassUi], [ClassicUi]) over the same state and actions, which live here.
  *
  * Looks: built-in film-style presets, looks made in [LookEditorActivity], and imported .cube
  * files (in Android/data/com.authrec/files/luts/).
@@ -110,8 +110,10 @@ class CameraActivity : Activity() {
     internal var simple = true
         private set
     /**
-     * Photo mode: Simple's controls ([simple] is true, fully automatic) and the record button
-     * takes a still (see [takePhoto]).
+     * Photo mode: Pro's controls ([simple] is false) without the video-only ones (frame rate,
+     * codec, bitrate, recording format, audio, resolution, clean-up: photos get the full
+     * clean-up), Manual's shutter up to ½ s, and the record button takes a still ([takePhoto]).
+     * Owner: "why are the manual controls all gone in photo".
      */
     internal var photo = false
         private set
@@ -242,6 +244,7 @@ class CameraActivity : Activity() {
     internal fun togglePause() {
         val rec = recorder ?: return
         if (warmingUp || stopping) return
+        tap()
         val now = SystemClock.elapsedRealtime()
         if (paused) {
             rec.resume()
@@ -257,6 +260,33 @@ class CameraActivity : Activity() {
     /** Frames lost while recording (from the renderer's stats). */
     internal var droppedFrames = 0
         private set
+
+    /**
+     * One short, strong tap when recording starts, stops or pauses and when a photo is taken
+     * (owner: "not a long lasting one but a strong short one"): the click primitive at full scale
+     * where the motor offers it, else a 30 ms pulse at full amplitude (the X14 has no primitives
+     * for apps, and its predefined heavy click plays at MEDIUM strength), else the heavy click.
+     * As touch feedback, so it follows the system's haptics setting.
+     */
+    private fun tap() {
+        val vibrator = getSystemService(android.os.VibratorManager::class.java)?.defaultVibrator ?: return
+        if (!vibrator.hasVibrator()) return
+        val primitive = android.os.VibrationEffect.Composition.PRIMITIVE_CLICK
+        val click = when {
+            vibrator.areAllPrimitivesSupported(primitive) ->
+                android.os.VibrationEffect.startComposition().addPrimitive(primitive, 1f).compose()
+            vibrator.hasAmplitudeControl() -> android.os.VibrationEffect.createOneShot(30, 255)
+            else -> android.os.VibrationEffect.createPredefined(android.os.VibrationEffect.EFFECT_HEAVY_CLICK)
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                vibrator.vibrate(click, android.os.VibrationAttributes.createForUsage(android.os.VibrationAttributes.USAGE_TOUCH))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(click)
+            }
+        }
+    }
 
     // Views both layouts place; the rest belongs to [ui].
     internal lateinit var surfaceView: SurfaceView
@@ -310,7 +340,7 @@ class CameraActivity : Activity() {
 
     private fun loadPrefs() {
         simple = prefs.getBoolean("simple", true)
-        photo = simple && prefs.getBoolean("photo", false)
+        photo = !simple && prefs.getBoolean("photo", false)
         photoRaw = prefs.getBoolean("photoRaw", false)
         classicUi = prefs.getString("uiStyle", "glass") == "classic"
         aspect = runCatching { FrameAspect.valueOf(prefs.getString("aspect", null)!!) }.getOrDefault(FrameAspect.OPEN_GATE)
@@ -342,7 +372,7 @@ class CameraActivity : Activity() {
         mirrorFront = prefs.getBoolean("mirrorFront", false)
         superpixel = prefs.getBoolean("superpixel", false)
         audioOn = prefs.getBoolean("audio", true)
-        capture = capture.copy(fps = prefs.getInt("fps", 30))
+        capture = capture.copy(fps = prefs.getInt("fps", 30), longExposure = photo)
         exposureEv = prefs.getFloat("exposureEv", 0f)
         limits = PriorityLimits(
             prefs.getLong("prioFastestNs", limits.fastestNs), prefs.getLong("prioSlowestNs", limits.slowestNs),
@@ -688,8 +718,8 @@ class CameraActivity : Activity() {
 
     internal fun setSimple(on: Boolean) = setMode(simple = on, photo = false)
 
-    /** Photo mode (see [photo]); off goes back to Simple. */
-    internal fun setPhoto(on: Boolean) = setMode(simple = true, photo = on)
+    /** Photo mode (see [photo]); off goes back to Pro, whose controls it shares. */
+    internal fun setPhoto(on: Boolean) = setMode(simple = false, photo = on)
 
     /** 0 Simple, 1 Pro, 2 Photo: the mode switches' choice. */
     internal val modeIndex get() = if (photo) 2 else if (simple) 0 else 1
@@ -703,9 +733,28 @@ class CameraActivity : Activity() {
         if (photoBusy || recorder != null || stopping) return
         this.simple = simple
         this.photo = photo
-        // Simple and Photo are fully automatic.
-        if (simple) setCapture(capture.copy(ae = AeMode.AUTO, af = AfMode.CONTINUOUS, focusPoint = null, evSteps = 0, awbLock = false))
+        var c = capture.copy(longExposure = photo)
+        // Simple is fully automatic.
+        if (simple) c = c.copy(ae = AeMode.AUTO, af = AfMode.CONTINUOUS, focusPoint = null, evSteps = 0, awbLock = false)
+        // Back from Photo's long shutters: a video frame holds at most 1/fps.
+        if (!photo) c = c.copy(exposureNs = c.exposureNs.coerceAtMost(1_000_000_000L / c.fps))
+        setCapture(c)
         settingsChanged()
+    }
+
+    /** The current lens has a flash unit the torch can use (the front cameras don't). */
+    internal fun torchAvailable() = camera?.hasTorch == true
+
+    /**
+     * The torch (a steady light for video and photos), while the app has the camera; not kept
+     * across launches. On/off only (owner): brightness is up to each phone's HAL, and the X14
+     * refuses it while an app has the camera (one level in a session; the flashlight API's 100
+     * fail on every id with "existing camera user" / "insufficient resources", tested 2026-11-01).
+     */
+    internal fun setTorch(on: Boolean) {
+        if (on == capture.torch) return
+        EventLog.log("Torch ${if (on) "on" else "off"} (lens ${lenses.getOrNull(lensIndex)?.key})")
+        setCapture(capture.copy(torch = on))
     }
 
     internal fun setPhotoRaw(on: Boolean) {
@@ -1304,12 +1353,16 @@ class CameraActivity : Activity() {
         return (stops.filter { it in range.lower..range.upper } + range.upper).distinct().sorted()
     }
 
-    /** Shutter times that fit in one frame at the current fps, longest first; includes 180° (1/2fps). */
+    /**
+     * Shutter times that fit in one frame at the current fps, longest first; includes 180° (1/2fps).
+     * Photo mode goes on to ½ s (RawCamera.PHOTO_LONGEST_NS), the sensor permitting.
+     */
     internal fun shutterStops(): List<Long> {
         val frameNs = 1_000_000_000L / capture.fps
         val minNs = camera?.info?.exposureRangeNs?.lower ?: 100_000L
-        val denoms = (listOf(24, 25, 30, 48, 50, 60, 100, 120, 125, 250, 500, 1000, 2000, 4000, 8000) + 2 * capture.fps).distinct()
-        return denoms.map { 1_000_000_000L / it }.filter { it in minNs..frameNs }.sortedDescending()
+        val longest = if (photo) maxOf(frameNs, minOf(camera?.info?.exposureRangeNs?.upper ?: frameNs, RawCamera.PHOTO_LONGEST_NS)) else frameNs
+        val denoms = (listOf(2, 4, 8, 15, 24, 25, 30, 48, 50, 60, 100, 120, 125, 250, 500, 1000, 2000, 4000, 8000) + 2 * capture.fps).distinct()
+        return denoms.map { 1_000_000_000L / it }.filter { it in minNs..longest }.sortedDescending()
     }
 
     // ---- Pipeline ----
@@ -1940,13 +1993,17 @@ class CameraActivity : Activity() {
         // The RAW is the sensor's image: never mirrored, and the front camera's half turn not applied.
         val rawTurn = ((if (cam.info.front) (360 - poseTurn()) % 360 else poseTurn()) + if (displayQuarterTurns == 2) 180 else 0) % 360
         val lens = lenses.getOrNull(lensIndex)?.key
-        val frames = debugPhotoFrames.takeIf { it > 0 } ?: PHOTO_FRAMES
+        // About PHOTO_BURST_NS of frames, at most PHOTO_FRAMES: Manual's long shutters get fewer.
+        val frameNs = maxOf(1e9 / capture.fps, if (capture.ae == AeMode.MANUAL) capture.exposureNs.toDouble() else 0.0)
+        val frames = debugPhotoFrames.takeIf { it > 0 } ?: (PHOTO_BURST_NS / frameNs).toInt().coerceIn(3, PHOTO_FRAMES)
         val battery = batteryTempC
         val raw = photoRaw
         info.postDelayed(photoTimeout, PHOTO_TIMEOUT_MS)
         updateUi()
         r.takePhoto(frames, keepRaw = raw, cropHeight = keep, onReference = { if (raw) cam.keepResult(it) }) { shot ->
-            // GL thread. Saving takes a second or two (JPEG of 12 MP, maybe a 25 MB DNG): its own thread.
+            // GL thread. The tap only now, the burst taken: the motor shook a ¼ s frame when it came
+            // with the press. Saving takes a second or two (JPEG of 12 MP, maybe a 25 MB DNG): its own thread.
+            if (shot != null) tap()
             if (shot == null) {
                 EventLog.log("Photo not taken (the camera stopped or switched)")
                 runOnUiThread { photoDone("Photo not taken") }
@@ -2089,6 +2146,7 @@ class CameraActivity : Activity() {
         }
         recorder = rec
         warmingUp = true
+        tap()
         recordStartMs = SystemClock.elapsedRealtime()
         lastResult = null
         EventLog.log("Recording ${w}x$h (${aspect.label}) ${recCodec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
@@ -2126,6 +2184,7 @@ class CameraActivity : Activity() {
         warmingUp = false
         val rec = recorder ?: return
         val r = renderer ?: return
+        tap()
         // Measured now: recordedMs() leaves pauses out, and needs the recorder for an open one.
         val secs = recordedMs() / 1000.0
         val pauseCount = rec.pauses.count()
@@ -2288,7 +2347,9 @@ class CameraActivity : Activity() {
         val m = stats.meta
         val shutter = if (m != null && m.exposureNs > 0) "1/${(1e9 / m.exposureNs).toInt()}" else "-"
         val (fw, fh) = frameSize(cam)
-        val out = "$fw×$fh" + (if (aspect != FrameAspect.OPEN_GATE) " ${aspect.label}" else "") + if (superpixel) " superpixel" else ""
+        val out = if (photo) "Photo ${cam.info.size.width}×${(cam.info.size.height * frameSize(cam).third).roundToInt()}" +
+            (if (aspect != FrameAspect.OPEN_GATE) " ${aspect.label}" else "")
+        else "$fw×$fh" + (if (aspect != FrameAspect.OPEN_GATE) " ${aspect.label}" else "") + if (superpixel) " superpixel" else ""
         // Sensor ISO times the digital gain before the log curve: what the noise looks like.
         val gainEv = renderer?.totalGainEv ?: 0f
         val effectiveIso = m?.iso?.let { (it * Math.pow(2.0, gainEv.toDouble())).roundToInt() }
@@ -2385,7 +2446,8 @@ class CameraActivity : Activity() {
      * nrfast = true|false (`--ez`: colour NR's Fast variant instead of Quality),
      * photo = true|false (`--ez`: Photo mode), cmd = photo (take one, in Photo mode), photoraw =
      * true|false (`--ez`: a DNG too), photoframes = burst length (`--ei`, 0 = default),
-     * photomerge = false (`--ez`: no burst merge, to compare; colour NR still warms over the burst).
+     * photomerge = false (`--ez`: no burst merge, to compare; colour NR still warms over the burst),
+     * torch = true|false (`--ez`).
      */
     private fun handleCommands(intent: Intent?) {
         // Launchers add their own extras (Xiaomi's sends e.g. "profile"); only adb-style intents
@@ -2415,8 +2477,10 @@ class CameraActivity : Activity() {
             if (extras.containsKey("wblock")) c = c.copy(awbLock = extras.getBoolean("wblock"))
             extras.getString("af")?.let { c = c.copy(af = AfMode.valueOf(it), focusPoint = null) }
             if (extras.containsKey("focus")) c = c.copy(focusDiopters = extras.getFloat("focus"))
+            if (extras.containsKey("torch")) c = c.copy(torch = extras.getBoolean("torch"))
             if (c != capture) setCapture(c)
         }
+
         // Debug: stream an arbitrary route, e.g. rawlens=5/4 zoom=2.6 (not saved to the lens list).
         extras.getString("rawlens")?.takeIf { recorder == null }?.let { route ->
             val (openId, physId) = route.split("/").let { it[0] to it.getOrNull(1) }
@@ -2572,6 +2636,7 @@ class CameraActivity : Activity() {
         private const val NOISY_ISO = 3200
         /** Photo mode: frames in a burst (~0.3–0.5 s), and how long a photo may take before it's given up. */
         private const val PHOTO_FRAMES = 8
+        private const val PHOTO_BURST_NS = 2e9
         private const val PHOTO_TIMEOUT_MS = 10_000L
         /** Pre-roll before a clip starts (see [warmingUp]): 4K, and 2K superpixel. */
         private const val PRE_ROLL_MS = 1000L
