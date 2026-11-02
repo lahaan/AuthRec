@@ -206,17 +206,30 @@ class Renderer(
     @Volatile var onNrShed: ((String) -> Unit)? = null
 
     /**
-     * [cleanup] as the pipeline runs it: without colour NR once a recording had to shed it; a
-     * photo's burst always gets the pixel fix and colour NR (it has the time).
+     * [cleanup] as the pipeline runs it: without colour NR once a recording had to shed it. Photo
+     * mode's viewfinder (and a photo's burst) has the pixel fix only, which the burst's merge
+     * needs; colour NR runs once on the merged photo (owner: NR after, a lighter viewfinder).
      */
     private fun activeCleanup() = when {
-        photo != null -> 2
+        photo?.final == true -> 2
+        photoMode || photo != null -> 1
         recording?.nrShed == true -> minOf(cleanup, 1)
         else -> cleanup
     }
 
-    /** Colour NR's Fast variant runs now ([nrFast]); a photo's burst always uses Quality. */
+    /** Colour NR's Fast variant runs now ([nrFast]); a photo always gets Quality. */
     private fun fastNr() = nrFast && photo == null
+
+    /** Photo mode (the viewfinder's settings, see [activeCleanup]; the dials below). */
+    @Volatile var photoMode = false
+    /**
+     * Photo mode's Texture, Clarity and Dehaze, −1..1 (PipelineShaders.photoFinish): on the
+     * viewfinder and the photo, not on recordings.
+     */
+    @Volatile var photoTexture = 0f
+    @Volatile var photoClarity = 0f
+    @Volatile var photoDehaze = 0f
+    private fun finishOn() = photoMode && (photoTexture != 0f || photoClarity != 0f || photoDehaze != 0f)
 
     /** Red focus-peaking overlay on the preview (never recorded). */
     @Volatile var peaking: Boolean = false
@@ -563,7 +576,13 @@ class Renderer(
             recording = null
             photo?.let { if (!it.done) it.onDone(null) }
             photo = null
+            pendingSnap?.onDone?.invoke(null)
+            pendingSnap = null
             releasePhotoTextures()
+            photoFinish?.release()
+            photoFinish = null
+            viewFinish?.release()
+            viewFinish = null
             releaseScaled()
             backdrop?.release()
             backdrop = null
@@ -746,7 +765,11 @@ class Renderer(
     private fun processFrame(image: Image): FrameMeta? {
         egl.makeCurrent(windowSurface)
         // The photo the last frame's draw showed is done with (see finishPhoto).
-        if (photo?.done == true) photo = null
+        if (photo?.done == true) {
+            photo = null
+            photoFinish?.release()
+            photoFinish = null
+        }
         stage(-1)
         val timestamp = image.timestamp
         lastFrameMs = SystemClock.elapsedRealtime()
@@ -782,6 +805,10 @@ class Renderer(
         stage(1)
         runPipeline(meta)
         recording?.let { encodeFrame(it, timestamp) }
+        pendingSnap?.let { snap ->
+            pendingSnap = null
+            snap.onDone(runCatching { takeSnapNow(snap, timestamp, meta) }.onFailure { EventLog.log("Snap failed", it) }.getOrNull())
+        }
         photo?.takeIf { !it.done }?.let { if (++it.taken >= it.frames) finishPhoto(it) }
         stage(5)
         logStages()
@@ -1252,14 +1279,17 @@ class Renderer(
         }
         GLES30.glUniform1i(Gl.uniform(prog, "uTnrOnLog"), if (onLog) 1 else 0)
         Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, history[historyRead])
-        Gl.bindTexture(3, GLES30.GL_TEXTURE_2D, keepTex)
+        // A photo's passes don't read the change test (uStill), which hasn't run for them.
+        Gl.bindTexture(3, GLES30.GL_TEXTURE_2D, if (keepTex != 0) keepTex else noHistory)
         GLES30.glUniform1i(Gl.uniform(prog, "uSlot"), motionSlot)
         GLES30.glUniform1f(Gl.uniform(prog, "uWindows"), ((w / 4) * (h / 4)).toFloat())
         GLES31.glBindImageTexture(2, history[1 - historyRead], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
         GLES30.glUniform1i(Gl.uniform(prog, "uTnr"), if (historyFresh) 2 else 1)
         historyFresh = false
         historyRead = 1 - historyRead
-        GLES30.glUniform1f(Gl.uniform(prog, "uTnrAlpha"), photo?.let { photoAlpha(it) } ?: if (activeCleanup() >= 3) TNR_STRONG else TNR_NORMAL)
+        val still = photo?.final == true
+        GLES30.glUniform1i(Gl.uniform(prog, "uStill"), if (still) 1 else 0)
+        GLES30.glUniform1f(Gl.uniform(prog, "uTnrAlpha"), if (still) PHOTO_NR_ALPHA else if (activeCleanup() >= 3) TNR_STRONG else TNR_NORMAL)
         // Sensor noise for normalised RAW (S·x + O), carried through the prep pass's white
         // balance and shading gains (~1.8 on average: variance scales by gain × S and gain² × O).
         val (ns, no) = rawNoise(meta)
@@ -1361,9 +1391,18 @@ class Renderer(
         val target = developTarget()
         val fromLog = viewFromLog()
         if (fromLog) makeViewFromLog(target)
-        val tex = if (fromLog) spViewTex else target.view
         val texW = if (fromLog) w / 2 else target.width
         val texH = if (fromLog) h / 2 else target.height
+        // Photo mode's dials on the viewfinder (the photo just taken: its own finished image, once).
+        val finished = photoFinish?.takeIf { photo?.done == true } ?: if (finishOn() && recording == null && !fromLog) {
+            viewFinish?.takeIf { it.width != texW || it.height != texH }?.let { it.release(); viewFinish = null }
+            (viewFinish ?: FinishTarget(texW, texH).also { viewFinish = it }).also { applyFinish(target.view, it, viewOctave = 1) }
+        } else {
+            viewFinish?.release()
+            viewFinish = null
+            null
+        }
+        val tex = finished?.out ?: if (fromLog) spViewTex else target.view
         val letterbox = intArrayOf((viewW - vw) / 2, (viewH - vh) / 2, vw, vh)
         val rects = glassRects
         val glass = if (rects.isNotEmpty()) (backdrop ?: GlassBackdrop().also { backdrop = it }) else null
@@ -1485,7 +1524,7 @@ class Renderer(
     }
 
     /** Mid-recording the mode is fixed by what the encoder was set up for; between recordings see [previewFullRes]. */
-    private fun activeSuperpixel() = if (photo != null) false else recording?.superpixel ?: (superpixel || !previewFullRes)
+    private fun activeSuperpixel() = if (photo?.final == true) false else recording?.superpixel ?: (superpixel || !previewFullRes)
 
     /**
      * Whether drawing at [scale] source pixels per screen pixel makes noise beat. Bilinear
@@ -1523,14 +1562,14 @@ class Renderer(
     /** A photo being taken (GL thread only). */
     private var photo: PhotoBurst? = null
 
-    private class PhotoBurst(val frames: Int, val merge: Boolean, val keepRaw: Boolean, val cropHeight: Float,
+    private class PhotoBurst(val frames: Int, val merge: Boolean, val align: Boolean, val keepRaw: Boolean, val cropHeight: Float,
                              val onReference: (Long) -> Unit, val onDone: (Photo?) -> Unit) {
-        /** Burst frames developed so far; the first ([taken] 0) is the reference. */
+        /** Burst frames taken so far; the first ([taken] 0) is the reference. */
         var taken = 0
         var merged = 0
         /** Frames left out of the merge because their exposure differed from the reference's. */
         var otherExposure = 0
-        /** The develop pass now makes the photo itself (the merged reference). */
+        /** The merged reference is being developed: the photo itself. */
         var final = false
         /** Handed over; the viewfinder shows the photo for one draw, then the preview goes on. */
         var done = false
@@ -1540,8 +1579,12 @@ class Renderer(
         var raw: ByteBuffer? = null
         /** The lens's real noise over its profile's (variance), from the first pair; NaN until then. */
         var noiseScale = Float.NaN
-        /** Sum of each merged frame's mean merge weight, for the event log. */
-        var keptSum = 0.0
+        /** The last frame's offset from the reference as a whole, and its tiles' from that: the mean, the most (RAW pixels). */
+        var shiftWhole = 0f
+        var shiftLastMean = 0f
+        var shiftMax = 0f
+        /** When the merged frame's develop began (the burst was in). */
+        var finalNs = 0L
         val startNs = SystemClock.elapsedRealtimeNanos()
     }
 
@@ -1554,24 +1597,23 @@ class Renderer(
                 val rawWidth: Int, val rawHeight: Int, val summary: String)
 
     /**
-     * Photo mode's shutter. The next [frames] frames are developed at full size with Quality colour
-     * NR, its history started over at the first, so it has warmed over the burst; each one after
-     * the first is averaged into it in RAW where it matches within noise (see
-     * PipelineShaders.photoMerge), and then the merged first frame is developed once more with
-     * that history. [onDone] gets its view ([cropHeight]: the frame's band, as in recordings) on
-     * the GL thread, or null when the burst couldn't finish (renderer released, a recording,
-     * another photo). [keepRaw]: the first frame's RAW as well (for a DNG); [onReference] gets that
-     * frame's timestamp as soon as it's picked (GL thread), so its capture result can be kept.
+     * Photo mode's shutter. The next [frames] frames are merged in RAW into the first (each one
+     * aligned to it, then averaged in where it matches within noise: PipelineShaders.photoAlign,
+     * photoMerge) while the viewfinder goes on as it was; then the merged frame is developed at
+     * full size with Quality colour NR (a few passes over it: see [finishPhoto]). [onDone] gets
+     * its view ([cropHeight]: the frame's band, as in recordings) on the GL thread, or null when
+     * the burst couldn't finish (renderer released, a recording, another photo). [keepRaw]: the
+     * first frame's RAW as well (for a DNG); [onReference] gets that frame's timestamp as soon as
+     * it's picked (GL thread), so its capture result can be kept.
      */
     fun takePhoto(frames: Int, keepRaw: Boolean, cropHeight: Float, onReference: (Long) -> Unit = {},
                   onDone: (Photo?) -> Unit) = handler.post {
         if (photo?.done == true) photo = null
         if (released || recording != null || photo != null) return@post onDone(null)
-        photo = PhotoBurst(frames.coerceAtLeast(1), debugPhotoMerge, keepRaw, cropHeight, onReference, onDone)
-        historyFresh = true
+        photo = PhotoBurst(frames.coerceAtLeast(1), debugPhotoMerge, debugPhotoAlign, keepRaw, cropHeight, onReference, onDone)
     }
 
-    /** Gives up on a photo still in its burst (the activity leaves the foreground). */
+    /** Gives up on a photo still in its burst. */
     fun cancelPhoto() = post {
         photo?.takeIf { !it.done }?.let {
             photo = null
@@ -1581,30 +1623,59 @@ class Renderer(
     }
 
     /**
-     * Colour NR's history weight in a photo's burst: a running mean (frame k blends 1/(k+1) of
-     * itself into what came before), so every burst frame counts the same, rather than the
-     * video's fixed weight where the newest count most. The merged photo itself averages most of
-     * the burst already; its colour leans on the history ([PHOTO_FINAL_ALPHA]), whose half-size,
-     * neighbourhood-clamped colour is smoother where the merge left a quad to the first frame.
+     * The activity leaves the foreground: a photo still in its burst is finished with the frames
+     * it has (no more are coming once the camera closes), so the shot isn't lost.
      */
-    private fun photoAlpha(p: PhotoBurst) = if (p.final) PHOTO_FINAL_ALPHA else p.taken / (p.taken + 1f)
+    fun finishPhotoNow() = post {
+        val p = photo?.takeIf { !it.done } ?: return@post
+        if (p.taken == 0 || windowSurface == EGL14.EGL_NO_SURFACE) {
+            photo = null
+            releasePhotoTextures()
+            p.onDone(null)
+            return@post
+        }
+        egl.makeCurrent(windowSurface)
+        finishPhoto(p)
+    }
 
     private var mergeProgram = 0
     private var noiseProgram = 0
+    private var diffProgram = 0
+    private var greyProgram = 0
+    private var downProgram = 0
+    private var alignProgram = 0
+    private var globalProgram = 0
+    private var globalPickProgram = 0
+    /** photoGlobal's cost per offset, and the offset it picked (1×1, coarsest-level pixels). */
+    private var globalBuffer = 0
+    private var globalTex = 0
     /** 0 until tried; -1 when the merge shaders didn't compile (photos then come without the merge). */
     private var mergeState = 0
     /** The burst's first frame (prep output), Σ weight × value per pixel, Σ weight per 2×2 quad. */
     private var refTex = 0
     private var sumTex = 0
     private var weightTex = 0
+    /** Per quad, its z² against the reference (PipelineShaders.photoDiff). */
+    private var z2Tex = 0
     private var histBuffer = 0
+    /** Alignment pyramids (grey, level 0 one value per quad: [PYR_FACTOR]) and each level's tile offsets. */
+    private val refPyr = IntArray(PYR_LEVELS)
+    private val altPyr = IntArray(PYR_LEVELS)
+    private val shiftTex = IntArray(PYR_LEVELS)
+    private val pyrW = IntArray(PYR_LEVELS)
+    private val pyrH = IntArray(PYR_LEVELS)
+    private val tilesW = IntArray(PYR_LEVELS)
+    private val tilesH = IntArray(PYR_LEVELS)
+    /** 1×1 zero offset: frames merged without alignment, and the coarsest level's guess. */
+    private var noShiftTex = 0
 
-    /** After a burst frame's prep pass: the first becomes the reference, the others are merged into it. */
+    /** After a burst frame's prep pass: the first becomes the reference, the others are aligned and merged into it. */
     private fun burstFrame(p: PhotoBurst, meta: FrameMeta?, prepWb: FloatArray) {
         if (p.final || !ensureMerge()) return
         if (p.taken == 0) {
             p.refPrepWb = prepWb
-            runMerge(MERGE_FIRST, 1f, 1f, meta, prepWb)
+            runMerge(MERGE_FIRST, 1f, 1f, meta, prepWb, noShiftTex, NO_SHAKE)
+            if (p.align) buildPyramid(refPyr, 1f, NO_SHAKE)
             return
         }
         if (!p.merge) return
@@ -1614,16 +1685,26 @@ class Renderer(
             p.otherExposure++
             return
         }
-        val hist = noiseHistogram(gain, meta, prepWb)
-        if (hist.sum() == 0) p.noiseScale = 1f // nothing read back: trust the profile
+        val shake = debugShake(p.taken)
+        val shift = if (p.align) align(gain, shake, p) else noShiftTex
         if (p.noiseScale.isNaN()) {
             // The quartile of pure noise's z² (chi-square, 1 degree of freedom) is 0.1015. From the
-            // first pair, the closest in time: the hand has moved least, so the least is moving.
-            p.noiseScale = (histQuantile(hist, 0.25) / 0.1015).toFloat().coerceIn(0.15f, 4f)
+            // first pair, the closest in time: the least has moved within the scene. (Read back,
+            // so it waits for the GPU: only this once.)
+            val hist = noiseHistogram(gain, meta, prepWb, shift, shake)
+            p.noiseScale = if (hist.sum() == 0) 1f else (histQuantile(hist, 0.25) / 0.1015).toFloat().coerceIn(0.15f, 4f)
         }
-        p.keptSum += histKept(hist, p.noiseScale)
-        runMerge(MERGE_ADD, gain, p.noiseScale, meta, prepWb)
+        runDiff(gain, meta, prepWb, shift, shake)
+        runMerge(MERGE_ADD, gain, p.noiseScale, meta, prepWb, shift, shake)
         p.merged++
+    }
+
+    /** Debug (adb photoshake): burst frame [k]'s made-up offset in quads (even RAW pixels), the same for every pixel. */
+    private fun debugShake(k: Int): IntArray {
+        val s = debugPhotoShake
+        if (s == 0) return NO_SHAKE
+        val a = k * 2.4
+        return intArrayOf((s * kotlin.math.cos(a)).roundToInt(), (s * kotlin.math.sin(a)).roundToInt())
     }
 
     /** ISO × exposure time of [meta]'s frame (NaN if unknown). */
@@ -1636,9 +1717,22 @@ class Renderer(
             mergeState = runCatching {
                 mergeProgram = Gl.computeProgram(PipelineShaders.photoMerge)
                 noiseProgram = Gl.computeProgram(PipelineShaders.photoNoise)
+                diffProgram = Gl.computeProgram(PipelineShaders.photoDiff)
+                greyProgram = Gl.computeProgram(PipelineShaders.photoGrey)
+                downProgram = Gl.computeProgram(PipelineShaders.photoDown)
+                alignProgram = Gl.computeProgram(PipelineShaders.photoAlign)
+                globalProgram = Gl.computeProgram(PipelineShaders.photoGlobal)
+                globalPickProgram = Gl.computeProgram(PipelineShaders.photoGlobalPick)
+                globalBuffer = IntArray(1).also { GLES30.glGenBuffers(1, it, 0) }[0]
+                GLES30.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, globalBuffer)
+                GLES30.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, 4 * GLOBAL_OFFSETS, zeroInts(GLOBAL_OFFSETS), GLES30.GL_DYNAMIC_DRAW)
+                globalTex = Gl.texture2D(GLES30.GL_RGBA32F, 1, 1, linear = false)
                 histBuffer = IntArray(1).also { GLES30.glGenBuffers(1, it, 0) }[0]
                 GLES30.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, histBuffer)
                 GLES30.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, 4 * HIST_BINS, zeroInts(HIST_BINS), GLES30.GL_DYNAMIC_DRAW)
+                noShiftTex = Gl.texture2D(GLES30.GL_RGBA32F, 1, 1, linear = false)
+                GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, 1, 1, GLES30.GL_RGBA, GLES30.GL_FLOAT,
+                    ByteBuffer.allocateDirect(16).order(ByteOrder.nativeOrder()))
                 1
             }.getOrElse {
                 EventLog.log("Photo: the burst merge's shaders failed; photos come without it", it)
@@ -1650,39 +1744,169 @@ class Renderer(
             refTex = Gl.texture2D(GLES30.GL_R32F, w, h, linear = false)
             sumTex = Gl.texture2D(GLES30.GL_R32F, w, h, linear = false)
             weightTex = Gl.texture2D(GLES30.GL_R32F, w / 2, h / 2, linear = false)
+            z2Tex = Gl.texture2D(GLES30.GL_R32F, w / 2, h / 2, linear = false)
+            var lw = w / 2
+            var lh = h / 2
+            for (k in 0 until PYR_LEVELS) {
+                if (k > 0) {
+                    lw = (lw + PYR_FACTOR[k] - 1) / PYR_FACTOR[k]
+                    lh = (lh + PYR_FACTOR[k] - 1) / PYR_FACTOR[k]
+                }
+                pyrW[k] = lw
+                pyrH[k] = lh
+                tilesW[k] = (lw + ALIGN_TILE[k] - 1) / ALIGN_TILE[k]
+                tilesH[k] = (lh + ALIGN_TILE[k] - 1) / ALIGN_TILE[k]
+                refPyr[k] = Gl.texture2D(GLES30.GL_R32F, lw, lh, linear = false)
+                altPyr[k] = Gl.texture2D(GLES30.GL_R32F, lw, lh, linear = false)
+                shiftTex[k] = Gl.texture2D(GLES30.GL_RGBA32F, tilesW[k], tilesH[k], linear = false)
+            }
         }
         return true
     }
 
-    /** ~110 MB at 4K: freed after each photo. */
+    /** ~150 MB at 4K: freed after each photo. */
     private fun releasePhotoTextures() {
         if (refTex == 0) return
-        GLES30.glDeleteTextures(3, intArrayOf(refTex, sumTex, weightTex), 0)
+        GLES30.glDeleteTextures(4, intArrayOf(refTex, sumTex, weightTex, z2Tex), 0)
+        GLES30.glDeleteTextures(PYR_LEVELS, refPyr, 0)
+        GLES30.glDeleteTextures(PYR_LEVELS, altPyr, 0)
+        GLES30.glDeleteTextures(PYR_LEVELS, shiftTex, 0)
         refTex = 0
         sumTex = 0
         weightTex = 0
+        z2Tex = 0
     }
 
-    private fun setMergeUniforms(prog: Int, gain: Float, meta: FrameMeta?, prepWb: FloatArray) {
+    /** This frame's grey pyramid (PipelineShaders.photoGrey, photoDown) into [pyr]. */
+    private fun buildPyramid(pyr: IntArray, gain: Float, shake: IntArray) {
+        GLES30.glUseProgram(greyProgram)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, linearTex)
+        GLES31.glBindImageTexture(0, pyr[0], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
+        GLES30.glUniform1f(Gl.uniform(greyProgram, "uGain"), gain)
+        GLES30.glUniform2i(Gl.uniform(greyProgram, "uDebugShift"), shake[0], shake[1])
+        GLES31.glDispatchCompute((pyrW[0] + 15) / 16, (pyrH[0] + 15) / 16, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+        GLES30.glUseProgram(downProgram)
+        for (k in 1 until PYR_LEVELS) {
+            Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, pyr[k - 1])
+            GLES31.glBindImageTexture(0, pyr[k], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
+            GLES30.glUniform1i(Gl.uniform(downProgram, "uFactor"), PYR_FACTOR[k])
+            GLES31.glDispatchCompute((pyrW[k] + 15) / 16, (pyrH[k] + 15) / 16, 1)
+            GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+        }
+    }
+
+    /**
+     * Where each tile of the reference is in this frame (PipelineShaders.photoAlign), coarse to
+     * fine; returns the last level's offsets (quads, per [PipelineShaders.PHOTO_SHIFT_TILE]²-quad
+     * tile). Reads them back for the event log (a photo's burst already waits for the GPU).
+     */
+    private fun align(gain: Float, shake: IntArray, p: PhotoBurst): Int {
+        buildPyramid(altPyr, gain, shake)
+        // The whole frame's offset (PipelineShaders.photoGlobal): the coarsest tiles' guess.
+        val top = PYR_LEVELS - 1
+        GLES30.glUseProgram(globalProgram)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, refPyr[top])
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, altPyr[top])
+        GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 1, globalBuffer)
+        GLES30.glUniform1i(Gl.uniform(globalProgram, "uRadius"), GLOBAL_RADIUS)
+        GLES31.glDispatchCompute(GLOBAL_OFFSETS, 1, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
+        GLES30.glUseProgram(globalPickProgram)
+        GLES31.glBindImageTexture(0, globalTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA32F)
+        GLES30.glUniform1i(Gl.uniform(globalPickProgram, "uRadius"), GLOBAL_RADIUS)
+        GLES31.glDispatchCompute(1, 1, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+
+        val prog = alignProgram
+        GLES30.glUseProgram(prog)
+        for (k in top downTo 0) {
+            val coarsest = k == top
+            Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, refPyr[k])
+            Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, altPyr[k])
+            Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, if (coarsest) globalTex else shiftTex[k + 1])
+            GLES31.glBindImageTexture(0, shiftTex[k], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA32F)
+            GLES30.glUniform1i(Gl.uniform(prog, "uTile"), ALIGN_TILE[k])
+            GLES30.glUniform1i(Gl.uniform(prog, "uRadius"), ALIGN_RADIUS[k])
+            // The whole frame's offset is in this level's pixels already, one "tile" over everything.
+            GLES30.glUniform1i(Gl.uniform(prog, "uCoarseScale"), if (coarsest) 1 else PYR_FACTOR[k + 1])
+            GLES30.glUniform1i(Gl.uniform(prog, "uCoarseTile"), if (coarsest) 1 shl 20 else ALIGN_TILE[k + 1])
+            GLES30.glUniform1i(Gl.uniform(prog, "uSubpixel"), if (k == 0) 1 else 0)
+            GLES31.glDispatchCompute(tilesW[k], tilesH[k], 1)
+            GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+        }
+        // For the event log: the last frame's (reading back waits for the GPU).
+        if (p.taken == p.frames - 1) runCatching { readShifts(p, shake) }
+        return shiftTex[0]
+    }
+
+    /**
+     * The last frame's offsets into [p]'s summary (RAW pixels, a debug shake's own taken off): the
+     * whole frame's, and how far the tiles went from it, on average and at most.
+     */
+    private fun readShifts(p: PhotoBurst, shake: IntArray) {
+        val global = readFloats(globalTex, 1, 1)
+        val gx = global.get(0) * GLOBAL_PX / 2
+        val gy = global.get(1) * GLOBAL_PX / 2
+        p.shiftWhole = 2f * kotlin.math.hypot(gx + shake[0], gy + shake[1])
+        val n = tilesW[0] * tilesH[0]
+        val f = readFloats(shiftTex[0], tilesW[0], tilesH[0])
+        var sum = 0.0
+        for (i in 0 until n) {
+            val len = 2f * kotlin.math.hypot(f.get(4 * i) - gx, f.get(4 * i + 1) - gy)
+            sum += len
+            if (len > p.shiftMax) p.shiftMax = len
+        }
+        p.shiftLastMean = (sum / n).toFloat()
+    }
+
+    /** An RGBA32F image read back (waits for the GPU). */
+    private fun readFloats(tex: Int, width: Int, height: Int): java.nio.FloatBuffer {
+        val fbo = IntArray(1).also { GLES30.glGenFramebuffers(1, it, 0) }[0]
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, tex, 0)
+        val buf = ByteBuffer.allocateDirect(16 * width * height).order(ByteOrder.nativeOrder())
+        GLES30.glReadPixels(0, 0, width, height, GLES30.GL_RGBA, GLES30.GL_FLOAT, buf)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
+        return buf.asFloatBuffer()
+    }
+
+    private fun setMergeUniforms(prog: Int, gain: Float, meta: FrameMeta?, prepWb: FloatArray, shift: Int, shake: IntArray) {
         Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, shadingTex)
+        Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, shift)
         val (ns, no) = rawNoise(meta)
         GLES30.glUniform4fv(Gl.uniform(prog, "uWb"), 1, prepWb, 0)
         GLES30.glUniform2f(Gl.uniform(prog, "uNoise"), ns, no)
         GLES30.glUniform1f(Gl.uniform(prog, "uGain"), gain)
         GLES30.glUniform2i(Gl.uniform(prog, "uRedOffset"), sensor.redOffset.first, sensor.redOffset.second)
+        GLES30.glUniform2i(Gl.uniform(prog, "uDebugShift"), shake[0], shake[1])
+    }
+
+    /** PipelineShaders.photoDiff: each quad's z² against the reference, for the merge's weights. */
+    private fun runDiff(gain: Float, meta: FrameMeta?, prepWb: FloatArray, shift: Int, shake: IntArray) {
+        val prog = diffProgram
+        GLES30.glUseProgram(prog)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, linearTex)
+        GLES31.glBindImageTexture(0, refTex, 0, false, 0, GLES31.GL_READ_ONLY, GLES30.GL_R32F)
+        GLES31.glBindImageTexture(1, z2Tex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_R32F)
+        setMergeUniforms(prog, gain, meta, prepWb, shift, shake)
+        GLES31.glDispatchCompute((w / 2 + 15) / 16, (h / 2 + 15) / 16, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
     }
 
     /** One PipelineShaders.photoMerge pass ([MERGE_FIRST], [MERGE_ADD] or [MERGE_RESOLVE] into the prep image). */
-    private fun runMerge(mode: Int, gain: Float, scale: Float, meta: FrameMeta?, prepWb: FloatArray) {
+    private fun runMerge(mode: Int, gain: Float, scale: Float, meta: FrameMeta?, prepWb: FloatArray, shift: Int, shake: IntArray) {
         val prog = mergeProgram
         val resolve = mode == MERGE_RESOLVE
         GLES30.glUseProgram(prog)
         // Resolving writes the prep image, which isn't read then: the sampler gets the reference.
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, if (resolve) refTex else linearTex)
+        Gl.bindTexture(3, GLES30.GL_TEXTURE_2D, z2Tex)
         GLES31.glBindImageTexture(0, if (resolve) linearTex else refTex, 0, false, 0, GLES31.GL_READ_WRITE, GLES30.GL_R32F)
         GLES31.glBindImageTexture(1, sumTex, 0, false, 0, GLES31.GL_READ_WRITE, GLES30.GL_R32F)
         GLES31.glBindImageTexture(2, weightTex, 0, false, 0, GLES31.GL_READ_WRITE, GLES30.GL_R32F)
-        setMergeUniforms(prog, gain, meta, prepWb)
+        setMergeUniforms(prog, gain, meta, prepWb, shift, shake)
         GLES30.glUniform1i(Gl.uniform(prog, "uMode"), mode)
         GLES30.glUniform1f(Gl.uniform(prog, "uScale"), scale)
         GLES31.glDispatchCompute((w / 2 + 15) / 16, (h / 2 + 15) / 16, 1)
@@ -1690,7 +1914,7 @@ class Renderer(
     }
 
     /** PipelineShaders.photoNoise's histogram of this frame against the reference (waits for the GPU: photos only). */
-    private fun noiseHistogram(gain: Float, meta: FrameMeta?, prepWb: FloatArray): IntArray {
+    private fun noiseHistogram(gain: Float, meta: FrameMeta?, prepWb: FloatArray, shift: Int, shake: IntArray): IntArray {
         GLES30.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, histBuffer)
         GLES30.glBufferSubData(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 4 * HIST_BINS, zeroInts(HIST_BINS))
         GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 1, histBuffer)
@@ -1698,7 +1922,7 @@ class Renderer(
         GLES30.glUseProgram(prog)
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, linearTex)
         GLES31.glBindImageTexture(0, refTex, 0, false, 0, GLES31.GL_READ_ONLY, GLES30.GL_R32F)
-        setMergeUniforms(prog, gain, meta, prepWb)
+        setMergeUniforms(prog, gain, meta, prepWb, shift, shake)
         GLES31.glDispatchCompute((w / 8 + 15) / 16, (h / 8 + 15) / 16, 1)
         GLES31.glMemoryBarrier(GLES31.GL_BUFFER_UPDATE_BARRIER_BIT)
         val counts = IntArray(HIST_BINS)
@@ -1721,69 +1945,158 @@ class Renderer(
         return 2.0.pow((HIST_BINS - 32) / 4.0)
     }
 
-    /** The merge's mean weight over [hist]'s quads at noise [scale] (see PipelineShaders.photoMerge). */
-    private fun histKept(hist: IntArray, scale: Float): Double {
-        val total = hist.sum().takeIf { it > 0 } ?: return 0.0
-        return hist.indices.sumOf { k ->
-            val z = kotlin.math.sqrt(2.0.pow((k - 31.5) / 4.0) / scale)
-            hist[k] * (1 - smoothstep(1.5, 3.0, z))
-        } / total
-    }
-
     /**
      * The burst is in: the merged reference goes back into the prep image (just the reference
-     * when nothing merged), its colour test and develop run once more with the warmed history,
-     * and the view is read back. Without the merge shaders the last burst frame's view is the photo.
+     * when nothing merged) and is developed at full size with Quality colour NR: [PHOTO_NR_PASSES]
+     * passes over the same frame, each blending in the colour the last one left (half size,
+     * clamped to its neighbours', see PipelineShaders.developB), a spatial filter on a frame the
+     * merge already averaged in time. The burst's own frames moved (handheld), so colour NR
+     * warmed over them left ghosts (owner, 2026-11-01). Then the dials, and the view is read back.
      */
     private fun finishPhoto(p: PhotoBurst) {
+        p.finalNs = SystemClock.elapsedRealtimeNanos()
         val shot = runCatching {
             if (refTex != 0) {
                 val meta = p.refMeta
                 val wb = p.refPrepWb ?: floatArrayOf(1f, 1f, 1f, 1f)
-                runMerge(MERGE_RESOLVE, 1f, 1f, meta, wb)
-                p.final = true
-                if (activeCleanup() >= 2) updateColourChange(wb, meta)
-                develop(meta)
+                runMerge(MERGE_RESOLVE, 1f, 1f, meta, wb, noShiftTex, NO_SHAKE)
             }
-            readPhoto(p)
+            p.final = true
+            historyFresh = true
+            repeat(PHOTO_NR_PASSES) { develop(p.refMeta) }
+            val image = if (finishOn()) {
+                FinishTarget(w, h).also {
+                    photoFinish = it
+                    applyFinish(viewTex, it, viewOctave = 0)
+                }.out
+            } else viewTex
+            readView(image, w, h, p.cropHeight)
         }.onFailure { EventLog.log("Photo failed", it) }.getOrNull()
         releasePhotoTextures()
         p.done = true
         val m = p.refMeta
         val summary = "Photo ${w}x${(h * p.cropHeight).roundToInt()} from ${p.taken} frames: ${p.merged} merged" +
-            (if (p.merged > 0) " (%.0f %% of each kept on average, noise ×%.2f the profile)".format(100 * p.keptSum / p.merged, p.noiseScale) else "") +
+            (if (p.merged > 0) " (noise ×%.2f the profile".format(p.noiseScale) +
+                (if (p.align) ", aligned: the last frame %.1f px off, its tiles %.1f px from that on average, up to %.1f px)".format(p.shiftWhole, p.shiftLastMean, p.shiftMax)
+                else ", not aligned)")
+            else "") +
             (if (p.otherExposure > 0) ", ${p.otherExposure} left out (exposure changed)" else "") +
             (if (!p.merge) ", merge off" else if (mergeState < 0) ", no merge (shaders failed)" else "") +
+            (if (debugPhotoShake > 0) ", debug shake $debugPhotoShake" else "") +
             ", ISO ${m?.iso ?: "-"} 1/${m?.exposureNs?.takeIf { it > 0 }?.let { (1e9 / it).roundToInt() } ?: "-"}, gain %+.1f EV".format(totalGainEv) +
-            ", developed in %.0f ms".format((SystemClock.elapsedRealtimeNanos() - p.startNs) / 1e6)
+            (if (finishOn()) ", texture %+.0f clarity %+.0f dehaze %+.0f".format(photoTexture * 100, photoClarity * 100, photoDehaze * 100) else "") +
+            ", done in %.0f ms (burst %.0f, develop %.0f)".format((SystemClock.elapsedRealtimeNanos() - p.startNs) / 1e6,
+                (p.finalNs - p.startNs) / 1e6, (SystemClock.elapsedRealtimeNanos() - p.finalNs) / 1e6)
         p.onDone(shot?.let { Photo(it, p.refTimestamp, m, p.raw, w, h, summary) })
     }
 
-    /** The photo's view, read back at 8 bits (the JPEG's), upright and cropped like a recording's frame. */
-    private fun readPhoto(p: PhotoBurst): Bitmap {
-        val keep = p.cropHeight.coerceIn(0.1f, 1f)
-        val outH = ((h * keep).roundToInt() / 2 * 2).coerceAtMost(h)
-        val band = outH.toFloat() / h
+    /** [tex] ([width]×[height]) read back at 8 bits (the JPEG's), upright and cropped to [cropHeight] like a recording's frame. */
+    private fun readView(tex: Int, width: Int, height: Int, cropHeight: Float): Bitmap {
+        val keep = cropHeight.coerceIn(0.1f, 1f)
+        val outH = ((height * keep).roundToInt() / 2 * 2).coerceAtMost(height)
+        val band = outH.toFloat() / height
         val top = (1f - band) / 2f
-        val tex = Gl.texture2D(GLES30.GL_RGBA8, w, outH, linear = true)
+        val out = Gl.texture2D(GLES30.GL_RGBA8, width, outH, linear = true)
         val fbo = IntArray(1).also { GLES30.glGenFramebuffers(1, it, 0) }[0]
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
-        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, tex, 0)
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, out, 0)
         GLES30.glDisable(GLES30.GL_BLEND)
         GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
-        GLES30.glViewport(0, 0, w, outH)
+        GLES30.glViewport(0, 0, width, outH)
         // The band upside down (negative height): glReadPixels returns the bottom row first, so the
         // bitmap comes out upright without a flipped copy of 50 MB.
-        drawTexture(viewTex, rotationQuarterTurns = if (rotation == 2) 2 else 0, crop = floatArrayOf(0f, top + band, 1f, -band), mirror = mirror)
-        val pixels = ByteBuffer.allocateDirect(w * outH * 4).order(ByteOrder.nativeOrder())
-        GLES30.glReadPixels(0, 0, w, outH, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
+        drawTexture(tex, rotationQuarterTurns = if (rotation == 2) 2 else 0, crop = floatArrayOf(0f, top + band, 1f, -band), mirror = mirror)
+        val pixels = ByteBuffer.allocateDirect(width * outH * 4).order(ByteOrder.nativeOrder())
+        GLES30.glReadPixels(0, 0, width, outH, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
-        GLES30.glDeleteTextures(1, intArrayOf(tex), 0)
-        val bmp = Bitmap.createBitmap(w, outH, Bitmap.Config.ARGB_8888)
+        GLES30.glDeleteTextures(1, intArrayOf(out), 0)
+        val bmp = Bitmap.createBitmap(width, outH, Bitmap.Config.ARGB_8888)
         pixels.rewind()
         bmp.copyPixelsFromBuffer(pixels)
         return bmp
+    }
+
+    // ---- Texture / Clarity / Dehaze (PipelineShaders.finishDown, photoFinish) ----
+
+    /** The dials' images for a view of [width]×[height]: the brightness pyramid and the finished view (8-bit). */
+    private class FinishTarget(val width: Int, val height: Int) {
+        val pyr = Gl.texture2D(GLES30.GL_RGBA16F, (width + 1) / 2, (height + 1) / 2, linear = true, levels = FINISH_LEVELS)
+        val out = Gl.texture2D(GLES30.GL_RGBA8, width, height, linear = true)
+        fun release() = GLES30.glDeleteTextures(2, intArrayOf(pyr, out), 0)
+    }
+    /** The viewfinder's (half size), and the photo's (full size, until the photo has been shown). */
+    private var viewFinish: FinishTarget? = null
+    private var photoFinish: FinishTarget? = null
+    private var finishDownProgram = 0
+    private var finishProgram = 0
+
+    /** Photo mode's dials on [view] into [t] ([viewOctave]: 0 the full photo, 1 half its size). */
+    private fun applyFinish(view: Int, t: FinishTarget, viewOctave: Int) {
+        if (finishProgram == 0) {
+            finishDownProgram = Gl.computeProgram(PipelineShaders.finishDown)
+            finishProgram = Gl.computeProgram(PipelineShaders.photoFinish)
+        }
+        GLES30.glUseProgram(finishDownProgram)
+        var lw = (t.width + 1) / 2
+        var lh = (t.height + 1) / 2
+        for (k in 0 until FINISH_LEVELS) {
+            Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, if (k == 0) view else t.pyr)
+            GLES31.glBindImageTexture(0, t.pyr, k, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+            GLES30.glUniform1i(Gl.uniform(finishDownProgram, "uLevel"), k)
+            GLES31.glDispatchCompute((lw + 15) / 16, (lh + 15) / 16, 1)
+            GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+            lw = maxOf(1, lw / 2)
+            lh = maxOf(1, lh / 2)
+        }
+        GLES30.glUseProgram(finishProgram)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, view)
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, t.pyr)
+        GLES31.glBindImageTexture(0, t.out, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA8)
+        GLES30.glUniform1f(Gl.uniform(finishProgram, "uTexture"), photoTexture)
+        GLES30.glUniform1f(Gl.uniform(finishProgram, "uClarity"), photoClarity)
+        GLES30.glUniform1f(Gl.uniform(finishProgram, "uDehaze"), photoDehaze)
+        GLES30.glUniform1i(Gl.uniform(finishProgram, "uViewOctave"), viewOctave)
+        GLES31.glDispatchCompute((t.width + 15) / 16, (t.height + 15) / 16, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+    }
+
+    // ---- A still while recording ----
+
+    private class Snap(val cropHeight: Float, val onDone: (Photo?) -> Unit)
+    private var pendingSnap: Snap? = null
+
+    /**
+     * A still from the recording: the next frame as it's recorded (its size, colour NR and all),
+     * with the look (made from the log when the look isn't baked in). [onDone] gets it on the GL
+     * thread, null when there's no recording.
+     */
+    fun takeSnap(cropHeight: Float, onDone: (Photo?) -> Unit) = handler.post {
+        if (released || recording == null || pendingSnap != null) return@post onDone(null)
+        pendingSnap = Snap(cropHeight, onDone)
+    }
+
+    private fun takeSnapNow(snap: Snap, timestamp: Long, meta: FrameMeta?): Photo? {
+        val rec = recording ?: return null
+        val t0 = SystemClock.elapsedRealtimeNanos()
+        val target = developTarget()
+        val view = if (viewFromLog()) {
+            // Recording log at full size: the develop pass wrote only the log.
+            GLES30.glUseProgram(viewLogProgram)
+            Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, target.log)
+            GLES31.glBindImageTexture(0, viewTex, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+            setViewUniforms(viewLogProgram, profile)
+            GLES30.glUniform1i(Gl.uniform(viewLogProgram, "uCurve"), profile.shaderId)
+            GLES31.glDispatchCompute((w + 15) / 16, (h + 15) / 16, 1)
+            GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+            viewTex
+        } else target.view
+        val image = readView(view, target.width, target.height, snap.cropHeight)
+        val summary = "Snap ${image.width}x${image.height} from the recording at %.1f s, ISO %s 1/%s, read in %.0f ms".format(
+            if (rec.firstTimestamp >= 0) (timestamp - rec.firstTimestamp) / 1e9 else 0.0, meta?.iso ?: "-",
+            meta?.exposureNs?.takeIf { it > 0 }?.let { (1e9 / it).roundToInt() } ?: "-",
+            (SystemClock.elapsedRealtimeNanos() - t0) / 1e6)
+        return Photo(image, timestamp, meta, null, w, h, summary)
     }
 
     /** The RAW plane without row padding (DngCreator.writeByteBuffer wants it dense). */
@@ -1927,8 +2240,12 @@ class Renderer(
         private const val MAX_PENDING_RECORDING = 8
         /** Debug (adb slowframe=ms): each recorded frame holds this thread that much longer, as a hot phone's GPU would. */
         @Volatile var debugSlowFrameMs = 0
-        /** Debug (adb photomerge=false): photos without the burst merge (colour NR still warms over the burst). */
+        /** Debug (adb photomerge=false): photos without the burst merge. */
         @Volatile var debugPhotoMerge = true
+        /** Debug (adb photoalign=false): the burst merged without aligning its frames (as before 2026-11-02). */
+        @Volatile var debugPhotoAlign = true
+        /** Debug (adb photoshake=quads): each burst frame read that far off (a known shake for the alignment to undo). */
+        @Volatile var debugPhotoShake = 0
         /** For the preview's waiting rule (recordings use their own frame rate). */
         private const val PREVIEW_FRAME_NS = 33_333_333L
         /** Time spent on recorded frames before the GL thread looks at its other work again. */
@@ -1940,8 +2257,26 @@ class Renderer(
         private const val TNR_STRONG = 0.85f
         /** Average white balance × shading gain between the RAW and the prep pass's output. */
         private const val NR_GAIN = 1.8f
-        /** Photo mode: colour NR's history weight in the merged photo's own develop (see [photoAlpha]). */
-        private const val PHOTO_FINAL_ALPHA = 0.75f
+        /** Photo mode: colour NR's passes over the merged photo and each one's history weight (see [finishPhoto]). */
+        private const val PHOTO_NR_PASSES = 4
+        private const val PHOTO_NR_ALPHA = 0.75f
+        /**
+         * The alignment pyramid (level 0: one grey value per quad, then ÷2, ÷4: 1/16 of the RAW),
+         * each level's tile side and search radius around its guess (the last level's tile is
+         * PipelineShaders.PHOTO_SHIFT_TILE quads, 32 RAW px).
+         */
+        private const val PYR_LEVELS = 3
+        private val PYR_FACTOR = intArrayOf(1, 2, 4)
+        private val ALIGN_TILE = intArrayOf(PipelineShaders.PHOTO_SHIFT_TILE, 8, 8)
+        private val ALIGN_RADIUS = intArrayOf(1, 3, 4)
+        /** The whole frame's offset is looked for within this many coarsest-level pixels (16 RAW px each): ±96 px. */
+        private const val GLOBAL_RADIUS = 6
+        private const val GLOBAL_OFFSETS = (2 * GLOBAL_RADIUS + 1) * (2 * GLOBAL_RADIUS + 1)
+        /** RAW pixels per coarsest-level pixel. */
+        private const val GLOBAL_PX = 16
+        private val NO_SHAKE = intArrayOf(0, 0)
+        /** The dials' pyramid levels: down to 1/64 of the full photo (PipelineShaders.photoFinish). */
+        private const val FINISH_LEVELS = 6
         /** PipelineShaders.photoMerge's modes, and photoNoise's histogram size. */
         private const val MERGE_FIRST = 0
         private const val MERGE_ADD = 2

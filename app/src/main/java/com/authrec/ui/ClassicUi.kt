@@ -38,6 +38,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val edrButton = kit.button("") { a.setEdr(!a.edrOn) }
     /** The flash unit as a steady light (back lenses that have one). */
     private val torchButton = kit.button("") { a.setTorch(!a.capture.torch) }
+    /** A still from the recording, under Pause while a clip records. */
+    private val snapButton = kit.button("◉ Snap") { a.takeSnap() }
     private val adjustButton = kit.button("Adjust") {
         adjustPanel.visibility = if (adjustPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
     }
@@ -74,6 +76,11 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private lateinit var vibranceBar: SeekBar
     private lateinit var warmthBar: SeekBar
     private lateinit var tintBar: SeekBar
+    private lateinit var textureBar: SeekBar
+    private lateinit var clarityBar: SeekBar
+    private lateinit var dehazeBar: SeekBar
+    /** Photo mode's Texture / Clarity / Dehaze rows (shown only in Photo mode). */
+    private lateinit var photoDials: List<View>
     private val adjustPanel = buildAdjustPanel()
 
     private val exposureBar = LinearLayout(a).apply {
@@ -104,7 +111,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
         }
         val left = column(profileButton, viewButton, importButton, adjustButton, edrButton, torchButton)
-        val right = column(recButton, pauseButton, rawButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton, nrButton)
+        val right = column(recButton, pauseButton, snapButton, rawButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton, nrButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = a.exposureSlider.layoutParams as FrameLayout.LayoutParams
             val margin = v.width + 48 + 12
@@ -178,6 +185,13 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         val (vibRow, vib) = slider("Vibrance", 200, a.vibrancePct + 100, signed) { a.setLookAdjust(vibrance = it - 100) }
         val (warmRow, warm) = slider("Warmth", 200, a.wbWarmth + 100, signed) { a.setWbShift(it - 100, a.wbTint) }
         val (tintRow, tint) = slider("Tint", 200, a.wbTint + 100, signed) { a.setWbShift(a.wbWarmth, it - 100) }
+        val (texRow, tex) = slider("Texture", 200, a.photoTexture + 100, signed) { a.setPhotoFinish(texture = it - 100) }
+        val (claRow, cla) = slider("Clarity", 200, a.photoClarity + 100, signed) { a.setPhotoFinish(clarity = it - 100) }
+        val (dehRow, deh) = slider("Dehaze", 200, a.photoDehaze + 100, signed) { a.setPhotoFinish(dehaze = it - 100) }
+        textureBar = tex
+        clarityBar = cla
+        dehazeBar = deh
+        photoDials = listOf(texRow, claRow, dehRow)
         highlightsBar = hi
         shadowsBar = lo
         strengthBar = s
@@ -191,6 +205,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
                 a.setLookAdjust(100, 100, 0)
                 a.setWbShift(0, 0)
                 a.resetEdrCurve()
+                if (a.photo) a.setPhotoFinish(0, 0, 0)
             })
             addView(kit.button("Edit look / make LUT…") { a.openLookEditor() })
         }
@@ -199,7 +214,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             setBackgroundColor(0xB0000000.toInt())
             setPadding(32, 16, 32, 16)
             visibility = View.GONE
-            listOf(hiRow, loRow, strengthRow, satRow, vibRow, warmRow, tintRow).forEach { addView(it) }
+            listOf(hiRow, loRow, strengthRow, satRow, vibRow, warmRow, tintRow, texRow, claRow, dehRow).forEach { addView(it) }
             addView(buttons)
         }
     }
@@ -218,6 +233,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         pauseButton.visibility = if (recording) View.VISIBLE else View.GONE
         pauseButton.text = if (a.paused) "▶ Resume" else "❚❚ Pause"
         pauseButton.isEnabled = !a.stopping
+        snapButton.visibility = if (recording && !a.warmingUp) View.VISIBLE else View.GONE
+        snapButton.isEnabled = !a.snapBusy && !a.stopping
         lockedWhileRecording.forEach { it.isEnabled = !recording && !a.stopping && !a.warmingUp && !a.photoBusy }
         proOnly.forEach { it.visibility = if (a.simple) View.GONE else View.VISIBLE }
         // Photo mode: Pro without what only video uses (a photo is always the full RAW, fully
@@ -286,6 +303,10 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         sync(vibranceBar, a.vibrancePct + 100)
         sync(warmthBar, a.wbWarmth + 100)
         sync(tintBar, a.wbTint + 100)
+        sync(textureBar, a.photoTexture + 100)
+        sync(clarityBar, a.photoClarity + 100)
+        sync(dehazeBar, a.photoDehaze + 100)
+        photoDials.forEach { it.visibility = if (a.photo) View.VISIBLE else View.GONE }
         (adjustPanel.layoutParams as? FrameLayout.LayoutParams)?.let {
             val margin = if (a.simple) 120 else 170
             if (it.bottomMargin != margin) { it.bottomMargin = margin; adjustPanel.requestLayout() }

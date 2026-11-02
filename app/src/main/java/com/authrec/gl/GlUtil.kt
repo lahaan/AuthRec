@@ -108,13 +108,15 @@ internal class EglCore(preferTenBit: Boolean = false) {
 /** Small GL helpers. */
 internal object Gl {
 
-    fun texture2D(internalFormat: Int, w: Int, h: Int, linear: Boolean): Int {
+    /** [levels] > 1: mip levels too (filled by the caller), each sampled filtered when [linear]. */
+    fun texture2D(internalFormat: Int, w: Int, h: Int, linear: Boolean, levels: Int = 1): Int {
         val tex = IntArray(1).also { GLES30.glGenTextures(1, it, 0) }[0]
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
-        GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, internalFormat, w, h)
+        GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, levels, internalFormat, w, h)
         // Integer and 32-bit float textures are incomplete with linear filtering.
         val filter = if (linear) GLES30.GL_LINEAR else GLES30.GL_NEAREST
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, filter)
+        val minFilter = if (levels == 1) filter else if (linear) GLES30.GL_LINEAR_MIPMAP_NEAREST else GLES30.GL_NEAREST_MIPMAP_NEAREST
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, minFilter)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, filter)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)

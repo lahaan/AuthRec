@@ -511,6 +511,10 @@ class RawCamera(
             }
             // The torch: on with AE on or off alike (never an AE flash mode), for as long as the stream runs.
             if (hasTorch) set(CaptureRequest.FLASH_MODE, if (st.torch) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+            // Photo mode asks for optical stabilization; otherwise it's the template's (the HAL's) default.
+            if (st.longExposure && hasOis) {
+                set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+            }
             // A tapped spot also weights auto exposure, unless exposure is ours (manual / priority).
             if (st.ae in listOf(AeMode.AUTO, AeMode.LOCKED) && region != null && info.maxAeRegions > 0) {
                 set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
@@ -530,6 +534,17 @@ class RawCamera(
                 context.getSystemService(CameraManager::class.java).getCameraCharacteristics(lens.openId)
             } else characteristics
             chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        }.getOrDefault(false)
+    }
+
+    /** The camera we open offers optical stabilization (X14: 1x, 2.6x and their routes; not 0.6x or front). */
+    val hasOis: Boolean by lazy {
+        runCatching {
+            val chars = if (lens != null && lens.openId != lens.sensorId) {
+                context.getSystemService(CameraManager::class.java).getCameraCharacteristics(lens.openId)
+            } else characteristics
+            chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                ?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
         }.getOrDefault(false)
     }
 
@@ -739,7 +754,8 @@ class RawCamera(
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
             if (++resultsSeen == 1) {
                 EventLog.log("$name: first frame ${sinceOpenMs()} ms after opening" +
-                    (result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.let { ", active lens $it" } ?: ""))
+                    (result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.let { ", active lens $it" } ?: "") +
+                    (if (hasOis) ", OIS " + if (result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE) == CaptureResult.LENS_OPTICAL_STABILIZATION_MODE_ON) "on" else "off" else ""))
             }
             val now = SystemClock.elapsedRealtime()
             if (now - afLogged > (if (afVerbose) 0 else 2000)) {

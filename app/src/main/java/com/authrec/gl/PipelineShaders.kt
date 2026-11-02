@@ -21,6 +21,9 @@ internal object PipelineShaders {
      */
     const val DEVELOP_GROUP = 16
 
+    /** Quads per side of photo alignment's last tiles (Renderer.ALIGN_TILE's level 0). */
+    const val PHOTO_SHIFT_TILE = 16
+
     /** The prep pass's declarations and its last step, shared by its two variants. */
     private val prepCommon = """
         #version 310 es
@@ -497,6 +500,7 @@ internal object PipelineShaders {
         uniform vec2 uNoise;         // variance of one prep-pass sample at brightness x: x * uNoise.x + uNoise.y
         uniform int uSlot;           // this frame's motion counter
         uniform float uWindows;      // how many windows colourChange tested
+        uniform bool uStill;         // a photo's colour NR passes: the history is this same frame, nothing moved
 
         float px(ivec2 p) {
             p = clamp(p, ivec2(0), textureSize(uLinear, 0) - 1);
@@ -609,6 +613,11 @@ internal object PipelineShaders {
             vec3 box = sqrt(max(s2 / n - mean * mean, vec3(0.0))) + 0.002;
             vec3 h = texture(uHistIn, (vec2(gP) + 0.5) / vec2(imageSize(uOutView))).rgb;
             h = clamp(h, mean - box, mean + box);
+            if (uStill) {
+                gBlend = uTnrAlpha;
+                gNr = mix(gColour, h, gBlend);
+                return;
+            }
             // How far the quad's brightness moved from its running average, in units of one
             // sample's noise (the 2×2 mean of 3×3 means against an average: ~0.35 of that).
             float sigma = sqrt(max(gQuadB, 0.0) * uNoise.x + uNoise.y);
@@ -895,10 +904,265 @@ internal object PipelineShaders {
     val developScaledFast get() = variant(true, scaledMain)
 
     /**
-     * Photo mode's burst merge, on the prep pass's mosaic (shared by [photoMerge] and [photoNoise]):
-     * how much a 2×2 quad of this frame differs from the burst's first frame, the reference, in
-     * units of the sensor's noise. The noise of each prep sample follows from the noise profile
-     * and that pixel's own gain (white balance × lens shading), for both frames.
+     * Photo mode's alignment pyramid, level 0: each 2×2 quad of the prep pass's mosaic as one
+     * grey value (its mean: white-balanced, so the colours weigh alike), times [uGain] (the
+     * reference's exposure over this frame's). Half the RAW's size, one value per quad.
+     */
+    val photoGrey = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(binding = 0) uniform highp sampler2D uLinear;
+        layout(r32f, binding = 0) writeonly uniform highp image2D uOut;
+        uniform float uGain;
+        uniform ivec2 uDebugShift;   // see photoCommon
+
+        void main() {
+            ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+            if (q.x >= imageSize(uOut).x || q.y >= imageSize(uOut).y) return;
+            ivec2 p = clamp(q + uDebugShift, ivec2(0), textureSize(uLinear, 0) / 2 - 1) * 2;
+            float s = texelFetch(uLinear, p, 0).r + texelFetch(uLinear, p + ivec2(1, 0), 0).r +
+                texelFetch(uLinear, p + ivec2(0, 1), 0).r + texelFetch(uLinear, p + ivec2(1, 1), 0).r;
+            imageStore(uOut, q, vec4(s * 0.25 * uGain));
+        }
+    """.trimIndent()
+
+    /** The pyramid's next level: the mean of each [uFactor]² block of the one below. */
+    val photoDown = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(binding = 0) uniform highp sampler2D uIn;
+        layout(r32f, binding = 0) writeonly uniform highp image2D uOut;
+        uniform int uFactor;
+
+        void main() {
+            ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+            if (o.x >= imageSize(uOut).x || o.y >= imageSize(uOut).y) return;
+            ivec2 last = textureSize(uIn, 0) - 1;
+            float s = 0.0;
+            for (int y = 0; y < uFactor; y++) for (int x = 0; x < uFactor; x++)
+                s += texelFetch(uIn, min(o * uFactor + ivec2(x, y), last), 0).r;
+            imageStore(uOut, o, vec4(s / float(uFactor * uFactor)));
+        }
+    """.trimIndent()
+
+    /**
+     * Photo mode's alignment, first step: one offset for the whole frame (the hand's shake), on
+     * the pyramid's coarsest level, from every pixel. Tiles alone found it only where they had
+     * structure: in a dark room most are flat noise and kept no offset, and a structured tile's
+     * neighbours then pulled its offset back toward none (a 12 px shake, 2026-11-02). One work
+     * group per offset within [uRadius] (pixels within [uRadius] of the edge left out); its sum
+     * of absolute differences into [cost].
+     */
+    val photoGlobal = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 256) in;
+        layout(binding = 0) uniform highp sampler2D uRefLevel;
+        layout(binding = 1) uniform highp sampler2D uAltLevel;
+        layout(std430, binding = 1) writeonly buffer Costs { float cost[]; };
+        uniform int uRadius;
+
+        shared float sSum[256];
+
+        void main() {
+            uint i = gl_LocalInvocationIndex;
+            int c = int(gl_WorkGroupID.x);
+            int side = 2 * uRadius + 1;
+            ivec2 d = ivec2(c % side - uRadius, c / side - uRadius);
+            ivec2 size = textureSize(uRefLevel, 0) - 2 * uRadius;
+            float s = 0.0;
+            for (int k = int(i); k < size.x * size.y; k += 256) {
+                ivec2 p = ivec2(k % size.x, k / size.x) + uRadius;
+                s += abs(texelFetch(uRefLevel, p, 0).r - texelFetch(uAltLevel, p + d, 0).r);
+            }
+            sSum[i] = s;
+            memoryBarrierShared();
+            barrier();
+            $GLOBAL_REDUCE
+            if (i == 0u) cost[c] = sSum[0];
+        }
+    """.trimIndent()
+
+    /** photoGlobal's halving steps over its 256 threads, each followed by a barrier. */
+    private val GLOBAL_REDUCE get() = (7 downTo 0).joinToString("") { k ->
+        val h = 1 shl k
+        """
+            if (i < ${h}u) sSum[i] += sSum[i + ${h}u];
+            memoryBarrierShared();
+            barrier();"""
+    }
+
+    /** [photoGlobal]'s least cost, to a fraction of a pixel (a parabola each way), as a 1×1 offset image. */
+    val photoGlobalPick = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 1) in;
+        layout(std430, binding = 1) readonly buffer Costs { float cost[]; };
+        layout(rgba32f, binding = 0) writeonly uniform highp image2D uOut;
+        uniform int uRadius;
+
+        void main() {
+            int side = 2 * uRadius + 1;
+            int b = 0;
+            for (int c = 1; c < side * side; c++) if (cost[c] < cost[b]) b = c;
+            int bx = b % side;
+            int by = b / side;
+            vec2 sub = vec2(0.0);
+            if (bx > 0 && bx < side - 1) {
+                float cx = cost[b - 1] - 2.0 * cost[b] + cost[b + 1];
+                if (cx > 0.0) sub.x = clamp(0.5 * (cost[b - 1] - cost[b + 1]) / cx, -0.5, 0.5);
+            }
+            if (by > 0 && by < side - 1) {
+                float cy = cost[b - side] - 2.0 * cost[b] + cost[b + side];
+                if (cy > 0.0) sub.y = clamp(0.5 * (cost[b - side] - cost[b + side]) / cy, -0.5, 0.5);
+            }
+            imageStore(uOut, ivec2(0), vec4(vec2(bx - uRadius, by - uRadius) + sub, 0.0, 0.0));
+        }
+    """.trimIndent()
+
+    /**
+     * Photo mode's alignment, one level of the pyramid per pass, per tile: where this tile of the
+     * reference is in this frame (as HDR+ does it): the offset with the least absolute difference
+     * within [uRadius] of the best of three guesses from the coarser level (the tile's own coarse
+     * tile and the two nearest neighbours, so a tile on a coarse tile's edge can follow the other
+     * side; at the coarsest level, [photoGlobal]'s offset). An offset that beats the guess by no more than noise would
+     * (flat, dark tiles) keeps the guess, so a featureless tile follows the coarser level rather
+     * than a random offset its neighbours' interpolation would lean toward. The last level adds a
+     * fraction of a pixel (a parabola through the squared differences around the best).
+     * Output per tile: the offset in this level's pixels (xy).
+     */
+    val photoAlign = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        // One work group per tile, its threads each trying offsets: a thread per tile looping over
+        // every offset left the GPU waiting on fetches (~100 ms a burst frame at 4K, X14).
+        layout(local_size_x = 64) in;
+        layout(binding = 0) uniform highp sampler2D uRefLevel;
+        layout(binding = 1) uniform highp sampler2D uAltLevel;
+        layout(binding = 2) uniform highp sampler2D uCoarse;   // the coarser level's tiles
+        layout(rgba32f, binding = 0) writeonly uniform highp image2D uOut;
+        uniform int uTile;          // tile side, this level's pixels (at most 16)
+        uniform int uRadius;        // at most 4
+        uniform int uCoarseScale;   // this level's pixels per coarser-level pixel; 0 at the coarsest
+        uniform int uCoarseTile;
+        uniform bool uSubpixel;
+
+        shared float sRef[256];     // the reference's tile
+        shared float sCost[81];
+        shared ivec2 sGuesses[3];
+        shared float sGuessCost[3];
+        shared ivec2 sGuess;
+        shared ivec2 sBest;
+        shared float sFit[5];
+
+        ivec2 gT0;
+        ivec2 gLast;
+
+        float sad(ivec2 d) {
+            float s = 0.0;
+            for (int y = 0; y < uTile; y++) for (int x = 0; x < uTile; x++) {
+                ivec2 p = min(gT0 + ivec2(x, y), gLast);
+                s += abs(sRef[y * uTile + x] - texelFetch(uAltLevel, clamp(p + d, ivec2(0), gLast), 0).r);
+            }
+            return s;
+        }
+
+        float ssd(ivec2 d) {
+            float s = 0.0;
+            for (int y = 0; y < uTile; y++) for (int x = 0; x < uTile; x++) {
+                ivec2 p = min(gT0 + ivec2(x, y), gLast);
+                float e = sRef[y * uTile + x] - texelFetch(uAltLevel, clamp(p + d, ivec2(0), gLast), 0).r;
+                s += e * e;
+            }
+            return s;
+        }
+
+        void main() {
+            ivec2 t = ivec2(gl_WorkGroupID.xy);
+            int li = int(gl_LocalInvocationIndex);
+            gLast = textureSize(uRefLevel, 0) - 1;
+            gT0 = t * uTile;
+            int n = uTile * uTile;
+            for (int i = li; i < n; i += 64) sRef[i] = texelFetch(uRefLevel, min(gT0 + ivec2(i % uTile, i / uTile), gLast), 0).r;
+            memoryBarrierShared();
+            barrier();
+
+            // The guesses: no offset at the coarsest level, else the coarser level's for this tile's
+            // coarse tile and the two nearest neighbours (a tile on its edge can follow the other side).
+            int guesses = uCoarseScale == 0 ? 1 : 3;
+            if (li < guesses) {
+                ivec2 d = ivec2(0);
+                if (uCoarseScale > 0) {
+                    ivec2 last = textureSize(uCoarse, 0) - 1;
+                    vec2 c = (vec2(gT0) + 0.5 * float(uTile)) / float(uCoarseScale * uCoarseTile);
+                    ivec2 nb = ivec2(sign(fract(c) - 0.5));
+                    ivec2 ci = clamp(ivec2(floor(c)) + (li == 1 ? ivec2(nb.x, 0) : li == 2 ? ivec2(0, nb.y) : ivec2(0)), ivec2(0), last);
+                    d = ivec2(round(texelFetch(uCoarse, ci, 0).xy * float(uCoarseScale)));
+                }
+                sGuesses[li] = d;
+                sGuessCost[li] = sad(d);
+            }
+            memoryBarrierShared();
+            barrier();
+            if (li == 0) {
+                int g = 0;
+                for (int i = 1; i < guesses; i++) if (sGuessCost[i] < sGuessCost[g]) g = i;
+                sGuess = sGuesses[g];
+                sGuessCost[0] = sGuessCost[g];
+            }
+            memoryBarrierShared();
+            barrier();
+
+            ivec2 guess = sGuess;
+            int side = 2 * uRadius + 1;
+            for (int c = li; c < side * side; c += 64) sCost[c] = sad(guess + ivec2(c % side - uRadius, c / side - uRadius));
+            memoryBarrierShared();
+            barrier();
+            if (li == 0) {
+                int b = 0;
+                for (int c = 1; c < side * side; c++) if (sCost[c] < sCost[b]) b = c;
+                // Two noise-only sums of absolute differences over n pixels differ by ~1 · sum / √n.
+                float guessCost = sGuessCost[0];
+                sBest = guessCost - sCost[b] < 3.0 * sCost[b] / sqrt(float(n)) ? guess
+                    : guess + ivec2(b % side - uRadius, b / side - uRadius);
+            }
+            memoryBarrierShared();
+            barrier();
+
+            ivec2 best = sBest;
+            if (uSubpixel && li < 5) {
+                ivec2 o = li == 1 ? ivec2(-1, 0) : li == 2 ? ivec2(1, 0) : li == 3 ? ivec2(0, -1) : li == 4 ? ivec2(0, 1) : ivec2(0);
+                sFit[li] = ssd(best + o);
+            }
+            memoryBarrierShared();
+            barrier();
+            if (li == 0) {
+                vec2 sub = vec2(0.0);
+                if (uSubpixel) {
+                    float cx = sFit[1] - 2.0 * sFit[0] + sFit[2];
+                    float cy = sFit[3] - 2.0 * sFit[0] + sFit[4];
+                    if (cx > 0.0) sub.x = clamp(0.5 * (sFit[1] - sFit[2]) / cx, -0.5, 0.5);
+                    if (cy > 0.0) sub.y = clamp(0.5 * (sFit[3] - sFit[4]) / cy, -0.5, 0.5);
+                }
+                imageStore(uOut, t, vec4(vec2(best) + sub, 0.0, 0.0));
+            }
+        }
+    """.trimIndent()
+
+    /**
+     * Photo mode's burst merge, on the prep pass's mosaic (shared by [photoDiff], [photoMerge] and
+     * [photoNoise]): this frame's 2×2 quad where the reference has it ([photoAlign]'s offsets,
+     * interpolated between tiles; each colour's samples interpolated between quads), and how much
+     * it differs from the burst's first frame, the reference, in units of the sensor's noise. The
+     * noise of each prep sample follows from the noise profile and that pixel's own gain (white
+     * balance × lens shading), for both frames; interpolating averages a frame's noise down.
      */
     private val photoCommon = """
         #version 310 es
@@ -908,43 +1172,124 @@ internal object PipelineShaders {
 
         layout(binding = 0) uniform highp sampler2D uLinear;     // this frame's prep output
         layout(binding = 1) uniform mediump sampler2D uShading;  // R, G_even, G_odd, B gains, as in prep
+        layout(binding = 2) uniform highp sampler2D uShift;      // photoAlign's last level: per tile, the offset in quads
 
         uniform vec4 uWb;         // the prep pass's white balance (with the user's trim)
         uniform vec2 uNoise;      // variance of normalised RAW at x: x * S + O
         uniform float uGain;      // the reference's exposure over this frame's
         uniform ivec2 uRedOffset;
+        uniform ivec2 uDebugShift; // debug (adb photoshake): this frame read that many quads off, a known shake
+
+        const float SHIFT_TILE = $PHOTO_SHIFT_TILE.0;  // quads per side of photoAlign's last tiles
 
         float cur[4];
         float ref[4];
+        float curVar;   // the share of one sample's noise variance left in cur
 
-        /** z² of quad [q0]'s change from the reference (its 4 samples in [ref]); fills [cur] too. */
+        /** This frame's offset from the reference at quad [q] (quads), between the tiles' centres. */
+        vec2 shiftAt(ivec2 q) {
+            ivec2 last = textureSize(uShift, 0) - 1;
+            vec2 tc = (vec2(q) + 0.5) / SHIFT_TILE - 0.5;
+            ivec2 t = ivec2(floor(tc));
+            vec2 f = tc - vec2(t);
+            vec2 a = texelFetch(uShift, clamp(t, ivec2(0), last), 0).xy;
+            vec2 b = texelFetch(uShift, clamp(t + ivec2(1, 0), ivec2(0), last), 0).xy;
+            vec2 c = texelFetch(uShift, clamp(t + ivec2(0, 1), ivec2(0), last), 0).xy;
+            vec2 d = texelFetch(uShift, clamp(t + ivec2(1, 1), ivec2(0), last), 0).xy;
+            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+
+        /** Catmull-Rom weights at fraction [t] (taps −1, 0, 1, 2). */
+        vec4 catmullRom(float t) {
+            float t2 = t * t;
+            float t3 = t2 * t;
+            return vec4(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);
+        }
+
+        /**
+         * Quad [q]'s samples of this frame where the reference has them, times uGain, into [cur],
+         * Catmull-Rom between quads (each colour's own samples): bilinear left what's averaged in
+         * ~0.8 px softer (by a fraction of a quad, 2 px, that varies frame to frame).
+         */
+        void fetchAlignedSharp(ivec2 q, ivec2 size) {
+            vec2 at = vec2(q + uDebugShift) + shiftAt(q);
+            ivec2 a = ivec2(floor(at));
+            vec2 f = at - vec2(a);
+            vec4 wx = catmullRom(f.x);
+            vec4 wy = catmullRom(f.y);
+            ivec2 qLast = size / 2 - 1;
+            for (int i = 0; i < 4; i++) cur[i] = 0.0;
+            for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
+                ivec2 p = clamp(a + ivec2(x - 1, y - 1), ivec2(0), qLast) * 2;
+                float w = wx[x] * wy[y];
+                for (int i = 0; i < 4; i++) cur[i] += w * texelFetch(uLinear, p + ivec2(i & 1, i >> 1), 0).r;
+            }
+            for (int i = 0; i < 4; i++) cur[i] *= uGain;
+        }
+
+        /** Quad [q]'s samples of this frame where the reference has them, times uGain, into [cur] (bilinear: for the tests). */
+        void fetchAligned(ivec2 q, ivec2 size) {
+            vec2 at = vec2(q + uDebugShift) + shiftAt(q);
+            ivec2 a = ivec2(floor(at));
+            vec2 f = at - vec2(a);
+            ivec2 qLast = size / 2 - 1;
+            ivec2 p00 = clamp(a, ivec2(0), qLast) * 2;
+            ivec2 p10 = clamp(a + ivec2(1, 0), ivec2(0), qLast) * 2;
+            ivec2 p01 = clamp(a + ivec2(0, 1), ivec2(0), qLast) * 2;
+            ivec2 p11 = clamp(a + ivec2(1, 1), ivec2(0), qLast) * 2;
+            for (int i = 0; i < 4; i++) {
+                ivec2 o = ivec2(i & 1, i >> 1);
+                float top = mix(texelFetch(uLinear, p00 + o, 0).r, texelFetch(uLinear, p10 + o, 0).r, f.x);
+                float bottom = mix(texelFetch(uLinear, p01 + o, 0).r, texelFetch(uLinear, p11 + o, 0).r, f.x);
+                cur[i] = mix(top, bottom, f.y) * uGain;
+            }
+            curVar = ((1.0 - f.x) * (1.0 - f.x) + f.x * f.x) * ((1.0 - f.y) * (1.0 - f.y) + f.y * f.y);
+        }
+
+        /** z² of quad [q0]'s change from the reference ([ref]) to this frame ([cur], from fetchAligned). */
         float quadZ2(ivec2 q0, ivec2 size) {
             vec4 gains = texture(uShading, (vec2(q0) + 1.0) / vec2(size)) * uWb;
             float d = 0.0;
             float v = 0.0;
             for (int i = 0; i < 4; i++) {
-                ivec2 p = q0 + ivec2(i & 1, i >> 1);
-                ivec2 site = (p + uRedOffset) & 1;
+                ivec2 site = (q0 + ivec2(i & 1, i >> 1) + uRedOffset) & 1;
                 float g = gains[site == ivec2(0, 0) ? 0 : site == ivec2(1, 1) ? 3 : site == ivec2(1, 0) ? 1 : 2];
-                cur[i] = texelFetch(uLinear, p, 0).r * uGain;
                 d += cur[i] - ref[i];
                 // Prep value y = g · x: variance g·y·S + g²·O, for this frame and the reference.
-                v += g * (max(cur[i], 0.0) + max(ref[i], 0.0)) * uNoise.x + 2.0 * g * g * uNoise.y;
+                v += g * (max(cur[i], 0.0) * curVar + max(ref[i], 0.0)) * uNoise.x + (curVar + 1.0) * g * g * uNoise.y;
             }
             return d * d / max(v, 1e-12);
         }
     """.trimIndent() + "\n"
 
+    /** Photo mode: each quad's [photoCommon] z² against the reference, for [photoMerge] (r32f, one per quad). */
+    val photoDiff = photoCommon + """
+        layout(r32f, binding = 0) readonly uniform highp image2D uRef;
+        layout(r32f, binding = 1) writeonly uniform highp image2D uZ2;
+
+        void main() {
+            ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = imageSize(uRef);
+            ivec2 q0 = q * 2;
+            if (q0.x + 1 >= size.x || q0.y + 1 >= size.y) return;
+            for (int i = 0; i < 4; i++) ref[i] = imageLoad(uRef, q0 + ivec2(i & 1, i >> 1)).r;
+            fetchAligned(q, size);
+            imageStore(uZ2, q, vec4(quadZ2(q0, size)));
+        }
+    """.trimIndent()
+
     /**
-     * Photo mode: each burst frame averaged into the first (the moment the shutter was pressed)
-     * where it matches it within noise, one weight per 2×2 quad: full up to z 1.5, none from 3. No
-     * alignment: where the hand moved the picture, edges and texture differ by far more than noise
-     * and keep the first frame alone, while flat areas (where noise shows most) average them all;
-     * what a moved texture faint enough to pass leaves is within the noise it replaces.
+     * Photo mode: each burst frame, aligned, averaged into the first (the moment the shutter was
+     * pressed) where it matches it within noise, one weight per 2×2 quad from the mean z² of the
+     * 3×3 quads around it (noise alone: ~1, rarely past 2): full up to 2, none from 4, and none
+     * where the quad alone is far off (z² 25). The mean, not each quad alone, decides, so pure
+     * noise doesn't speckle an edge with quads in and out of the merge (the bus, 2026-11-01);
+     * what moved within the scene, or wasn't aligned, keeps the first frame alone.
      * Modes: 0 the first frame (reference, sum and weight), 2 merge, 3 resolve (sum / weight into
      * the image at binding 0, the prep image then, for the final develop).
      */
     val photoMerge = photoCommon + """
+        layout(binding = 3) uniform highp sampler2D uZ2;         // photoDiff's
         layout(r32f, binding = 0) uniform highp image2D uRef;     // the first frame; mode 3: the prep image
         layout(r32f, binding = 1) uniform highp image2D uSum;     // Σ weight × value per pixel
         layout(r32f, binding = 2) uniform highp image2D uWeight;  // Σ weight per 2×2 quad
@@ -975,9 +1320,14 @@ internal object PipelineShaders {
                 }
                 return;
             }
-            for (int i = 0; i < 4; i++) ref[i] = imageLoad(uRef, q0 + ivec2(i & 1, i >> 1)).r;
-            float w = 1.0 - smoothstep(1.5, 3.0, sqrt(quadZ2(q0, size) / uScale));
+            ivec2 qLast = size / 2 - 1;
+            float around = 0.0;
+            for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++)
+                around += texelFetch(uZ2, clamp(q + ivec2(x, y), ivec2(0), qLast), 0).r;
+            float own = texelFetch(uZ2, q, 0).r;
+            float w = (1.0 - smoothstep(2.0, 4.0, around / 9.0 / uScale)) * (1.0 - smoothstep(9.0, 25.0, own / uScale));
             if (w <= 0.0) return;
+            fetchAlignedSharp(q, size);
             for (int i = 0; i < 4; i++) {
                 ivec2 p = q0 + ivec2(i & 1, i >> 1);
                 imageStore(uSum, p, vec4(imageLoad(uSum, p).r + w * cur[i]));
@@ -1007,12 +1357,96 @@ internal object PipelineShaders {
             ivec2 q0 = ivec2(gl_GlobalInvocationID.xy) * 8;
             if (q0.x + 1 < size.x && q0.y + 1 < size.y) {
                 for (int i = 0; i < 4; i++) ref[i] = imageLoad(uRef, q0 + ivec2(i & 1, i >> 1)).r;
+                fetchAligned(q0 / 2, size);
                 float z2 = quadZ2(q0, size);
                 atomicAdd(sHist[clamp(int(floor(log2(max(z2, 1e-6)) * 4.0)) + 32, 0, 63)], 1u);
             }
             memoryBarrierShared();
             barrier();
             if (li < 64u && sHist[li] > 0u) atomicAdd(hist[li], sHist[li]);
+        }
+    """.trimIndent()
+
+    /**
+     * Photo mode's Texture / Clarity / Dehaze (Lightroom's Presence dials), step 1: a pyramid of
+     * the view's brightness (r) and darkest channel (g), level 0 at half the view's size, each
+     * level half the one before (rgba16f mip levels, so the finish samples them filtered).
+     */
+    val finishDown = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(binding = 0) uniform highp sampler2D uIn;   // level 0: the view; then the pyramid
+        layout(rgba16f, binding = 0) writeonly uniform highp image2D uOut;
+        uniform int uLevel;
+
+        void main() {
+            ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+            if (o.x >= imageSize(uOut).x || o.y >= imageSize(uOut).y) return;
+            int src = max(uLevel - 1, 0);
+            ivec2 last = textureSize(uIn, src) - 1;
+            vec2 s = vec2(0.0);
+            for (int i = 0; i < 4; i++) {
+                vec4 c = texelFetch(uIn, min(o * 2 + ivec2(i & 1, i >> 1), last), src);
+                s += uLevel == 0 ? vec2(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), min(min(c.r, c.g), c.b)) : c.rg;
+            }
+            imageStore(uOut, o, vec4(s * 0.25, 0.0, 1.0));
+        }
+    """.trimIndent()
+
+    /**
+     * Step 2, on the finished view (look and all, display-referred): Dehaze lifts a veil, the
+     * darkest channel blurred over ~32 px of the full photo (never above the pixel's own) and
+     * stretches what's left back to white, or (negative) lays a light veil over it. Texture adds
+     * or takes away the detail between ~2 and ~8 px, Clarity the local contrast between ~8 and
+     * ~64 px, in the midtones and softened where it's strong (less halo). Both on brightness only.
+     * Radii are the full photo's: the half-size viewfinder uses the pyramid one level lower, so it
+     * shows what the photo will get. Amounts −1..1.
+     */
+    val photoFinish = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        layout(binding = 0) uniform highp sampler2D uView;
+        layout(binding = 1) uniform highp sampler2D uPyr;   // finishDown's
+        layout(rgba8, binding = 0) writeonly uniform highp image2D uOut;
+        uniform float uTexture;
+        uniform float uClarity;
+        uniform float uDehaze;
+        uniform int uViewOctave;   // the view's size: 0 the full photo, 1 half of it
+
+        const vec3 W709 = vec3(0.2126, 0.7152, 0.0722);
+
+        /** Brightness (x) and darkest channel (y) blurred to 2^[octave] pixels of the full photo. */
+        vec2 blurred(int octave, vec2 uv, vec2 self) {
+            int level = octave - uViewOctave - 1;
+            return level < 0 ? self : textureLod(uPyr, uv, float(level)).rg;
+        }
+
+        void main() {
+            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = imageSize(uOut);
+            if (p.x >= size.x || p.y >= size.y) return;
+            vec2 uv = (vec2(p) + 0.5) / vec2(size);
+            vec3 c = clamp(texelFetch(uView, p, 0).rgb, 0.0, 1.0);
+            vec2 self = vec2(dot(c, W709), min(min(c.r, c.g), c.b));
+            vec2 b1 = blurred(1, uv, self);
+            vec2 b3 = blurred(3, uv, self);
+            vec2 b6 = blurred(6, uv, self);
+            if (uDehaze > 0.0) {
+                float veil = 0.9 * uDehaze * min(blurred(5, uv, self).y, self.y);
+                c = (c - veil) / max(1.0 - veil, 0.05);
+            } else if (uDehaze < 0.0) {
+                c = mix(c, vec3(0.25 + 0.75 * b6.x), -0.5 * uDehaze);
+            }
+            float y = dot(c, W709);
+            float detail = (b1.x - b3.x) * uTexture * (uTexture > 0.0 ? 1.5 : 1.0);
+            float local = b3.x - b6.x;
+            float midtones = clamp(1.0 - (2.0 * y - 1.0) * (2.0 * y - 1.0), 0.0, 1.0);
+            float clarity = local / (1.0 + 3.0 * abs(local)) * 1.5 * uClarity * midtones;
+            imageStore(uOut, p, vec4(clamp(c + detail + clarity, 0.0, 1.0), 1.0));
         }
     """.trimIndent()
 

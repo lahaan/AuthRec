@@ -120,8 +120,23 @@ class CameraActivity : Activity() {
     /** Photo mode also saves the burst's first RAW frame as a DNG (Settings → Photo). */
     internal var photoRaw = false
         private set
-    /** A photo is being taken or saved: the shutter, lenses and modes wait for it. */
+    /** A photo's burst is being taken: the shutter, lenses and modes wait for it (saving doesn't hold them). */
     internal var photoBusy = false
+        private set
+    /** Photos taken and not yet saved, saved one at a time ([photoSaver]). */
+    private val photosSaving = java.util.concurrent.atomic.AtomicInteger()
+    private val photoSaver = java.util.concurrent.Executors.newSingleThreadExecutor()
+    /** The shutter was pressed during a burst: the next one starts as soon as it's done. */
+    private var photoQueued = false
+    /** A still from the recording is on its way ([takeSnap]). */
+    internal var snapBusy = false
+        private set
+    /** Photo mode's Texture, Clarity and Dehaze, −100..100 (Adjust; see Renderer.photoTexture). */
+    internal var photoTexture = 0
+        private set
+    internal var photoClarity = 0
+        private set
+    internal var photoDehaze = 0
         private set
     /** See [Renderer.cleanup]. */
     internal var cleanup = 2
@@ -262,28 +277,35 @@ class CameraActivity : Activity() {
         private set
 
     /**
-     * One short, strong tap when recording starts, stops or pauses and when a photo is taken
-     * (owner: "not a long lasting one but a strong short one"): the click primitive at full scale
-     * where the motor offers it, else a 30 ms pulse at full amplitude (the X14 has no primitives
-     * for apps, and its predefined heavy click plays at MEDIUM strength), else the heavy click.
-     * As touch feedback, so it follows the system's haptics setting.
+     * A short, strong tap when recording starts, stops or pauses (owner: "not a long lasting one
+     * but a strong short one"; 30 ms felt like a cheap phone's buzz): ~9 ms rising to full and
+     * falling off, in 1–4 ms steps of amplitude (the X14's motor has amplitude control but no
+     * primitives or envelopes for apps). [shutter]: a photo, two quick taps 22 ms apart, the
+     * second softer (a shutter's two stages, "extremely quick"). The click primitive where a
+     * motor has it, else a predefined click. As touch feedback: it follows the haptics setting.
      */
-    private fun tap() {
+    private fun tap(shutter: Boolean = false) {
         val vibrator = getSystemService(android.os.VibratorManager::class.java)?.defaultVibrator ?: return
         if (!vibrator.hasVibrator()) return
         val primitive = android.os.VibrationEffect.Composition.PRIMITIVE_CLICK
-        val click = when {
-            vibrator.areAllPrimitivesSupported(primitive) ->
-                android.os.VibrationEffect.startComposition().addPrimitive(primitive, 1f).compose()
-            vibrator.hasAmplitudeControl() -> android.os.VibrationEffect.createOneShot(30, 255)
-            else -> android.os.VibrationEffect.createPredefined(android.os.VibrationEffect.EFFECT_HEAVY_CLICK)
+        val effect = when {
+            vibrator.areAllPrimitivesSupported(primitive) -> android.os.VibrationEffect.startComposition().apply {
+                addPrimitive(primitive, 1f)
+                if (shutter) addPrimitive(primitive, 0.6f, SHUTTER_GAP_MS.toInt())
+            }.compose()
+            vibrator.hasAmplitudeControl() -> if (shutter) {
+                android.os.VibrationEffect.createWaveform(longArrayOf(4, SHUTTER_GAP_MS, 3), intArrayOf(255, 0, 180), -1)
+            } else {
+                android.os.VibrationEffect.createWaveform(longArrayOf(2, 4, 3), intArrayOf(160, 255, 90), -1)
+            }
+            else -> android.os.VibrationEffect.createPredefined(android.os.VibrationEffect.EFFECT_CLICK)
         }
         runCatching {
             if (Build.VERSION.SDK_INT >= 33) {
-                vibrator.vibrate(click, android.os.VibrationAttributes.createForUsage(android.os.VibrationAttributes.USAGE_TOUCH))
+                vibrator.vibrate(effect, android.os.VibrationAttributes.createForUsage(android.os.VibrationAttributes.USAGE_TOUCH))
             } else {
                 @Suppress("DEPRECATION")
-                vibrator.vibrate(click)
+                vibrator.vibrate(effect)
             }
         }
     }
@@ -328,7 +350,23 @@ class CameraActivity : Activity() {
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) audioOn = false
         // A recreate (layout switch) keeps the launching intent; its adb commands already ran.
-        if (savedInstanceState == null) handleCommands(intent)
+        if (savedInstanceState == null && !staleLaunch(intent)) handleCommands(intent)
+    }
+
+    /**
+     * An intent this activity was already created with: Android restarts a task's first activity
+     * with the intent that made the task (from recents, or the launcher bringing the task back
+     * after the process died), so an adb test's settings came back over the owner's: Record went
+     * back to Log, Photo mode came on (2026-11-01). Remembered per launch; a fresh adb intent
+     * reaches a running task through [onNewIntent] instead.
+     */
+    private fun staleLaunch(intent: Intent?): Boolean {
+        if (intent == null || intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return true
+        if (intent.hasCategory(Intent.CATEGORY_LAUNCHER) || intent.extras == null) return false
+        val key = intent.toUri(0)
+        if (prefs.getString("lastLaunch", null) == key) return true
+        prefs.edit().putString("lastLaunch", key).apply()
+        return false
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -342,6 +380,9 @@ class CameraActivity : Activity() {
         simple = prefs.getBoolean("simple", true)
         photo = !simple && prefs.getBoolean("photo", false)
         photoRaw = prefs.getBoolean("photoRaw", false)
+        photoTexture = prefs.getInt("photoTexture", 0)
+        photoClarity = prefs.getInt("photoClarity", 0)
+        photoDehaze = prefs.getInt("photoDehaze", 0)
         classicUi = prefs.getString("uiStyle", "glass") == "classic"
         aspect = runCatching { FrameAspect.valueOf(prefs.getString("aspect", null)!!) }.getOrDefault(FrameAspect.OPEN_GATE)
         profile = runCatching { LogProfile.valueOf(prefs.getString("profile", null)!!) }.getOrDefault(LogProfile.APPLE_LOG)
@@ -386,6 +427,9 @@ class CameraActivity : Activity() {
             .putBoolean("simple", simple)
             .putBoolean("photo", photo)
             .putBoolean("photoRaw", photoRaw)
+            .putInt("photoTexture", photoTexture)
+            .putInt("photoClarity", photoClarity)
+            .putInt("photoDehaze", photoDehaze)
             .putString("uiStyle", if (classicUi) "classic" else "glass")
             .putString("aspect", aspect.name)
             .putString("profile", profile.name)
@@ -739,7 +783,25 @@ class CameraActivity : Activity() {
         // Back from Photo's long shutters: a video frame holds at most 1/fps.
         if (!photo) c = c.copy(exposureNs = c.exposureNs.coerceAtMost(1_000_000_000L / c.fps))
         setCapture(c)
+        applyPhotoFinish()
         settingsChanged()
+    }
+
+    /** Photo mode's Texture, Clarity and Dehaze (−100..100): the viewfinder shows them, the photo gets them. */
+    internal fun setPhotoFinish(texture: Int = photoTexture, clarity: Int = photoClarity, dehaze: Int = photoDehaze) {
+        photoTexture = texture.coerceIn(-100, 100)
+        photoClarity = clarity.coerceIn(-100, 100)
+        photoDehaze = dehaze.coerceIn(-100, 100)
+        applyPhotoFinish()
+        updateUi()
+        saveSoon()
+    }
+
+    private fun applyPhotoFinish() {
+        renderer?.photoMode = photo
+        renderer?.photoTexture = photoTexture / 100f
+        renderer?.photoClarity = photoClarity / 100f
+        renderer?.photoDehaze = photoDehaze / 100f
     }
 
     /** The current lens has a flash unit the torch can use (the front cameras don't). */
@@ -1724,6 +1786,7 @@ class CameraActivity : Activity() {
         r.nrFast = nrFast
         camera = cam
         renderer = r
+        applyPhotoFinish()
         // After the swap: these write to the current renderer (exposure was lost on lens switches
         // when it ran before it, e.g. Manual's digital EV).
         applyTone()
@@ -1873,7 +1936,9 @@ class CameraActivity : Activity() {
         getSystemService(PowerManager::class.java).removeThermalStatusListener(thermalListener)
         orientationListener.disable()
         stopRecording() // also cancels a warm-up
-        if (photoBusy) renderer?.cancelPhoto() // one already saving finishes on its own
+        // A burst under way is finished with the frames it has; saving goes on in the background.
+        if (photoBusy) renderer?.finishPhotoNow()
+        photoQueued = false
         info.removeCallbacks(retryCamera)
         retryPending = false
         camera?.close()
@@ -1978,16 +2043,23 @@ class CameraActivity : Activity() {
     private var debugPhotoFrames = 0
 
     /**
-     * Photo mode's shutter: a short burst from the running RAW stream, developed off the
-     * realtime path (full size, Quality colour NR warmed over the burst, the frames merged where
-     * they match: Renderer.takePhoto), saved as a JPEG of the view and optionally the first
-     * frame's DNG ([PhotoSaver]). The viewfinder keeps running; the shutter waits until saved.
+     * Photo mode's shutter: a short burst from the running RAW stream, merged (aligned) in RAW
+     * and developed off the realtime path (full size, Quality colour NR on the merged frame:
+     * Renderer.takePhoto), saved as a JPEG of the view and optionally the first frame's DNG
+     * ([PhotoSaver]). The viewfinder keeps running, and the shutter is free again once the burst
+     * is in: saving runs behind ([photoSaver]), and a press during a burst takes the next one
+     * right after it (owner: "take another one almost instantly").
      */
     internal fun takePhoto() {
         val r = renderer ?: return
         val cam = camera ?: return
-        if (photoBusy || recorder != null || stopping || scanning) return
+        if (recorder != null || stopping || scanning) return
+        if (photoBusy || photosSaving.get() >= MAX_PHOTOS_SAVING) {
+            photoQueued = true
+            return
+        }
         photoBusy = true
+        photoQueued = false
         val keep = frameSize(cam).third
         val turn = recordingRotation()
         // The RAW is the sensor's image: never mirrored, and the front camera's half turn not applied.
@@ -2001,31 +2073,43 @@ class CameraActivity : Activity() {
         info.postDelayed(photoTimeout, PHOTO_TIMEOUT_MS)
         updateUi()
         r.takePhoto(frames, keepRaw = raw, cropHeight = keep, onReference = { if (raw) cam.keepResult(it) }) { shot ->
-            // GL thread. The tap only now, the burst taken: the motor shook a ¼ s frame when it came
-            // with the press. Saving takes a second or two (JPEG of 12 MP, maybe a 25 MB DNG): its own thread.
-            if (shot != null) tap()
+            // GL thread. The tap only now, the burst taken: the motor shook a ¼ s frame when it came with the press.
+            if (shot != null) tap(shutter = true)
             if (shot == null) {
                 EventLog.log("Photo not taken (the camera stopped or switched)")
                 runOnUiThread { photoDone("Photo not taken") }
                 return@takePhoto
             }
             val dng = if (raw) cam.dngSource(shot.timestamp) else null
-            Thread {
-                val t0 = SystemClock.elapsedRealtime()
-                val saved = runCatching { PhotoSaver.save(this, shot, turn, dng, rawTurn) }
-                    .getOrElse { PhotoSaver.Result(null, 0, null, it.message ?: it.javaClass.simpleName) }
-                EventLog.log("${shot.summary} on $lens, " + (if (turn != 0) "turned $turn°, " else "") + "battery %.1f °C; ".format(battery) +
-                    "saved in ${SystemClock.elapsedRealtime() - t0} ms: " +
-                    (saved.jpeg?.let { "JPEG ${saved.jpegBytes / 1000} KB → $it" } ?: "no JPEG") +
-                    (saved.dng?.let { ", DNG → $it" } ?: "") + (saved.error?.let { " ($it)" } ?: ""))
-                val msg = when {
-                    saved.jpeg == null -> "Photo not saved: ${saved.error}"
-                    saved.error != null -> "Photo saved (${saved.error})"
-                    saved.dng != null -> "Photo saved (JPEG + DNG)"
-                    else -> "Photo saved"
-                }
-                runOnUiThread { photoDone(msg) }
-            }.start()
+            savePhoto(shot, turn, dng, rawTurn, "on $lens, " + (if (turn != 0) "turned $turn°, " else "") + "battery %.1f °C".format(battery))
+            runOnUiThread { photoDone(null) }
+        }
+    }
+
+    /** [shot] into the save queue: JPEG (+ DNG from [dng]), the event log line, a note when saved. */
+    private fun savePhoto(shot: Renderer.Photo, turn: Int, dng: Pair<android.hardware.camera2.CameraCharacteristics, android.hardware.camera2.CaptureResult>?,
+                          rawTurn: Int, where: String) {
+        photosSaving.incrementAndGet()
+        photoSaver.execute {
+            val t0 = SystemClock.elapsedRealtime()
+            val saved = runCatching { PhotoSaver.save(this, shot, turn, dng, rawTurn) }
+                .getOrElse { PhotoSaver.Result(null, 0, null, it.message ?: it.javaClass.simpleName) }
+            val waiting = photosSaving.decrementAndGet()
+            EventLog.log("${shot.summary} $where; saved in ${SystemClock.elapsedRealtime() - t0} ms" +
+                (if (waiting > 0) " ($waiting more waiting)" else "") + ": " +
+                (saved.jpeg?.let { "JPEG ${saved.jpegBytes / 1000} KB → $it" } ?: "no JPEG") +
+                (saved.dng?.let { ", DNG → $it" } ?: "") + (saved.error?.let { " ($it)" } ?: ""))
+            val msg = when {
+                saved.jpeg == null -> "Photo not saved: ${saved.error}"
+                saved.error != null -> "Photo saved (${saved.error})"
+                saved.dng != null -> "Photo saved (JPEG + DNG)"
+                else -> "Photo saved"
+            }
+            runOnUiThread {
+                note(msg)
+                if (photoQueued && !photoBusy && photo) takePhoto()
+                updateUi()
+            }
         }
     }
 
@@ -2036,11 +2120,41 @@ class CameraActivity : Activity() {
         photoDone("Photo not taken (timed out)")
     }
 
-    private fun photoDone(msg: String) {
+    /** The burst is over ([msg]: why there's no photo, else null: it's saving). */
+    private fun photoDone(msg: String?) {
         info.removeCallbacks(photoTimeout)
         photoBusy = false
-        note(msg)
+        msg?.let { note(it) }
         updateUi()
+        if (photoQueued && resumed && photo) takePhoto()
+    }
+
+    /**
+     * A still while recording (asked for by someone the owner showed the app): the frame being
+     * recorded, at its size, with the look (Renderer.takeSnap). No haptic tap: it would shake the clip.
+     */
+    internal fun takeSnap() {
+        val r = renderer ?: return
+        val cam = camera ?: return
+        if (recorder == null || snapBusy || photosSaving.get() >= MAX_PHOTOS_SAVING) return
+        snapBusy = true
+        updateUi()
+        val turn = recordingRotation()
+        val lens = lenses.getOrNull(lensIndex)?.key
+        r.takeSnap(frameSize(cam).third) { shot ->
+            if (shot == null) {
+                runOnUiThread {
+                    snapBusy = false
+                    updateUi()
+                }
+                return@takeSnap
+            }
+            savePhoto(shot, turn, null, 0, "on $lens" + if (turn != 0) ", turned $turn°" else "")
+            runOnUiThread {
+                snapBusy = false
+                updateUi()
+            }
+        }
     }
 
     /**
@@ -2446,7 +2560,9 @@ class CameraActivity : Activity() {
      * nrfast = true|false (`--ez`: colour NR's Fast variant instead of Quality),
      * photo = true|false (`--ez`: Photo mode), cmd = photo (take one, in Photo mode), photoraw =
      * true|false (`--ez`: a DNG too), photoframes = burst length (`--ei`, 0 = default),
-     * photomerge = false (`--ez`: no burst merge, to compare; colour NR still warms over the burst),
+     * photomerge = false (`--ez`: no burst merge, to compare), photoalign = false (`--ez`: merged
+     * without aligning), photoshake = quads (`--ei`: each burst frame read that far off, 0 = off),
+     * texture / clarity / dehaze = −100..100 (`--ei`: Photo mode's dials), cmd = snap (a still while recording),
      * torch = true|false (`--ez`).
      */
     private fun handleCommands(intent: Intent?) {
@@ -2558,6 +2674,11 @@ class CameraActivity : Activity() {
         if (extras.containsKey("slowframe")) Renderer.debugSlowFrameMs = extras.getInt("slowframe")
         if (extras.containsKey("photoframes")) debugPhotoFrames = extras.getInt("photoframes")
         if (extras.containsKey("photomerge")) Renderer.debugPhotoMerge = extras.getBoolean("photomerge")
+        if (extras.containsKey("photoalign")) Renderer.debugPhotoAlign = extras.getBoolean("photoalign")
+        if (extras.containsKey("photoshake")) Renderer.debugPhotoShake = extras.getInt("photoshake")
+        if (extras.containsKey("texture") || extras.containsKey("clarity") || extras.containsKey("dehaze")) {
+            setPhotoFinish(extras.getInt("texture", photoTexture), extras.getInt("clarity", photoClarity), extras.getInt("dehaze", photoDehaze))
+        }
         extras.getString("open")?.let { name ->
             info.postDelayed({ if (name == "recordings") openRecordings() else ui.openForTest(name) }, 1200)
         }
@@ -2570,6 +2691,7 @@ class CameraActivity : Activity() {
                 info.postDelayed({ takePhoto() }, 2500)
             }
             "stop" -> stopRecording()
+            "snap" -> takeSnap()
             "edit" -> info.postDelayed({ openLookEditor() }, 1500)
             "dumpcams" -> Thread { dumpCameras() }.start()
             // Exercises the failure handling: the camera closes as if the HAL had reported an error
@@ -2638,6 +2760,10 @@ class CameraActivity : Activity() {
         private const val PHOTO_FRAMES = 8
         private const val PHOTO_BURST_NS = 2e9
         private const val PHOTO_TIMEOUT_MS = 10_000L
+        /** Photos waiting to be saved before the shutter waits too (~50 MB of picture each). */
+        private const val MAX_PHOTOS_SAVING = 3
+        /** The shutter's two taps, this far apart. */
+        private const val SHUTTER_GAP_MS = 22L
         /** Pre-roll before a clip starts (see [warmingUp]): 4K, and 2K superpixel. */
         private const val PRE_ROLL_MS = 1000L
         private const val PRE_ROLL_2K_MS = 500L

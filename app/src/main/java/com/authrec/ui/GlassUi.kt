@@ -72,6 +72,11 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         foreground = PauseIcon(this, a.dp(2).toFloat()) { a.paused }
         contentDescription = "Pause recording"
     }
+    /** A still from the recording, above Pause while a clip records. */
+    private val snapButton = roundChip("") { a.takeSnap() }.apply {
+        foreground = SnapIcon(this, a.dp(2).toFloat())
+        contentDescription = "Photo from the recording"
+    }
     /** Selfie-style mirror, next to the flip button while the front camera is on. */
     private val mirrorButton = roundChip("") { a.setMirrorFront(!a.mirrorFront) }.apply {
         foreground = MirrorIcon(this, a.dp(2).toFloat())
@@ -224,6 +229,19 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val vibranceLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val adjWarmthLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val adjTintLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
+    // Photo mode's Texture / Clarity / Dehaze (Lightroom's Presence dials), only in Photo mode.
+    private val textureBar = kit.seekBar(200, a.photoTexture + 100)
+    private val clarityBar = kit.seekBar(200, a.photoClarity + 100)
+    private val dehazeBar = kit.seekBar(200, a.photoDehaze + 100)
+    private val textureLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
+    private val clarityLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
+    private val dehazeLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
+    private val photoDials = LinearLayout(a).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(sliderRow(textureLabel, textureBar) { a.setPhotoFinish(texture = it - 100) })
+        addView(sliderRow(clarityLabel, clarityBar) { a.setPhotoFinish(clarity = it - 100) })
+        addView(sliderRow(dehazeLabel, dehazeBar) { a.setPhotoFinish(dehaze = it - 100) })
+    }
     private val adjustPanel = kit.panel().apply {
         orientation = LinearLayout.HORIZONTAL
         visibility = View.GONE
@@ -235,12 +253,14 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             addView(sliderRow(vibranceLabel, vibranceBar) { a.setLookAdjust(vibrance = it - 100) })
             addView(sliderRow(adjWarmthLabel, adjWarmthBar) { a.setWbShift(it - 100, a.wbTint) })
             addView(sliderRow(adjTintLabel, adjTintBar) { a.setWbShift(a.wbWarmth, it - 100) })
+            addView(photoDials)
             addView(LinearLayout(a).apply {
                 orientation = LinearLayout.HORIZONTAL
                 addView(kit.button("Reset") {
                     a.setLookAdjust(100, 100, 0)
                     a.setWbShift(0, 0)
                     a.resetEdrCurve()
+                    if (a.photo) a.setPhotoFinish(0, 0, 0)
                 })
                 addView(kit.button("Edit look…") { a.openLookEditor() }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
                     marginStart = a.dp(8)
@@ -313,6 +333,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         })
         addView(pauseButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
             setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18))
+        })
+        addView(snapButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
+            setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18 + 46 + 14))
         })
         // Under the EV slider (which ends 17 % of the height above the bottom), level with flip.
         addView(mirrorButton, FrameLayout.LayoutParams(a.dp(40), a.dp(40), Gravity.BOTTOM or Gravity.END).apply {
@@ -691,6 +714,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         kit.setOn(pauseButton, a.paused)
         pauseButton.contentDescription = if (a.paused) "Resume recording" else "Pause recording"
         pauseButton.invalidate()
+        snapButton.visibility = if (recording && !a.warmingUp) View.VISIBLE else View.GONE
+        snapButton.isEnabled = !a.snapBusy && !a.stopping
+        snapButton.alpha = if (snapButton.isEnabled) 1f else 0.5f
         flipButton.isEnabled = !busy && !a.scanning
         mirrorButton.visibility = if (current?.front == true) View.VISIBLE else View.GONE
         kit.setOn(mirrorButton, a.mirrorFront)
@@ -746,12 +772,19 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         vibranceLabel.text = "Vibrance %+d".format(a.vibrancePct)
         adjWarmthLabel.text = "Warmth %+d".format(a.wbWarmth)
         adjTintLabel.text = "Tint %+d".format(a.wbTint)
+        photoDials.visibility = if (a.photo) View.VISIBLE else View.GONE
+        textureLabel.text = "Texture %+d".format(a.photoTexture)
+        clarityLabel.text = "Clarity %+d".format(a.photoClarity)
+        dehazeLabel.text = "Dehaze %+d".format(a.photoDehaze)
         fun sync(bar: SeekBar, p: Int) { if (bar.progress != p) bar.progress = p }
         sync(strengthBar, a.lutStrength)
         sync(saturationBar, a.saturationPct)
         sync(vibranceBar, a.vibrancePct + 100)
         sync(adjWarmthBar, a.wbWarmth + 100)
         sync(adjTintBar, a.wbTint + 100)
+        sync(textureBar, a.photoTexture + 100)
+        sync(clarityBar, a.photoClarity + 100)
+        sync(dehazeBar, a.photoDehaze + 100)
 
         // Settings.
         settingsRows.forEach { it() }
@@ -1035,6 +1068,36 @@ private class MirrorIcon(private val view: TextView, private val stroke: Float) 
 }
 
 /** A lightning bolt in the button's text colour, filled while the torch is on. */
+/** A camera: a rounded body with a lens (the still-while-recording button). */
+private class SnapIcon(private val view: TextView, private val stroke: Float) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeJoin = Paint.Join.ROUND }
+    private val rect = android.graphics.RectF()
+
+    override fun draw(canvas: Canvas) {
+        val s = minOf(bounds.width(), bounds.height()) * 0.5f
+        val cx = bounds.exactCenterX()
+        val cy = bounds.exactCenterY()
+        paint.color = view.currentTextColor
+        paint.strokeWidth = stroke
+        rect.set(cx - s * 0.5f, cy - s * 0.3f, cx + s * 0.5f, cy + s * 0.36f)
+        canvas.drawRoundRect(rect, s * 0.1f, s * 0.1f, paint)
+        rect.set(cx - s * 0.18f, cy - s * 0.42f, cx + s * 0.06f, cy - s * 0.3f)
+        canvas.drawRect(rect, paint)
+        canvas.drawCircle(cx, cy + s * 0.03f, s * 0.17f, paint)
+    }
+
+    override fun setAlpha(alpha: Int) {
+        paint.alpha = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        paint.colorFilter = colorFilter
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
+}
+
 private class TorchIcon(private val view: TextView, private val stroke: Float, private val on: () -> Boolean) : Drawable() {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeJoin = Paint.Join.ROUND }
     private val path = Path()

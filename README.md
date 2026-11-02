@@ -20,7 +20,7 @@ balance, colour matrix, lens shading).
 - Pause / resume recording support
 - Finds lenses hidden from normal apps (ultrawide, telephoto where the phone allows)
 - Recordings screen with Compress (HEVC / H.264 / AV1 on the CPU, size-capped for grain)
-- Simple and Pro mode, and Photo: a burst merged in RAW, the look applied, JPEG (+ optional DNG)
+- Simple and Pro mode, and Photo: a burst aligned and merged in RAW, the look applied, Texture / Clarity / Dehaze, JPEG (+ optional DNG); stills while recording
 
 ## Status
 
