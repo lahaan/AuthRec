@@ -1,4 +1,4 @@
-# Handoff: state as of 0.7.2 (2026-10-21, GitHub pre-release v0.7.2)
+# Handoff: state as of 0.8.0 (2026-11-02, GitHub pre-release v0.8.0)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -104,6 +104,17 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
   verified unmirrored).
 
 ## Start here (next session)
+
+00000. **0.8.0 (2026-11-02)**: feedback/notes.md items 86–87. Photo mode (third mode; Pro's
+    controls minus video's, Manual shutter to ½ s): a burst of up to 8 RAW frames aligned to the
+    first (whole-frame offset, then tiles coarse to fine) and merged where they match within
+    noise, Quality colour NR run over the merged frame, the look applied, JPEG (+ DNG); the
+    viewfinder runs with the pixel fix only; saving queues behind the shutter. Texture / Clarity
+    / Dehaze dials in Photo mode. Stills while recording (the recorded frame with the look).
+    Torch on/off, short haptic taps, OIS asked for in Photo mode, Pro's info line says whether a
+    clip records the look or Log. adb intents an activity was already created with are ignored
+    (a restart replayed a test's Log-only setting over the owner's). Verified on the X14 1x
+    (still and with a made-up shake); real handheld shake and other phones untested.
 
 0000. **0.7.2 (2026-10-21)**: feedback/notes.md items 84–85. Cheaper GPU passes with identical
     output (prep per 2×2 quad with the pixel fix, gathered change-test blocks, glass blur every
