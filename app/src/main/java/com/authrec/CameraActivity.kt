@@ -2476,7 +2476,9 @@ class CameraActivity : Activity() {
             heatNote()?.let { append(it) }
             if (!simple) {
                 if (isNotEmpty()) append("\n")
-                append("$out · ${profile.label}\n")
+                // Pro records the look only with Settings → Record on Look (Simple always): said here,
+                // or Log clips come as a surprise (owner: "Pro only records Log").
+                append("$out · ${profile.label}" + (if (photo) "" else " · records " + if (bakeLut) "the look" else "Log") + "\n")
                 append("ISO ${m?.iso ?: "-"} (≈${effectiveIso ?: "-"} with gain) · $shutter · gain %+.1f EV · %.1f fps · frame %.1f ms".format(
                     gainEv, stats.fps, stats.gpuMs))
                 // A viewfinder drawing fewer frames than are recorded looks choppy (the GL thread is behind).
