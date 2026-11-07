@@ -1,4 +1,4 @@
-# Handoff: state as of 0.8.0 (2026-11-02, GitHub pre-release v0.8.0)
+# Handoff: state as of 0.8.1 (2026-11-07, GitHub pre-release v0.8.1)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -104,6 +104,13 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
   verified unmirrored).
 
 ## Start here (next session)
+
+000000. **0.8.1 (2026-11-07)**: feedback/notes.md item 88. Texture / Clarity / Dehaze rebuilt
+    (log brightness, a capped veil for Dehaze +, a highlight bloom for Dehaze −; tuned with a
+    numpy prototype on the owner's photos) and applied to look-baked recordings too (Pro and
+    Photo). The dials' pyramid is one texture per level: mip levels written while the level
+    below was read smeared bright areas on the Adreno 750. Adjust sliders drag relatively, stop
+    at neutral, reset on a double-tap. Pro's info line says whether a clip records the look.
 
 00000. **0.8.0 (2026-11-02)**: feedback/notes.md items 86–87. Photo mode (third mode; Pro's
     controls minus video's, Manual shutter to ½ s): a burst of up to 8 RAW frames aligned to the
