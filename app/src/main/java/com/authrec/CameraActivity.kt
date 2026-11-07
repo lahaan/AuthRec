@@ -131,7 +131,7 @@ class CameraActivity : Activity() {
     /** A still from the recording is on its way ([takeSnap]). */
     internal var snapBusy = false
         private set
-    /** Photo mode's Texture, Clarity and Dehaze, −100..100 (Adjust; see Renderer.photoTexture). */
+    /** Texture, Clarity and Dehaze, −100..100 (Adjust, Pro and Photo; see Renderer.photoTexture). */
     internal var photoTexture = 0
         private set
     internal var photoClarity = 0
@@ -787,7 +787,11 @@ class CameraActivity : Activity() {
         settingsChanged()
     }
 
-    /** Photo mode's Texture, Clarity and Dehaze (−100..100): the viewfinder shows them, the photo gets them. */
+    /**
+     * Texture, Clarity and Dehaze (−100..100), part of the view like the look: the viewfinder shows
+     * them, photos and recordings with the look baked in get them (owner: "could [they] be added to
+     * video"); log recordings don't. Pro and Photo only: Simple stays plain.
+     */
     internal fun setPhotoFinish(texture: Int = photoTexture, clarity: Int = photoClarity, dehaze: Int = photoDehaze) {
         photoTexture = texture.coerceIn(-100, 100)
         photoClarity = clarity.coerceIn(-100, 100)
@@ -799,6 +803,7 @@ class CameraActivity : Activity() {
 
     private fun applyPhotoFinish() {
         renderer?.photoMode = photo
+        renderer?.dialsActive = !simple
         renderer?.photoTexture = photoTexture / 100f
         renderer?.photoClarity = photoClarity / 100f
         renderer?.photoDehaze = photoDehaze / 100f
@@ -2264,7 +2269,9 @@ class CameraActivity : Activity() {
         recordStartMs = SystemClock.elapsedRealtime()
         lastResult = null
         EventLog.log("Recording ${w}x$h (${aspect.label}) ${recCodec.name} $bitrateMbps Mbps ${capture.fps} fps on ${lenses.getOrNull(lensIndex)?.key}, " +
-            "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}, clean $cleanup, " +
+            "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}" +
+            (if (bakeLut && !simple && (photoTexture != 0 || photoClarity != 0 || photoDehaze != 0))
+                " (texture %+d clarity %+d dehaze %+d)".format(photoTexture, photoClarity, photoDehaze) else "") + ", clean $cleanup, " +
             "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, WB shift $wbWarmth/$wbTint, " +
             (if (mirrored()) "mirrored, " else "") +
             (if (turn != 0) "turned $turn° (phone held ${if (turn % 180 == 0) "upside down" else "upright"}), " else "") +

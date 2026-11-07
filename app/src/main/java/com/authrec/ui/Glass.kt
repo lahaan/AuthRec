@@ -15,6 +15,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
@@ -334,9 +335,16 @@ internal class UiKit(val context: Context, val glass: Boolean) {
         }
     }
 
-    fun seekBar(max: Int, initial: Int): SeekBar = SeekBar(context).apply {
+    /** A slider; with a [neutral] value (where it rests, ≥ 0) a [DialBar], else a plain SeekBar (the focus bar). */
+    fun seekBar(max: Int, initial: Int, neutral: Int = -1): SeekBar = (if (neutral >= 0) DialBar(context, neutral) else SeekBar(context)).apply {
         this.max = max
         progress = initial
+        if (neutral >= 0) {
+            // A thicker track (more padding made Photo mode's eight rows taller than the screen).
+            minHeight = context.dp(4)
+            maxHeight = context.dp(4)
+            setPadding(context.dp(14), context.dp(2), context.dp(14), context.dp(2))
+        }
         if (glass) {
             progressTintList = ColorStateList.valueOf(Glass.ACCENT)
             thumbTintList = ColorStateList.valueOf(Color.WHITE)
@@ -401,5 +409,77 @@ internal class UiKit(val context: Context, val glass: Boolean) {
             addUpdateListener { view.alpha = it.animatedValue as Float }
             start()
         }
+    }
+}
+
+/**
+ * The Adjust sliders (owner: "could be a little easier to use"): dragging moves the value from
+ * where it was, wherever the finger lands (a touch no longer jumps it there), with a soft stop
+ * at [neutral] (a tick as it catches) and a double-tap back to it. Changes from these gestures
+ * reach the listener as the user's.
+ */
+internal class DialBar(context: Context, private val neutral: Int) : SeekBar(context) {
+    private var listener: OnSeekBarChangeListener? = null
+    private var byGesture = false
+    private var downX = 0f
+    private var downProgress = 0
+    private var dragging = false
+    private var lastTap = 0L
+    private val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+
+    override fun setOnSeekBarChangeListener(l: OnSeekBarChangeListener?) {
+        listener = l
+        super.setOnSeekBarChangeListener(object : OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) { l?.onProgressChanged(sb, p, fromUser || byGesture) }
+            override fun onStartTrackingTouch(sb: SeekBar) { l?.onStartTrackingTouch(sb) }
+            override fun onStopTrackingTouch(sb: SeekBar) { l?.onStopTrackingTouch(sb) }
+        })
+    }
+
+    private fun setByGesture(p: Int) {
+        if (p == progress) return
+        byGesture = true
+        progress = p
+        byGesture = false
+    }
+
+    @android.annotation.SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (!isEnabled) return false
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = e.x
+                downProgress = progress
+                dragging = false
+                parent?.requestDisallowInterceptTouchEvent(true)
+                isPressed = true
+                listener?.onStartTrackingTouch(this)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = e.x - downX
+                if (!dragging && kotlin.math.abs(dx) > slop) dragging = true
+                if (dragging) {
+                    val track = (width - paddingLeft - paddingRight).coerceAtLeast(1)
+                    var p = (downProgress + dx / track * max).toInt().coerceIn(0, max)
+                    if (neutral >= 0 && kotlin.math.abs(p - neutral) <= max / 40) {
+                        if (progress != neutral) performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        p = neutral
+                    }
+                    setByGesture(p)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                isPressed = false
+                if (!dragging && e.actionMasked == MotionEvent.ACTION_UP) {
+                    val now = e.eventTime
+                    if (neutral >= 0 && now - lastTap < android.view.ViewConfiguration.getDoubleTapTimeout()) {
+                        setByGesture(neutral)
+                        lastTap = 0L
+                    } else lastTap = now
+                }
+                listener?.onStopTrackingTouch(this)
+            }
+        }
+        return true
     }
 }

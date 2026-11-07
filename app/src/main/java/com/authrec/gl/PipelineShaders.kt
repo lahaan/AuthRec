@@ -1368,41 +1368,76 @@ internal object PipelineShaders {
     """.trimIndent()
 
     /**
-     * Photo mode's Texture / Clarity / Dehaze (Lightroom's Presence dials), step 1: a pyramid of
-     * the view's brightness (r) and darkest channel (g), level 0 at half the view's size, each
-     * level half the one before (rgba16f mip levels, so the finish samples them filtered).
+     * Photo mode's Texture / Clarity / Dehaze (Lightroom's Presence dials), step 1, one level per
+     * pass: two pyramids of the view, level 0 at half its size, each level half the one before:
+     * log brightness (r) and darkest channel (g); and the highlights' colour, what Dehaze's
+     * negative side blooms. One texture per level: written as mip levels of one texture (the level
+     * below read from it in the same pass) the Adreno 750 smeared bright areas along the rows.
      */
     val finishDown = """
         #version 310 es
         precision highp float;
         precision highp int;
         layout(local_size_x = 16, local_size_y = 16) in;
-        layout(binding = 0) uniform highp sampler2D uIn;   // level 0: the view; then the pyramid
+        layout(binding = 0) uniform highp sampler2D uIn;     // level 0: the view; then the level below
+        layout(binding = 1) uniform highp sampler2D uInGlow; // the glow level below (levels past 0)
         layout(rgba16f, binding = 0) writeonly uniform highp image2D uOut;
+        layout(rgba16f, binding = 1) writeonly uniform highp image2D uOutGlow;
         uniform int uLevel;
-
+        $FINISH_COMMON
         void main() {
             ivec2 o = ivec2(gl_GlobalInvocationID.xy);
             if (o.x >= imageSize(uOut).x || o.y >= imageSize(uOut).y) return;
-            int src = max(uLevel - 1, 0);
-            ivec2 last = textureSize(uIn, src) - 1;
-            vec2 s = vec2(0.0);
+            ivec2 last = textureSize(uIn, 0) - 1;
+            vec2 a = vec2(0.0);
+            vec3 g = vec3(0.0);
             for (int i = 0; i < 4; i++) {
-                vec4 c = texelFetch(uIn, min(o * 2 + ivec2(i & 1, i >> 1), last), src);
-                s += uLevel == 0 ? vec2(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), min(min(c.r, c.g), c.b)) : c.rg;
+                ivec2 p = min(o * 2 + ivec2(i & 1, i >> 1), last);
+                if (uLevel == 0) {
+                    vec3 c = clamp(texelFetch(uIn, p, 0).rgb, 0.0, 1.0);
+                    a += brightnessAndDark(c);
+                    g += glowSource(c);
+                } else {
+                    a += texelFetch(uIn, p, 0).rg;
+                    g += texelFetch(uInGlow, p, 0).rgb;
+                }
             }
-            imageStore(uOut, o, vec4(s * 0.25, 0.0, 1.0));
+            imageStore(uOut, o, vec4(a * 0.25, 0.0, 1.0));
+            imageStore(uOutGlow, o, vec4(g * 0.25, 1.0));
         }
     """.trimIndent()
 
+    /** What [finishDown] and [photoFinish] both measure per pixel. */
+    private const val FINISH_COMMON = """
+        const vec3 W709 = vec3(0.2126, 0.7152, 0.0722);
+        const float EPS = 1.0 / 64.0;   // keeps log brightness out of the deepest shadows' noise
+
+        /** log2 brightness and the darkest channel of display colour [c]. */
+        vec2 brightnessAndDark(vec3 c) { return vec2(log2(dot(c, W709) + EPS), min(min(c.r, c.g), c.b)); }
+
+        /**
+         * The part of [c] that blooms: its colour, from mid-bright up. Bright partly by its
+         * strongest channel: by brightness alone a saturated light (magenta LEDs, a red sign) is
+         * dim, and didn't bloom (2026-11-07).
+         */
+        vec3 glowSource(vec3 c) { return c * smoothstep(0.35, 0.9, mix(dot(c, W709), max(max(c.r, c.g), c.b), 0.5)); }
+    """
+
     /**
-     * Step 2, on the finished view (look and all, display-referred): Dehaze lifts a veil, the
-     * darkest channel blurred over ~32 px of the full photo (never above the pixel's own) and
-     * stretches what's left back to white, or (negative) lays a light veil over it. Texture adds
-     * or takes away the detail between ~2 and ~8 px, Clarity the local contrast between ~8 and
-     * ~64 px, in the midtones and softened where it's strong (less halo). Both on brightness only.
-     * Radii are the full photo's: the half-size viewfinder uses the pyramid one level lower, so it
-     * shows what the photo will get. Amounts −1..1.
+     * Step 2, on the finished view (look and all, display-referred), tuned on the owner's photos
+     * (a prototype with the same pyramids, 2026-11-07; the first version barely showed: absolute
+     * differences in the dark, a midtone weight that left night scenes out, a veil that only
+     * flattened):
+     * - Texture and Clarity act on log brightness (a ratio, so dark scenes get them too): Texture
+     *   the detail between ~2 and ~8 px of the full photo, Clarity the local contrast between ~8
+     *   and ~64 px, softened where it's strong (less halo), left out only near black and white.
+     * - Dehaze +: lifts a veil, the darkest channel over ~32 px (never above the pixel's own, at
+     *   most 45 % of it, so white stays white), stretches back, and adds some local contrast and
+     *   saturation. Dehaze −: a light veil toward the surroundings' brightness and a bloom: the
+     *   highlights' colour spread over ~8–64 px, screened on (owner: "bring out highlights as
+     *   bloomy").
+     * Radii are the full photo's: the half-size viewfinder gets the pyramids one level lower, so
+     * it shows what the photo will get. Amounts −1..1.
      */
     val photoFinish = """
         #version 310 es
@@ -1410,20 +1445,23 @@ internal object PipelineShaders {
         precision highp int;
         layout(local_size_x = 16, local_size_y = 16) in;
         layout(binding = 0) uniform highp sampler2D uView;
-        layout(binding = 1) uniform highp sampler2D uPyr;   // finishDown's
-        layout(rgba8, binding = 0) writeonly uniform highp image2D uOut;
+        // finishDown's levels blurred to 2^n pixels of the full photo: log brightness and darkest
+        // channel (uB), the highlights' colour (uG). The renderer binds the right level for the
+        // view's size; uB1Self: at half size 2 px is the pixel itself.
+        layout(binding = 1) uniform highp sampler2D uB1;
+        layout(binding = 2) uniform highp sampler2D uB3;
+        layout(binding = 3) uniform highp sampler2D uB5;
+        layout(binding = 4) uniform highp sampler2D uB6;
+        layout(binding = 5) uniform highp sampler2D uG3;
+        layout(binding = 6) uniform highp sampler2D uG4;
+        layout(binding = 7) uniform highp sampler2D uG5;
+        layout(binding = 8) uniform highp sampler2D uG6;
+        layout(rgba16f, binding = 0) writeonly uniform highp image2D uOut;
+        uniform bool uB1Self;
         uniform float uTexture;
         uniform float uClarity;
         uniform float uDehaze;
-        uniform int uViewOctave;   // the view's size: 0 the full photo, 1 half of it
-
-        const vec3 W709 = vec3(0.2126, 0.7152, 0.0722);
-
-        /** Brightness (x) and darkest channel (y) blurred to 2^[octave] pixels of the full photo. */
-        vec2 blurred(int octave, vec2 uv, vec2 self) {
-            int level = octave - uViewOctave - 1;
-            return level < 0 ? self : textureLod(uPyr, uv, float(level)).rg;
-        }
+        $FINISH_COMMON
 
         void main() {
             ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -1431,22 +1469,34 @@ internal object PipelineShaders {
             if (p.x >= size.x || p.y >= size.y) return;
             vec2 uv = (vec2(p) + 0.5) / vec2(size);
             vec3 c = clamp(texelFetch(uView, p, 0).rgb, 0.0, 1.0);
-            vec2 self = vec2(dot(c, W709), min(min(c.r, c.g), c.b));
-            vec2 b1 = blurred(1, uv, self);
-            vec2 b3 = blurred(3, uv, self);
-            vec2 b6 = blurred(6, uv, self);
+            vec2 self = brightnessAndDark(c);
+            vec2 b1 = uB1Self ? self : texture(uB1, uv).rg;
+            vec2 b3 = texture(uB3, uv).rg;
+            vec2 b6 = texture(uB6, uv).rg;
+            float extraClarity = 0.0;
             if (uDehaze > 0.0) {
-                float veil = 0.9 * uDehaze * min(blurred(5, uv, self).y, self.y);
-                c = (c - veil) / max(1.0 - veil, 0.05);
-            } else if (uDehaze < 0.0) {
-                c = mix(c, vec3(0.25 + 0.75 * b6.x), -0.5 * uDehaze);
+                float veil = 0.45 * uDehaze * min(texture(uB5, uv).g, self.y);
+                c = (c - veil) / (1.0 - veil);
+                extraClarity = 0.3 * uDehaze;
             }
-            float y = dot(c, W709);
-            float detail = (b1.x - b3.x) * uTexture * (uTexture > 0.0 ? 1.5 : 1.0);
+            float detail = b1.x - b3.x;
             float local = b3.x - b6.x;
-            float midtones = clamp(1.0 - (2.0 * y - 1.0) * (2.0 * y - 1.0), 0.0, 1.0);
-            float clarity = local / (1.0 + 3.0 * abs(local)) * 1.5 * uClarity * midtones;
-            imageStore(uOut, p, vec4(clamp(c + detail + clarity, 0.0, 1.0), 1.0));
+            local /= 1.0 + 0.7 * abs(local);
+            float lc = log2(dot(c, W709) + EPS);
+            float midtones = smoothstep(-7.0, -4.5, lc) * (1.0 - smoothstep(-0.7, 0.0, lc));
+            float kTexture = uTexture * (uTexture > 0.0 ? 1.6 : 1.0);
+            float kClarity = uClarity * (uClarity > 0.0 ? 1.2 : 1.0) + extraClarity;
+            c *= exp2(kTexture * detail + kClarity * local * midtones);
+            if (uDehaze > 0.0) {
+                float y = dot(c, W709);
+                c = vec3(y) + (c - vec3(y)) * (1.0 + 0.25 * uDehaze);
+            } else if (uDehaze < 0.0) {
+                float s = -uDehaze;
+                vec3 glow = 0.15 * texture(uG3, uv).rgb + 0.25 * texture(uG4, uv).rgb + 0.3 * texture(uG5, uv).rgb + 0.3 * texture(uG6, uv).rgb;
+                c += (vec3(0.05 + 0.7 * exp2(b6.x)) - c) * (0.12 * s);
+                c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - clamp(2.5 * s * glow, 0.0, 1.0));
+            }
+            imageStore(uOut, p, vec4(clamp(c, 0.0, 1.0), 1.0));
         }
     """.trimIndent()
 

@@ -79,7 +79,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private lateinit var textureBar: SeekBar
     private lateinit var clarityBar: SeekBar
     private lateinit var dehazeBar: SeekBar
-    /** Photo mode's Texture / Clarity / Dehaze rows (shown only in Photo mode). */
+    /** Texture / Clarity / Dehaze rows (Pro and Photo). */
     private lateinit var photoDials: List<View>
     private val adjustPanel = buildAdjustPanel()
 
@@ -156,9 +156,10 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     }
 
     private fun buildAdjustPanel(): LinearLayout {
-        fun slider(label: String, max: Int, initial: Int, format: (Int) -> String, onChange: (Int) -> Unit): Pair<LinearLayout, SeekBar> {
+        fun slider(label: String, max: Int, initial: Int, format: (Int) -> String, neutral: Int = 100,
+                   onChange: (Int) -> Unit): Pair<LinearLayout, SeekBar> {
             val text = kit.label().apply { minWidth = 260 }
-            val bar = kit.seekBar(max, initial).apply {
+            val bar = kit.seekBar(max, initial, neutral).apply {
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
                         text.text = "$label ${format(p)}"
@@ -178,8 +179,12 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             return row to bar
         }
         val signed = { p: Int -> "%+d".format(p - 100) }
-        val (hiRow, hi) = slider("eDR highlights", 200, a.edrHighlights + 100, signed) { a.setEdrCurve(it - 100, a.edrShadows) }
-        val (loRow, lo) = slider("eDR shadows", 200, a.edrShadows + 100, signed) { a.setEdrCurve(a.edrHighlights, it - 100) }
+        val (hiRow, hi) = slider("eDR highlights", 200, a.edrHighlights + 100, signed, CameraActivity.EDR_HIGHLIGHTS + 100) {
+            a.setEdrCurve(it - 100, a.edrShadows)
+        }
+        val (loRow, lo) = slider("eDR shadows", 200, a.edrShadows + 100, signed, CameraActivity.EDR_SHADOWS + 100) {
+            a.setEdrCurve(a.edrHighlights, it - 100)
+        }
         val (strengthRow, s) = slider("LUT strength", 100, a.lutStrength, { "$it%" }) { a.setLookAdjust(strength = it) }
         val (satRow, sat) = slider("Saturation", 200, a.saturationPct, { "$it%" }) { a.setLookAdjust(saturation = it) }
         val (vibRow, vib) = slider("Vibrance", 200, a.vibrancePct + 100, signed) { a.setLookAdjust(vibrance = it - 100) }
@@ -205,7 +210,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
                 a.setLookAdjust(100, 100, 0)
                 a.setWbShift(0, 0)
                 a.resetEdrCurve()
-                if (a.photo) a.setPhotoFinish(0, 0, 0)
+                if (!a.simple) a.setPhotoFinish(0, 0, 0)
             })
             addView(kit.button("Edit look / make LUT…") { a.openLookEditor() })
         }
@@ -306,7 +311,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         sync(textureBar, a.photoTexture + 100)
         sync(clarityBar, a.photoClarity + 100)
         sync(dehazeBar, a.photoDehaze + 100)
-        photoDials.forEach { it.visibility = if (a.photo) View.VISIBLE else View.GONE }
+        photoDials.forEach { it.visibility = if (a.simple) View.GONE else View.VISIBLE }
         (adjustPanel.layoutParams as? FrameLayout.LayoutParams)?.let {
             val margin = if (a.simple) 120 else 170
             if (it.bottomMargin != margin) { it.bottomMargin = margin; adjustPanel.requestLayout() }

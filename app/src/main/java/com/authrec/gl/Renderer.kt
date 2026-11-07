@@ -220,16 +220,18 @@ class Renderer(
     /** Colour NR's Fast variant runs now ([nrFast]); a photo always gets Quality. */
     private fun fastNr() = nrFast && photo == null
 
-    /** Photo mode (the viewfinder's settings, see [activeCleanup]; the dials below). */
+    /** Photo mode (the viewfinder's settings, see [activeCleanup]). */
     @Volatile var photoMode = false
     /**
-     * Photo mode's Texture, Clarity and Dehaze, −1..1 (PipelineShaders.photoFinish): on the
-     * viewfinder and the photo, not on recordings.
+     * Texture, Clarity and Dehaze, −1..1 (PipelineShaders.photoFinish), part of the view like the
+     * look: on the viewfinder, photos and recordings with the look baked in, while [dialsActive]
+     * (Pro and Photo; Simple stays plain).
      */
     @Volatile var photoTexture = 0f
     @Volatile var photoClarity = 0f
     @Volatile var photoDehaze = 0f
-    private fun finishOn() = photoMode && (photoTexture != 0f || photoClarity != 0f || photoDehaze != 0f)
+    @Volatile var dialsActive = false
+    private fun finishOn() = dialsActive && (photoTexture != 0f || photoClarity != 0f || photoDehaze != 0f)
 
     /** Red focus-peaking overlay on the preview (never recorded). */
     @Volatile var peaking: Boolean = false
@@ -559,6 +561,8 @@ class Renderer(
         }
         recording = null
         releaseScaled()
+        recFinish?.release()
+        recFinish = null
         onStopped(summary)
     }
 
@@ -583,6 +587,8 @@ class Renderer(
             photoFinish = null
             viewFinish?.release()
             viewFinish = null
+            recFinish?.release()
+            recFinish = null
             releaseScaled()
             backdrop?.release()
             backdrop = null
@@ -804,7 +810,10 @@ class Renderer(
         }
         stage(1)
         runPipeline(meta)
-        recording?.let { encodeFrame(it, timestamp) }
+        recording?.let {
+            finishForRecording(it)
+            encodeFrame(it, timestamp)
+        }
         pendingSnap?.let { snap ->
             pendingSnap = null
             snap.onDone(runCatching { takeSnapNow(snap, timestamp, meta) }.onFailure { EventLog.log("Snap failed", it) }.getOrNull())
@@ -908,7 +917,7 @@ class Renderer(
         GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
         GLES30.glViewport(0, 0, rec.outW, rec.outH)
         drawTexture(
-            if (rec.bakeLut) target.view else target.log,
+            recFinish?.out ?: if (rec.bakeLut) target.view else target.log,
             rotationQuarterTurns = rec.quarterTurns,
             crop = rec.crop,
             mirror = rec.mirror,
@@ -1393,10 +1402,13 @@ class Renderer(
         if (fromLog) makeViewFromLog(target)
         val texW = if (fromLog) w / 2 else target.width
         val texH = if (fromLog) h / 2 else target.height
-        // Photo mode's dials on the viewfinder (the photo just taken: its own finished image, once).
-        val finished = photoFinish?.takeIf { photo?.done == true } ?: if (finishOn() && recording == null && !fromLog) {
+        // The dials on the viewfinder (the photo just taken: its own finished image, once; a
+        // recording with the look baked in: the frame it records; recording log: none, its GPU
+        // time goes to the clip).
+        val finished = photoFinish?.takeIf { photo?.done == true } ?: recFinish ?: if (finishOn() && recording == null && !fromLog) {
             viewFinish?.takeIf { it.width != texW || it.height != texH }?.let { it.release(); viewFinish = null }
-            (viewFinish ?: FinishTarget(texW, texH).also { viewFinish = it }).also { applyFinish(target.view, it, viewOctave = 1) }
+            val octave = kotlin.math.log2(w.toFloat() / texW).roundToInt().coerceIn(0, 2)
+            (viewFinish ?: FinishTarget(texW, texH).also { viewFinish = it }).also { applyFinish(target.view, it, viewOctave = octave) }
         } else {
             viewFinish?.release()
             viewFinish = null
@@ -2019,11 +2031,33 @@ class Renderer(
 
     // ---- Texture / Clarity / Dehaze (PipelineShaders.finishDown, photoFinish) ----
 
-    /** The dials' images for a view of [width]×[height]: the brightness pyramid and the finished view (8-bit). */
+    /**
+     * The dials' images for a view of [width]×[height]: the two pyramids, a texture per level, and
+     * the finished view (16-bit float like the view: a 10-bit recording draws it).
+     */
     private class FinishTarget(val width: Int, val height: Int) {
-        val pyr = Gl.texture2D(GLES30.GL_RGBA16F, (width + 1) / 2, (height + 1) / 2, linear = true, levels = FINISH_LEVELS)
-        val out = Gl.texture2D(GLES30.GL_RGBA8, width, height, linear = true)
-        fun release() = GLES30.glDeleteTextures(2, intArrayOf(pyr, out), 0)
+        val levelW = IntArray(FINISH_LEVELS)
+        val levelH = IntArray(FINISH_LEVELS)
+        val brightness = IntArray(FINISH_LEVELS)
+        val glow = IntArray(FINISH_LEVELS)
+        init {
+            var lw = (width + 1) / 2
+            var lh = (height + 1) / 2
+            for (k in 0 until FINISH_LEVELS) {
+                levelW[k] = lw
+                levelH[k] = lh
+                brightness[k] = Gl.texture2D(GLES30.GL_RGBA16F, lw, lh, linear = true)
+                glow[k] = Gl.texture2D(GLES30.GL_RGBA16F, lw, lh, linear = true)
+                lw = maxOf(1, (lw + 1) / 2)
+                lh = maxOf(1, (lh + 1) / 2)
+            }
+        }
+        val out = Gl.texture2D(GLES30.GL_RGBA16F, width, height, linear = true)
+        fun release() {
+            GLES30.glDeleteTextures(FINISH_LEVELS, brightness, 0)
+            GLES30.glDeleteTextures(FINISH_LEVELS, glow, 0)
+            GLES30.glDeleteTextures(1, intArrayOf(out), 0)
+        }
     }
     /** The viewfinder's (half size), and the photo's (full size, until the photo has been shown). */
     private var viewFinish: FinishTarget? = null
@@ -2038,27 +2072,46 @@ class Renderer(
             finishProgram = Gl.computeProgram(PipelineShaders.photoFinish)
         }
         GLES30.glUseProgram(finishDownProgram)
-        var lw = (t.width + 1) / 2
-        var lh = (t.height + 1) / 2
         for (k in 0 until FINISH_LEVELS) {
-            Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, if (k == 0) view else t.pyr)
-            GLES31.glBindImageTexture(0, t.pyr, k, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+            Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, if (k == 0) view else t.brightness[k - 1])
+            // (Level 0 reads no glow; never a texture this pass writes.)
+            Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, if (k == 0) view else t.glow[k - 1])
+            GLES31.glBindImageTexture(0, t.brightness[k], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+            GLES31.glBindImageTexture(1, t.glow[k], 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
             GLES30.glUniform1i(Gl.uniform(finishDownProgram, "uLevel"), k)
-            GLES31.glDispatchCompute((lw + 15) / 16, (lh + 15) / 16, 1)
+            GLES31.glDispatchCompute((t.levelW[k] + 15) / 16, (t.levelH[k] + 15) / 16, 1)
             GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
-            lw = maxOf(1, lw / 2)
-            lh = maxOf(1, lh / 2)
         }
         GLES30.glUseProgram(finishProgram)
+        // The level blurred to 2^octave pixels of the full photo, for a view [viewOctave] octaves smaller.
+        fun level(octave: Int) = (octave - viewOctave - 1).coerceIn(0, FINISH_LEVELS - 1)
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, view)
-        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, t.pyr)
-        GLES31.glBindImageTexture(0, t.out, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA8)
+        listOf(1, 3, 5, 6).forEachIndexed { i, octave -> Gl.bindTexture(1 + i, GLES30.GL_TEXTURE_2D, t.brightness[level(octave)]) }
+        listOf(3, 4, 5, 6).forEachIndexed { i, octave -> Gl.bindTexture(5 + i, GLES30.GL_TEXTURE_2D, t.glow[level(octave)]) }
+        GLES31.glBindImageTexture(0, t.out, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES30.glUniform1i(Gl.uniform(finishProgram, "uB1Self"), if (1 - viewOctave - 1 < 0) 1 else 0)
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uTexture"), photoTexture)
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uClarity"), photoClarity)
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uDehaze"), photoDehaze)
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uViewOctave"), viewOctave)
         GLES31.glDispatchCompute((t.width + 15) / 16, (t.height + 15) / 16, 1)
         GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
+    }
+
+    /** The dials on a recording with the look baked in (its develop size), drawn into the clip and the viewfinder. */
+    private var recFinish: FinishTarget? = null
+
+    private fun finishForRecording(rec: Recording) {
+        if (!rec.bakeLut || !finishOn() || viewFromLog()) {
+            recFinish?.release()
+            recFinish = null
+            return
+        }
+        val target = developTarget()
+        recFinish?.takeIf { it.width != target.width || it.height != target.height }?.let { it.release(); recFinish = null }
+        val t = recFinish ?: FinishTarget(target.width, target.height).also { recFinish = it }
+        // The dials' radii are the full photo's: a 2K clip is a level smaller.
+        val octave = kotlin.math.log2(w.toFloat() / target.width).roundToInt().coerceIn(0, 2)
+        applyFinish(target.view, t, viewOctave = octave)
     }
 
     // ---- A still while recording ----
@@ -2080,7 +2133,8 @@ class Renderer(
         val rec = recording ?: return null
         val t0 = SystemClock.elapsedRealtimeNanos()
         val target = developTarget()
-        val view = if (viewFromLog()) {
+        // A clip with the look and the dials baked in: what it records.
+        val view = recFinish?.out ?: if (viewFromLog()) {
             // Recording log at full size: the develop pass wrote only the log.
             GLES30.glUseProgram(viewLogProgram)
             Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, target.log)

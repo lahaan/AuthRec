@@ -194,8 +194,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val shutterPanel = panel(dialHeader("Shutter", shutterAuto).fullWidth(), shutterDial.sized())
 
     private val wbRow = kit.segmented(listOf("Auto", "Locked")) { if ((it == 1) != a.capture.awbLock) a.toggleAwbLock() }
-    private val warmthBar = kit.seekBar(200, a.wbWarmth + 100)
-    private val tintBar = kit.seekBar(200, a.wbTint + 100)
+    private val warmthBar = kit.seekBar(200, a.wbWarmth + 100, neutral = 100)
+    private val tintBar = kit.seekBar(200, a.wbTint + 100, neutral = 100)
     private val warmthLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val tintLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val wbPanel = panel(
@@ -219,20 +219,20 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         addView(curve, LinearLayout.LayoutParams(a.dp(210), a.dp(150)).apply { topMargin = a.dp(6) })
         addView(kit.label("Drag a dot up or down; double-tap resets", 10.5f, dim = true))
     }
-    private val strengthBar = kit.seekBar(100, a.lutStrength)
-    private val saturationBar = kit.seekBar(200, a.saturationPct)
-    private val vibranceBar = kit.seekBar(200, a.vibrancePct + 100)
-    private val adjWarmthBar = kit.seekBar(200, a.wbWarmth + 100)
-    private val adjTintBar = kit.seekBar(200, a.wbTint + 100)
+    private val strengthBar = kit.seekBar(100, a.lutStrength, neutral = 100)
+    private val saturationBar = kit.seekBar(200, a.saturationPct, neutral = 100)
+    private val vibranceBar = kit.seekBar(200, a.vibrancePct + 100, neutral = 100)
+    private val adjWarmthBar = kit.seekBar(200, a.wbWarmth + 100, neutral = 100)
+    private val adjTintBar = kit.seekBar(200, a.wbTint + 100, neutral = 100)
     private val strengthLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val saturationLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val vibranceLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val adjWarmthLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val adjTintLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    // Photo mode's Texture / Clarity / Dehaze (Lightroom's Presence dials), only in Photo mode.
-    private val textureBar = kit.seekBar(200, a.photoTexture + 100)
-    private val clarityBar = kit.seekBar(200, a.photoClarity + 100)
-    private val dehazeBar = kit.seekBar(200, a.photoDehaze + 100)
+    // Texture / Clarity / Dehaze (Lightroom's Presence dials): Pro and Photo.
+    private val textureBar = kit.seekBar(200, a.photoTexture + 100, neutral = 100)
+    private val clarityBar = kit.seekBar(200, a.photoClarity + 100, neutral = 100)
+    private val dehazeBar = kit.seekBar(200, a.photoDehaze + 100, neutral = 100)
     private val textureLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val clarityLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
     private val dehazeLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
@@ -260,13 +260,13 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
                     a.setLookAdjust(100, 100, 0)
                     a.setWbShift(0, 0)
                     a.resetEdrCurve()
-                    if (a.photo) a.setPhotoFinish(0, 0, 0)
+                    if (!a.simple) a.setPhotoFinish(0, 0, 0)
                 })
                 addView(kit.button("Edit look…") { a.openLookEditor() }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
                     marginStart = a.dp(8)
                 })
             }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = a.dp(6) })
-        }, LinearLayout.LayoutParams(a.dp(272), WRAP_CONTENT))
+        }, LinearLayout.LayoutParams(a.dp(336), WRAP_CONTENT))
     }
 
     // ---- Settings sheet ----
@@ -495,7 +495,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
     private fun View.fullWidth(): View = this.apply { layoutParams = LinearLayout.LayoutParams(dialWidth, WRAP_CONTENT) }
 
-    private fun sliderRow(label: TextView, bar: SeekBar, width: Int = a.dp(176), onChange: (Int) -> Unit) = LinearLayout(a).apply {
+    private fun sliderRow(label: TextView, bar: SeekBar, width: Int = a.dp(232), onChange: (Int) -> Unit) = LinearLayout(a).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
         bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -772,7 +772,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         vibranceLabel.text = "Vibrance %+d".format(a.vibrancePct)
         adjWarmthLabel.text = "Warmth %+d".format(a.wbWarmth)
         adjTintLabel.text = "Tint %+d".format(a.wbTint)
-        photoDials.visibility = if (a.photo) View.VISIBLE else View.GONE
+        photoDials.visibility = if (a.simple) View.GONE else View.VISIBLE
         textureLabel.text = "Texture %+d".format(a.photoTexture)
         clarityLabel.text = "Clarity %+d".format(a.photoClarity)
         dehazeLabel.text = "Dehaze %+d".format(a.photoDehaze)
