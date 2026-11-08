@@ -105,6 +105,13 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 
 ## Start here (next session)
 
+00000000. **Unreleased (branch, 2026-11-08)**: feedback/notes.md items 90–92. Profiles (the look
+    with its adjustments and dials, the video format and colour NR under a name) at the top of the
+    Look menu; Glass's Look chip opens a glass sheet instead of the system pop-up; Glass's controls
+    turn and re-lay-out when the phone is held upright (not mid-clip; Classic stays landscape). The
+    turned layer reports its real screen area to the window's transparent region (views report an
+    unrotated rectangle, and a strip of controls vanished).
+
 0000000. **Unreleased (branch, 2026-11-08)**: feedback/notes.md item 89. The dials no longer look
     "jagged": their pyramid filters each level past 0 with [1 3 3 1] (2×2 means aliased) and the
     coarse levels are read as cubic B-splines (bilinear showed every texel as a crease, a

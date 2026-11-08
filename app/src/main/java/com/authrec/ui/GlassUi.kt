@@ -59,6 +59,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val lensTop = a.dp(14)
     /** Width of the ISO / shutter dials (declared before the panels that use it). */
     private val dialWidth = minOf(a.dp(520), imageW - a.dp(60))
+    /** Views sized to [dialWidth]: narrower when the phone is held upright. */
+    private val dialViews = mutableListOf<View>()
 
     // ---- Right: lenses, record, flip ----
     private val recordButton = RecordButton(a) { a.toggleRecording() }
@@ -387,6 +389,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
     // ---- Settings sheet ----
     private val settingsRows = mutableListOf<() -> Unit>()
+    /** The settings' label + options rows: options beside the label, or under it when upright. */
+    private val settingsLines = mutableListOf<LinearLayout>()
     private val proSettings = mutableListOf<View>()
     /** Rows only video uses (hidden in Photo mode), and Photo's own. */
     private val videoRows = mutableListOf<View>()
@@ -398,94 +402,63 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     override val lensAnchor: View get() = lensColumn
     override val lookAnchor: View get() = lookChip
 
+    /** The left column's chips: stacked beside the image, a row above it when the phone is upright. */
+    private val leftColumn = LinearLayout(a).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER_VERTICAL
+        listOf(lookChip, edrChip, adjustChip, resChip).forEach { addView(it) }
+    }
+    /** The Pro bar scrolls sideways where it's wider than the screen (upright). */
+    private val proBarScroll = android.widget.HorizontalScrollView(a).apply {
+        isHorizontalScrollBarEnabled = false
+        isHorizontalFadingEdgeEnabled = true
+        setFadingEdgeLength(a.dp(20))
+        addView(proBar)
+    }
+    /**
+     * Every control, in one layer the phone's pose turns as a whole (the image and the focus
+     * square stay as they are): laid out for landscape, or for the phone held upright, so text
+     * reads the right way up (owner, 2026-11-08: "when phone gets tilted vertical, elements could
+     * go vertical (and text readable properly) and be rearranged if needed").
+     */
+    private val controls = object : FrameLayout(a) {
+        /**
+         * With a SurfaceView in the window, every view takes the rectangle it draws out of the
+         * window's "transparent region", and the system skips the window where none did. Views
+         * work that rectangle out from their position and size, not their rotation, so turned
+         * upright the controls claimed the wrong places and a strip of them vanished whenever the
+         * stats line and Pro bar (which happened to cover it) were hidden (X14, 2026-11-08). The
+         * turned layer claims its whole turned bounds instead (it covers the screen).
+         */
+        override fun gatherTransparentRegion(region: android.graphics.Region?): Boolean {
+            if (region == null || rotation == 0f) return super.gatherTransparentRegion(region)
+            val box = RectF(0f, 0f, width.toFloat(), height.toFloat())
+            matrix.mapRect(box)
+            val parentLoc = IntArray(2)
+            (parent as? View)?.getLocationInWindow(parentLoc)
+            box.offset(left + parentLoc[0].toFloat(), top + parentLoc[1].toFloat())
+            region.op(box.left.toInt(), box.top.toInt(), box.right.toInt(), box.bottom.toInt(), android.graphics.Region.Op.DIFFERENCE)
+            return true
+        }
+    }
+    /** The pose the controls are laid out for: quarter turns clockwise from the screen's landscape. */
+    private var turn = 0
+    private val upright get() = turn == 90 || turn == 270
+
     override val root: View = FrameLayout(a).apply {
         setBackgroundColor(Color.BLACK)
         addView(a.surfaceView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         addView(a.focusSquare, FrameLayout.LayoutParams(a.dp(52), a.dp(52)))
         (a.focusSquare.background as? android.graphics.drawable.GradientDrawable)?.cornerRadius = a.dp(10).toFloat()
-
-        addView(a.info, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
-            setMargins(side + a.dp(14), a.dp(10), 0, 0)
-        })
-        // In the Simple/Pro switch's place (locked while recording): over the image it covered
-        // Pro's statistics (owner, 2026-10-21).
-        addView(recPill, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
-            setMargins(a.dp(20), a.dp(16), 0, 0)
-        })
-        addView(hint, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
-            topMargin = a.dp(52)
-        })
-
-        // Left margin.
-        val leftW = side.coerceAtLeast(a.dp(150))
-        addView(modeBox, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
-            setMargins(a.dp(20), a.dp(16), 0, 0)
-        })
-        addView(LinearLayout(a).apply {
-            orientation = LinearLayout.VERTICAL
-            listOf(lookChip, edrChip, adjustChip, resChip).forEach {
-                addView(it, LinearLayout.LayoutParams(leftW - a.dp(44), WRAP_CONTENT).apply { bottomMargin = a.dp(10) })
-            }
-        }, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER_VERTICAL or Gravity.START).apply {
-            marginStart = a.dp(20)
-        })
-        addView(settingsChip, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply {
-            setMargins(a.dp(20), 0, 0, a.dp(16))
-        })
-
-        // Right margin: the EV slider against the image, then the lens column / record / flip.
-        addView(a.exposureSlider, FrameLayout.LayoutParams(sliderW, (screenH * 0.66f).toInt(), Gravity.CENTER_VERTICAL or Gravity.END).apply {
-            marginEnd = rightColumnW
-        })
-        addView(recordButton, FrameLayout.LayoutParams(recSize, recSize, Gravity.TOP or Gravity.END).apply {
-            marginEnd = (rightColumnW - recSize) / 2
-            topMargin = recTop
-        })
-        addView(lensColumn, FrameLayout.LayoutParams(rightColumnW, WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
-            topMargin = lensTop
-        })
-        addView(flipButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
-            setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18))
-        })
-        addView(pauseButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
-            setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18))
-        })
-        addView(snapButton, FrameLayout.LayoutParams(a.dp(46), a.dp(46), Gravity.BOTTOM or Gravity.END).apply {
-            setMargins(0, 0, (rightColumnW - a.dp(46)) / 2, a.dp(18 + 46 + 14))
-        })
-        // Under the EV slider (which ends 17 % of the height above the bottom), level with flip.
-        addView(mirrorButton, FrameLayout.LayoutParams(a.dp(40), a.dp(40), Gravity.BOTTOM or Gravity.END).apply {
-            setMargins(0, 0, rightColumnW + (sliderW - a.dp(40)) / 2, a.dp(21))
-        })
-        addView(torchButton, FrameLayout.LayoutParams(a.dp(40), a.dp(40), Gravity.BOTTOM or Gravity.END).apply {
-            setMargins(0, 0, rightColumnW + (sliderW - a.dp(40)) / 2, a.dp(21))
-        })
-
-        // Bottom of the image (Pro), with its panels above it.
-        addView(proBar, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = a.dp(10)
-        })
-        val aboveBar = a.dp(76)
-        for (p in listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel)) {
-            p.visibility = View.GONE
-            addView(p, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = aboveBar })
-        }
-        addView(a.focusBar, FrameLayout.LayoutParams((imageW * 0.7f).toInt(), WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = aboveBar
-        })
-        addView(a.priorityPanel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = aboveBar + a.dp(130)
-        })
-        addView(adjustPanel, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = aboveBar
-        })
-        addView(settingsSheet, FrameLayout.LayoutParams(minOf(a.dp(560), imageW - a.dp(24)), MATCH_PARENT, Gravity.CENTER_HORIZONTAL).apply {
-            setMargins(0, a.dp(12), 0, a.dp(12))
-        })
-        // Over the image's left side, beside the column with the Look chip (which stays lit).
-        addView(lookSheet, FrameLayout.LayoutParams(minOf(a.dp(320), imageW - a.dp(24)), MATCH_PARENT, Gravity.START).apply {
-            setMargins(side + a.dp(8), a.dp(12), 0, a.dp(12))
-        })
+        addView(controls, FrameLayout.LayoutParams(screenW, screenH, Gravity.CENTER))
+        // Back to front. The REC pill sits in the mode switch's place (locked while recording):
+        // over the image it covered Pro's statistics (owner, 2026-10-21).
+        listOf(a.info, recPill, hint, modeBox, leftColumn, settingsChip, a.exposureSlider, recordButton, lensColumn,
+            flipButton, pauseButton, snapButton, mirrorButton, torchButton, proBarScroll,
+            aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel, a.focusBar, a.priorityPanel, adjustPanel, settingsSheet, lookSheet,
+        ).forEach { controls.addView(it) }
+        listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel).forEach { it.visibility = View.GONE }
+        arrange()
         // Before every UI frame: tell the renderer where the glass is, for the blur behind it.
         viewTreeObserver.addOnPreDrawListener {
             publishGlass()
@@ -493,16 +466,183 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }
     }
 
+    /** Where [setTurn] is heading (the layout changes once the controls have faded out). */
+    private var targetTurn = 0
+
+    override fun setTurn(turn: Int) {
+        if (turn == targetTurn) return
+        targetTurn = turn
+        // A quick fade rather than a spin: mid-turn the frosted backdrop (drawn square to the
+        // screen) wouldn't match the controls.
+        controls.animate().cancel()
+        controls.animate().alpha(0f).setDuration(90).withEndAction {
+            this.turn = targetTurn
+            arrange()
+            update()
+            controls.animate().alpha(1f).setDuration(140).start()
+        }.start()
+    }
+
+    private fun place(v: View, w: Int, h: Int, gravity: Int, left: Int = 0, top: Int = 0, right: Int = 0, bottom: Int = 0) {
+        v.layoutParams = FrameLayout.LayoutParams(w, h, gravity).apply { setMargins(left, top, right, bottom) }
+    }
+
+    /** Lays the controls out for [turn]: the layer is the screen's landscape, or upright and turned a quarter. */
+    private fun arrange() {
+        val w = if (upright) screenH else screenW
+        val h = if (upright) screenW else screenH
+        controls.layoutParams = FrameLayout.LayoutParams(w, h, Gravity.CENTER)
+        controls.rotation = -turn.toFloat()
+        if (upright) arrangeUpright(w, h) else arrangeLandscape()
+        lensKeys = emptyList()
+        rebuildLenses()
+        controls.requestLayout()
+    }
+
+    private fun arrangeLandscape() {
+        val top = Gravity.TOP
+        val bottom = Gravity.BOTTOM
+        val start = Gravity.START
+        val end = Gravity.END
+        val centreH = Gravity.CENTER_HORIZONTAL
+        a.info.maxWidth = Int.MAX_VALUE
+        place(a.info, WRAP_CONTENT, WRAP_CONTENT, top or start, left = side + a.dp(14), top = a.dp(10))
+        place(recPill, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(20), top = a.dp(16))
+        hintText.maxWidth = a.dp(420)
+        place(hint, WRAP_CONTENT, WRAP_CONTENT, top or centreH, top = a.dp(52))
+
+        // Left margin.
+        val leftW = side.coerceAtLeast(a.dp(150))
+        place(modeBox, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(20), top = a.dp(16))
+        leftColumn.orientation = LinearLayout.VERTICAL
+        for (i in 0 until leftColumn.childCount) {
+            leftColumn.getChildAt(i).layoutParams = LinearLayout.LayoutParams(leftW - a.dp(44), WRAP_CONTENT).apply { bottomMargin = a.dp(10) }
+        }
+        place(leftColumn, WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER_VERTICAL or start, left = a.dp(20))
+        place(settingsChip, WRAP_CONTENT, WRAP_CONTENT, bottom or start, left = a.dp(20), bottom = a.dp(16))
+
+        // Right margin: the EV slider against the image, then the lens column / record / flip.
+        place(a.exposureSlider, sliderW, (screenH * 0.66f).toInt(), Gravity.CENTER_VERTICAL or end, right = rightColumnW)
+        place(recordButton, recSize, recSize, top or end, right = (rightColumnW - recSize) / 2, top = recTop)
+        place(lensColumn, rightColumnW, WRAP_CONTENT, top or end, top = lensTop)
+        val roundRight = (rightColumnW - a.dp(46)) / 2
+        place(flipButton, a.dp(46), a.dp(46), bottom or end, right = roundRight, bottom = a.dp(18))
+        place(pauseButton, a.dp(46), a.dp(46), bottom or end, right = roundRight, bottom = a.dp(18))
+        place(snapButton, a.dp(46), a.dp(46), bottom or end, right = roundRight, bottom = a.dp(18 + 46 + 14))
+        // Under the EV slider (which ends 17 % of the height above the bottom), level with flip.
+        place(mirrorButton, a.dp(40), a.dp(40), bottom or end, right = rightColumnW + (sliderW - a.dp(40)) / 2, bottom = a.dp(21))
+        place(torchButton, a.dp(40), a.dp(40), bottom or end, right = rightColumnW + (sliderW - a.dp(40)) / 2, bottom = a.dp(21))
+
+        // Bottom of the image (Pro), with its panels above it.
+        place(proBarScroll, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = a.dp(10))
+        val aboveBar = a.dp(76)
+        for (p in listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel)) place(p, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
+        dialViews.forEach { it.layoutParams = (it.layoutParams as LinearLayout.LayoutParams).apply { width = dialWidth } }
+        place(a.focusBar, (imageW * 0.7f).toInt(), WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
+        place(a.priorityPanel, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar + a.dp(130))
+        adjustPanel.orientation = LinearLayout.HORIZONTAL
+        curveBox.layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = a.dp(14) }
+        place(adjustPanel, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
+        place(settingsSheet, minOf(a.dp(560), imageW - a.dp(24)), MATCH_PARENT, centreH, top = a.dp(12), bottom = a.dp(12))
+        settingsLines.forEach { line ->
+            line.orientation = LinearLayout.HORIZONTAL
+            line.gravity = Gravity.CENTER_VERTICAL
+            (line.getChildAt(1).layoutParams as? LinearLayout.LayoutParams)?.topMargin = 0
+        }
+        // Over the image's left side, beside the column with the Look chip (which stays lit).
+        place(lookSheet, minOf(a.dp(320), imageW - a.dp(24)), MATCH_PARENT, start, left = side + a.dp(8), top = a.dp(12), bottom = a.dp(12))
+    }
+
+    /**
+     * The phone upright: the image fills the width between two bands. Above it the mode switch
+     * and settings, with look / eDR / adjust in a row; below it the lens chips over the record
+     * button, flip on its right, torch / mirror on its left. The EV slider runs down the image's
+     * right edge, the Pro bar along its bottom (scrolling where it's too wide), panels above that.
+     */
+    private fun arrangeUpright(w: Int, h: Int) {
+        val top = Gravity.TOP
+        val bottom = Gravity.BOTTOM
+        val start = Gravity.START
+        val end = Gravity.END
+        val centreH = Gravity.CENTER_HORIZONTAL
+        val imgTop = side
+        val imgBottom = side + imageW
+        val below = h - imgBottom  // the band under the image
+        a.info.maxWidth = w - a.dp(28)
+        place(a.info, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(14), top = imgTop + a.dp(10))
+        place(recPill, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(16), top = a.dp(14))
+        hintText.maxWidth = w - a.dp(140)
+        place(hint, WRAP_CONTENT, WRAP_CONTENT, top or centreH, top = imgTop + a.dp(52))
+
+        place(modeBox, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(16), top = a.dp(14))
+        place(settingsChip, WRAP_CONTENT, WRAP_CONTENT, top or end, right = a.dp(16), top = a.dp(14))
+        leftColumn.orientation = LinearLayout.HORIZONTAL
+        for (i in 0 until leftColumn.childCount) {
+            val chip = leftColumn.getChildAt(i)
+            leftColumn.getChildAt(i).layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, if (chip === lookChip) 1.6f else 1f).apply {
+                if (i < leftColumn.childCount - 1) marginEnd = a.dp(8)
+            }
+        }
+        place(leftColumn, w - a.dp(32), WRAP_CONTENT, top or start, left = a.dp(16), top = (imgTop - a.dp(62)).coerceAtLeast(a.dp(100)))
+
+        val recCentre = imgBottom + below / 2 + a.dp(10)
+        place(recordButton, recSize, recSize, top or centreH, top = recCentre - recSize / 2)
+        place(lensColumn, WRAP_CONTENT, WRAP_CONTENT, top or centreH, top = imgBottom + a.dp(10))
+        val beside = w / 2 + recSize / 2  // right of the record button
+        val roundLeft = beside + (w - beside - a.dp(46)) / 2
+        place(flipButton, a.dp(46), a.dp(46), top or start, left = roundLeft, top = recCentre - a.dp(23))
+        place(pauseButton, a.dp(46), a.dp(46), top or start, left = roundLeft, top = recCentre - a.dp(23))
+        place(snapButton, a.dp(46), a.dp(46), top or start, left = roundLeft, top = recCentre - a.dp(23 + 46 + 14))
+        val smallLeft = (w / 2 - recSize / 2 - a.dp(40)) / 2
+        place(mirrorButton, a.dp(40), a.dp(40), top or start, left = smallLeft, top = recCentre - a.dp(20))
+        place(torchButton, a.dp(40), a.dp(40), top or start, left = smallLeft, top = recCentre - a.dp(20))
+
+        val sliderH = (imageW * 0.6f).toInt()
+        place(a.exposureSlider, sliderW, sliderH, top or end, top = imgTop + (imageW - sliderH) / 2 - a.dp(30))
+        place(proBarScroll, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, left = a.dp(8), right = a.dp(8), bottom = below + a.dp(10))
+        val aboveBar = below + a.dp(76)
+        for (p in listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel)) place(p, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
+        dialViews.forEach { it.layoutParams = (it.layoutParams as LinearLayout.LayoutParams).apply { width = w - a.dp(64) } }
+        place(a.focusBar, (w * 0.88f).toInt(), WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
+        place(a.priorityPanel, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar + a.dp(130))
+        // The curve over the sliders: side by side it's wider than the phone.
+        adjustPanel.orientation = LinearLayout.VERTICAL
+        curveBox.layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { bottomMargin = a.dp(10) }
+        place(adjustPanel, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
+        // Both sheets over the image only: across the bands they covered the controls there.
+        place(settingsSheet, w - a.dp(24), imageW, top or centreH, top = imgTop)
+        settingsLines.forEach { line ->
+            line.orientation = LinearLayout.VERTICAL
+            line.gravity = Gravity.START
+            (line.getChildAt(1).layoutParams as? LinearLayout.LayoutParams)?.topMargin = a.dp(4)
+        }
+        place(lookSheet, w - a.dp(24), imageW, top or centreH, top = imgTop)
+    }
+
     // ---- Backdrop blur ----
 
     private var publishedGlass: List<GlassRect> = emptyList()
-    private val loc = IntArray(2)
-    private val origin = IntArray(2)
+    private val toScreen = android.graphics.Matrix()
+    private val screenToSurface = android.graphics.Matrix()
+
+    /**
+     * [r], in [v]'s own pixels, as a rectangle in the surface's: through every transform on the
+     * way (the controls' layer turned a quarter when the phone is upright, a panel's grow-in).
+     * Leaves [toScreen] holding the transform (for radii).
+     */
+    private fun toSurface(v: View, r: RectF): RectF {
+        toScreen.reset()
+        v.transformMatrixToGlobal(toScreen)
+        toScreen.postConcat(screenToSurface)
+        return RectF(r).also { toScreen.mapRect(it) }
+    }
 
     /** Every visible glass shape (capsules, the record button, the EV slider) in surface pixels. */
     private fun publishGlass() {
         val out = ArrayList<GlassRect>(48)
-        a.surfaceView.getLocationInWindow(origin)
+        screenToSurface.reset()
+        a.surfaceView.transformMatrixToGlobal(screenToSurface)
+        screenToSurface.invert(screenToSurface)
         collectGlass(root, 1f, RectF(-1e6f, -1e6f, 1e6f, 1e6f), false, out)
         val same = out.size == publishedGlass.size && out.indices.all { i ->
             val p = out[i]
@@ -535,22 +675,16 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             else -> { box = null; radius = 0f }
         }
         if (box != null && v.width > 0 && !onGlass) {
-            v.getLocationInWindow(loc)
-            val x = (loc[0] - origin[0]).toFloat()
-            val y = (loc[1] - origin[1]).toFloat()
-            val r = GlassRect(x + box.left * v.scaleX, y + box.top * v.scaleY, x + box.right * v.scaleX, y + box.bottom * v.scaleY,
-                radius * v.scaleX, alpha, clip)
+            val b = toSurface(v, box)
+            val r = GlassRect(b.left, b.top, b.right, b.bottom, toScreen.mapRadius(radius), alpha, clip)
             if (r.right > clip.left && r.left < clip.right && r.bottom > clip.top && r.top < clip.bottom) out += r
         }
         if (v !is android.view.ViewGroup) return
         var inner = clip
         if (v.clipChildren) {
-            v.getLocationInWindow(loc)
-            val x = (loc[0] - origin[0]).toFloat()
-            val y = (loc[1] - origin[1]).toFloat()
             val pad = v.clipToPadding
-            inner = RectF(x + if (pad) v.paddingLeft else 0, y + if (pad) v.paddingTop else 0,
-                x + v.width - if (pad) v.paddingRight else 0, y + v.height - if (pad) v.paddingBottom else 0)
+            inner = toSurface(v, RectF((if (pad) v.paddingLeft else 0).toFloat(), (if (pad) v.paddingTop else 0).toFloat(),
+                (v.width - if (pad) v.paddingRight else 0).toFloat(), (v.height - if (pad) v.paddingBottom else 0).toFloat()))
             if (!inner.intersect(clip)) return
         }
         for (i in 0 until v.childCount) collectGlass(v.getChildAt(i), alpha, inner, onGlass || box != null, out)
@@ -611,9 +745,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         addView(auto)
     }
 
-    private fun ValueDial.sized(): View = this.apply { layoutParams = LinearLayout.LayoutParams(dialWidth, a.dp(64)) }
+    private fun ValueDial.sized(): View = this.apply { layoutParams = LinearLayout.LayoutParams(dialWidth, a.dp(64)); dialViews += this }
 
-    private fun View.fullWidth(): View = this.apply { layoutParams = LinearLayout.LayoutParams(dialWidth, WRAP_CONTENT) }
+    private fun View.fullWidth(): View = this.apply { layoutParams = LinearLayout.LayoutParams(dialWidth, WRAP_CONTENT); dialViews += this }
 
     private fun sliderRow(label: TextView, bar: SeekBar, width: Int = a.dp(232), onChange: (Int) -> Unit) = LinearLayout(a).apply {
         orientation = LinearLayout.HORIZONTAL
@@ -646,6 +780,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
                 addView(kit.label(label, 13f).apply { minWidth = a.dp(110) })
                 addView(control)
             }
+            settingsLines += r
             content.addView(r)
             if (pro) proSettings += r
             return r
@@ -756,6 +891,18 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         lensColumn.reset()
         lensColumn.removeAllViews()
         lensChips.clear()
+        // Upright: one row over the record button.
+        lensColumn.orientation = if (upright) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        if (upright) {
+            order.forEachIndexed { k, i ->
+                val chip = roundChip(lensChipText(a.lenses[i].label)) { if (i != a.lensIndex) a.switchLens(i) }
+                chip.setOnLongClickListener { a.showLensMenu(it); true }
+                lensChips[i] = chip
+                lensColumn.addView(chip, LinearLayout.LayoutParams(a.dp(44), a.dp(44)).apply { if (k > 0) marginStart = a.dp(10) })
+            }
+            if (order.isEmpty()) lensColumn.addView(kit.button("Lens") { a.showLensMenu(lensColumn) })
+            return
+        }
         // The chips fit between the top edge and the record button, keeping a clear gap above it so
         // a lens tap can't land on record. A short screen (15 Ultra: ~384 dp tall) or a fourth back
         // lens would squeeze one column below a comfortable size, so then they go two abreast.
@@ -856,7 +1003,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         val sheetOpen = settingsSheet.visibility == View.VISIBLE || lookSheet.visibility == View.VISIBLE
         proBar.visibility = if (pro && !sheetOpen) View.VISIBLE else View.GONE
         // The info line sits behind the sheet's rows and showed through its glass.
-        a.info.visibility = if (sheetOpen) View.INVISIBLE else View.VISIBLE
+        // (Upright, Adjust reaches the top of the image, where the stats line is.)
+        a.info.visibility = if (sheetOpen || (upright && adjustPanel.visibility == View.VISIBLE)) View.INVISIBLE else View.VISIBLE
+        // Upright the EV slider runs down the image, where the panels open.
+        a.exposureSlider.visibility = if (upright && panels.any { it.visibility == View.VISIBLE }) View.INVISIBLE else View.VISIBLE
         if (!pro) listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel).forEach { it.visibility = View.GONE }
         val ae = a.capture.ae
         setCaption(aeChip, when (ae) {

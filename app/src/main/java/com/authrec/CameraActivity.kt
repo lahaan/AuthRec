@@ -514,6 +514,7 @@ class CameraActivity : Activity() {
         ui = if (classicUi) ClassicUi(this) else GlassUi(this)
         setContentView(ui.root)
         updateUi()
+        applyPose()
     }
 
     private fun buildFocusBar(): LinearLayout {
@@ -583,7 +584,11 @@ class CameraActivity : Activity() {
                 val snapped = ((degrees + 45) / 90 % 4) * 90
                 // Near a diagonal, keep the current pose (no flicking between two).
                 val off = abs(((degrees - heldDegrees + 540) % 360) - 180)
-                if (heldDegrees < 0 || off > 60) heldDegrees = snapped
+                if ((heldDegrees < 0 || off > 60) && snapped != heldDegrees) {
+                    heldDegrees = snapped
+                    info.removeCallbacks(poseCheck)
+                    info.postDelayed(poseCheck, 250)
+                }
             }
         }
     }
@@ -597,6 +602,18 @@ class CameraActivity : Activity() {
         val turn = poseTurn()
         val front = camera?.info?.front == true
         return if (front && !mirrored()) (360 - turn) % 360 else turn
+    }
+
+    /**
+     * The controls follow the phone's pose (Glass): once it has settled, and never while a clip
+     * records or a burst is taken, so a clip's controls stay the way they started (owner: "in video
+     * if recording cant go vertical mid record"). They catch up when it's over.
+     */
+    private val poseCheck = Runnable { applyPose() }
+
+    private fun applyPose() {
+        if (!::ui.isInitialized || recorder != null || warmingUp || stopping || photoBusy) return
+        ui.setTurn(poseTurn())
     }
 
     /** How far the phone is turned clockwise from the screen's landscape (0 when unknown). */
@@ -2305,6 +2322,7 @@ class CameraActivity : Activity() {
         photoBusy = false
         msg?.let { note(it) }
         updateUi()
+        applyPose()
         if (photoQueued && resumed && photo) takePhoto()
     }
 
@@ -2495,6 +2513,7 @@ class CameraActivity : Activity() {
                         stopping = false
                         why?.let { lastResult = it }
                         updateUi()
+                        applyPose()
                         if (retryAfterStop) {
                             retryAfterStop = false
                             startRecording()
@@ -2512,6 +2531,7 @@ class CameraActivity : Activity() {
                     stopping = false
                     if (why != null || result.error != null) lastResult = msg else note(msg)
                     updateUi()
+                    applyPose()
                 }
             }
         }
@@ -2747,6 +2767,7 @@ class CameraActivity : Activity() {
      * without aligning), photoshake = quads (`--ei`: each burst frame read that far off, 0 = off),
      * texture / clarity / dehaze = −100..100 (`--ei`: Photo mode's dials), cmd = snap (a still while recording),
      * presetsave / preset / presetdelete = name (save the current settings as a profile, apply one, delete one),
+     * turn = 0 | 90 | 180 | 270 (`--ei`: lay the controls out for that pose until the phone's next real turn),
      * torch = true|false (`--ez`).
      */
     private fun handleCommands(intent: Intent?) {
@@ -2863,6 +2884,7 @@ class CameraActivity : Activity() {
         if (extras.containsKey("texture") || extras.containsKey("clarity") || extras.containsKey("dehaze")) {
             setPhotoFinish(extras.getInt("texture", photoTexture), extras.getInt("clarity", photoClarity), extras.getInt("dehaze", photoDehaze))
         }
+        if (extras.containsKey("turn")) info.postDelayed({ ui.setTurn(extras.getInt("turn")) }, 600)
         extras.getString("presetsave")?.let { saveProfile(it.trim()) }
         extras.getString("preset")?.let { name -> profiles.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { applyProfile(it) } ?: note("No profile \"$name\"") }
         extras.getString("presetdelete")?.let { name -> profiles.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { deleteProfile(it) } }

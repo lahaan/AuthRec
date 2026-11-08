@@ -29,6 +29,9 @@ internal interface CameraUi {
 
     /** adb `open=<name>`: opens a panel for screenshots on phones without input injection. */
     fun openForTest(name: String) = Unit
+
+    /** The phone's pose, quarter turns clockwise from the screen's landscape: the controls turn to read upright (Glass). */
+    fun setTurn(turn: Int) = Unit
 }
 
 /** "− value +" control (classic exposure bar, priority limits). */
