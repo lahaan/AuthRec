@@ -112,7 +112,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         addView(modeButtons[2], LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = a.dp(6) })
     }
-    private val lookChip = captionChip("LOOK") { a.showViewMenu(it) }
+    private val lookChip = captionChip("LOOK") { toggleLooks() }
     private val edrChip = kit.button("eDR") { a.setEdr(!a.edrOn) }.apply {
         setOnLongClickListener { if (!a.simple) toggle(adjustPanel); true }
     }
@@ -269,6 +269,122 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }, LinearLayout.LayoutParams(a.dp(336), WRAP_CONTENT))
     }
 
+    // ---- Look sheet: profiles, looks, LUTs ----
+    // In place of the system's grey pop-up list (owner: "the scroll for LUTs/looks looks a bit
+    // ehhh", 2026-11-08). Stays open while looks are tried, so they can be compared on the image.
+    private val lookRows = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
+    private val lookScroll = ScrollView(a).apply {
+        isVerticalScrollBarEnabled = false
+        isVerticalFadingEdgeEnabled = true
+        setFadingEdgeLength(a.dp(28))
+        addView(lookRows)
+    }
+    /** Each pill and whether it's the current choice (re-marked on [update]). */
+    private val lookMarks = mutableListOf<Pair<Button, () -> Boolean>>()
+    /** What the list was built from: rebuilt when it changes (a LUT imported, a profile saved). */
+    private var lookKey: List<Any?> = emptyList()
+    private val lookSheet: View = LinearLayout(a).apply {
+        orientation = LinearLayout.VERTICAL
+        background = GlassDrawable(a.dp(24).toFloat(), solid = true).apply { baseColor = 0x99101418.toInt() }
+        setPadding(a.dp(16), a.dp(14), a.dp(16), a.dp(8))
+        visibility = View.GONE
+        addView(LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(title("Looks"), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(kit.button("✕") { toggle(lookSheet) })
+        })
+        addView(lookScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+    }
+
+    private fun toggleLooks() {
+        if (lookSheet.visibility != View.VISIBLE) rebuildLooks(showCurrent = true)
+        toggle(lookSheet)
+    }
+
+    private fun currentLookKey(): List<Any?> = listOf(System.identityHashCode(a.views), System.identityHashCode(a.profiles), a.simple,
+        a.profilesUsable(), (a.currentView() as? CameraActivity.ViewEntry.CubeFile)?.let { it.file.path + a.lutInputOf(it.file) })
+
+    /** [showCurrent]: scroll to the look in use (on opening); otherwise keep the scroll where it was. */
+    private fun rebuildLooks(showCurrent: Boolean = false) {
+        lookKey = currentLookKey()
+        val scrollY = lookScroll.scrollY
+        lookRows.removeAllViews()
+        lookMarks.clear()
+        fun section(name: String) = lookRows.addView(kit.label(name.uppercase(), 11f, dim = true).apply {
+            letterSpacing = 0.08f
+            setPadding(a.dp(4), a.dp(12), 0, a.dp(6))
+        })
+        fun note(text: String) = lookRows.addView(kit.label(text, 11f, dim = true).apply { setPadding(a.dp(4), 0, a.dp(4), a.dp(6)) })
+        fun pill(text: String, enabled: Boolean = true, current: () -> Boolean, onLong: (() -> Unit)? = null, onClick: () -> Unit) {
+            val b = kit.button(text) { onClick() }.apply {
+                gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
+                isEnabled = enabled
+                alpha = if (enabled) 1f else 0.45f
+                onLong?.let { f -> setOnLongClickListener { f(); true } }
+            }
+            kit.setOn(b, current())
+            lookRows.addView(b, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = a.dp(6) })
+            lookMarks += b to current
+        }
+
+        section("Profiles")
+        val usable = a.profilesUsable()
+        a.profiles.forEach { p -> pill(p.name, usable, { a.profileActive(p) }, onLong = { a.promptEditProfile(p) }) { a.applyProfile(p) } }
+        note(when {
+            a.profiles.isEmpty() -> "The look with its adjustments and dials, the video format and colour NR, under a name."
+            !usable -> "Profiles change the format: after the clip."
+            else -> "Hold one to rename or delete it."
+        })
+        lookRows.addView(kit.button("+  Save current as profile") { a.promptSaveProfile() }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+
+        val groups = listOf<Pair<String, (CameraActivity.ViewEntry) -> Boolean>>(
+            "Looks" to { it is CameraActivity.ViewEntry.LogView || it is CameraActivity.ViewEntry.BuiltIn },
+            "Your looks" to { it is CameraActivity.ViewEntry.UserLook },
+            "LUTs" to { it is CameraActivity.ViewEntry.CubeFile },
+        )
+        for ((name, inGroup) in groups) {
+            val items = a.views.withIndex().filter { (_, v) -> inGroup(v) && !(a.simple && v is CameraActivity.ViewEntry.LogView) }
+            if (items.isEmpty()) continue
+            section(name)
+            // The section says what they are: no "★ " / "LUT " in front, nor ".cube.txt" behind.
+            items.forEach { (i, v) ->
+                val name = v.label.removePrefix("★ ").removePrefix("LUT ").replace(Regex("""(\.cube)?(\.txt)?$""", RegexOption.IGNORE_CASE), "")
+                pill(name, current = { a.viewIndex == i }) { a.selectView(i) }
+            }
+        }
+
+        // An imported LUT is built for one log format; ours is converted to it before the lookup.
+        (a.currentView() as? CameraActivity.ViewEntry.CubeFile)?.takeIf { !a.simple }?.let { cube ->
+            section("This LUT expects")
+            val options = listOf<Pair<String, LogProfile?>>("Our log" to null) + LogProfile.entries.map { it.label to it }
+            options.chunked(2).forEach { pair ->
+                val (seg, mark) = kit.segmented(pair.map { it.first }) { k -> a.setLutInput(cube.file, pair[k].second) }
+                mark(pair.indexOfFirst { it.second == a.lutInputOf(cube.file) })
+                lookRows.addView(seg, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { bottomMargin = a.dp(6) })
+            }
+        }
+
+        lookRows.addView(LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, a.dp(12), 0, a.dp(8))
+            if (!a.simple) addView(kit.button("Import .cube…") { a.pickLut() }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = a.dp(8) })
+            addView(kit.button("Edit look…") { a.openLookEditor() })
+        })
+        // Once laid out (on opening the sheet is still hidden here).
+        lookScroll.viewTreeObserver.addOnGlobalLayoutListener(object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+            override fun onGlobalLayout() {
+                if (lookScroll.height == 0) return
+                lookScroll.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                val current = lookMarks.lastOrNull { (_, isCurrent) -> isCurrent() }?.first
+                if (showCurrent && current != null) lookScroll.scrollTo(0, (current.top - lookScroll.height / 3).coerceAtLeast(0))
+                else lookScroll.scrollTo(0, scrollY)
+            }
+        })
+    }
+
     // ---- Settings sheet ----
     private val settingsRows = mutableListOf<() -> Unit>()
     private val proSettings = mutableListOf<View>()
@@ -277,7 +393,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val photoRows = mutableListOf<View>()
     private val settingsSheet: View = buildSettings()
 
-    private val panels: List<View> = listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel, adjustPanel, settingsSheet)
+    private val panels: List<View> = listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel, adjustPanel, settingsSheet, lookSheet)
 
     override val lensAnchor: View get() = lensColumn
     override val lookAnchor: View get() = lookChip
@@ -365,6 +481,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         })
         addView(settingsSheet, FrameLayout.LayoutParams(minOf(a.dp(560), imageW - a.dp(24)), MATCH_PARENT, Gravity.CENTER_HORIZONTAL).apply {
             setMargins(0, a.dp(12), 0, a.dp(12))
+        })
+        // Over the image's left side, beside the column with the Look chip (which stays lit).
+        addView(lookSheet, FrameLayout.LayoutParams(minOf(a.dp(320), imageW - a.dp(24)), MATCH_PARENT, Gravity.START).apply {
+            setMargins(side + a.dp(8), a.dp(12), 0, a.dp(12))
         })
         // Before every UI frame: tell the renderer where the glass is, for the blur behind it.
         viewTreeObserver.addOnPreDrawListener {
@@ -690,6 +810,11 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         modeBox.visibility = if (recording) View.INVISIBLE else View.VISIBLE // the REC pill sits there
         modeButtons.forEach { it.isEnabled = !busy }
         setCaption(lookChip, a.currentView()?.label ?: "")
+        kit.setOn(lookChip, lookSheet.visibility == View.VISIBLE)
+        if (lookSheet.visibility == View.VISIBLE) {
+            if (currentLookKey() != lookKey) rebuildLooks()
+            lookMarks.forEach { (b, current) -> kit.setOn(b, current()) }
+        }
         kit.setOn(edrChip, a.edrOn && a.edrAvailable())
         edrChip.isEnabled = a.edrAvailable()
         edrChip.text = if (a.edrOn) "eDR  on" else "eDR  off"
@@ -728,9 +853,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
         // Pro bar.
         val pro = !a.simple
-        proBar.visibility = if (pro && settingsSheet.visibility != View.VISIBLE) View.VISIBLE else View.GONE
+        val sheetOpen = settingsSheet.visibility == View.VISIBLE || lookSheet.visibility == View.VISIBLE
+        proBar.visibility = if (pro && !sheetOpen) View.VISIBLE else View.GONE
         // The info line sits behind the sheet's rows and showed through its glass.
-        a.info.visibility = if (settingsSheet.visibility == View.VISIBLE) View.INVISIBLE else View.VISIBLE
+        a.info.visibility = if (sheetOpen) View.INVISIBLE else View.VISIBLE
         if (!pro) listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel).forEach { it.visibility = View.GONE }
         val ae = a.capture.ae
         setCaption(aeChip, when (ae) {
@@ -877,6 +1003,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     override fun openForTest(name: String) {
         when (name) {
             "settings" -> settingsSheet
+            "looks" -> lookSheet.also { rebuildLooks(showCurrent = true) }
             "adjust" -> adjustPanel
             "ae" -> aePanel
             "iso" -> isoPanel

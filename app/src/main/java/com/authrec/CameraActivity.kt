@@ -49,6 +49,8 @@ import com.authrec.record.RecordingCheck
 import com.authrec.record.VideoCodec
 import com.authrec.ui.CameraUi
 import com.authrec.ui.ClassicUi
+import com.authrec.ui.Glass
+import com.authrec.ui.GlassDialog
 import com.authrec.ui.GlassUi
 import com.authrec.ui.Stepper
 import com.authrec.ui.UiKit
@@ -96,6 +98,9 @@ class CameraActivity : Activity() {
     internal var views: List<ViewEntry> = listOf(ViewEntry.LogView)
         private set
     internal var viewIndex = 1
+        private set
+    /** Named settings at the top of the Look menu (see [Profile]). */
+    internal var profiles: List<Profile> = emptyList()
         private set
     internal var codec = VideoCodec.HEVC_10
         private set
@@ -377,6 +382,7 @@ class CameraActivity : Activity() {
     // ---- Preferences ----
 
     private fun loadPrefs() {
+        profiles = Profile.load(prefs)
         simple = prefs.getBoolean("simple", true)
         photo = !simple && prefs.getBoolean("photo", false)
         photoRaw = prefs.getBoolean("photoRaw", false)
@@ -1564,9 +1570,183 @@ class CameraActivity : Activity() {
 
     internal fun openBench() = startActivity(Intent(this, com.authrec.bench.BenchActivity::class.java))
 
+    // ---- Profiles ----
+
+    /** The current settings as a profile called [name]. */
+    private fun snapshotProfile(name: String) = Profile(
+        name = name, look = currentView()?.label ?: ViewEntry.LogView.label,
+        lutStrength = lutStrength, saturation = saturationPct, vibrance = vibrancePct,
+        wbWarm = wbWarmth, wbTint = wbTint, edrOn = edrOn, edrHi = edrHighlights, edrLo = edrShadows,
+        texture = photoTexture, clarity = photoClarity, dehaze = photoDehaze,
+        aspect = aspect, superpixel = superpixel, fps = capture.fps, codec = codec, bitrate = bitrateMbps,
+        recordLook = bakeLut, logProfile = profile, cleanup = cleanup, nrFast = nrFast,
+    )
+
+    /** Whether the current settings are [p]'s (the list marks it). */
+    internal fun profileActive(p: Profile) = p.sameSettings(snapshotProfile(p.name))
+
+    /** Profiles can't change the format mid-clip or mid-burst. */
+    internal fun profilesUsable() = recorder == null && !stopping && !photoBusy
+
+    internal fun promptSaveProfile() = askProfileName("Save as profile",
+        "Keeps the look with its Adjust, eDR and Texture / Clarity / Dehaze, the video format and colour NR " +
+            "(not exposure or the lens). A name you already use updates that profile.",
+        profiles.firstOrNull { profileActive(it) }?.name ?: "", "Save") { saveProfile(it) }
+
+    // No keyboard at first: in landscape it covers the dialog's buttons (Delete).
+    internal fun promptEditProfile(p: Profile) = askProfileName("Rename \"${p.name}\"",
+        "Or delete it. Its settings stay as they are.", p.name, "Rename", extra = "Delete" to { deleteProfile(p) },
+        keyboard = false) { renameProfile(p, it) }
+
+    /** Picks look or LUT [i] of [views]. */
+    internal fun selectView(i: Int) {
+        if (i !in views.indices || (simple && views[i] is ViewEntry.LogView)) return
+        viewIndex = i
+        applyView()
+        settingsChanged()
+    }
+
+    /** What the imported LUT [file] gets converted to before the lookup (null: our log as is). */
+    internal fun setLutInput(file: File, p: LogProfile?) {
+        prefs.edit().putString("lutInput:${file.name}", p?.name ?: "NONE").apply()
+        applyView()
+        updateUi()
+    }
+
+    /** Sets everything [p] holds at once (one save, one redraw); its look is found by name. */
+    internal fun applyProfile(p: Profile) {
+        if (recorder != null || stopping || photoBusy) return
+        val look = views.indexOfFirst { it.label == p.look }.takeIf { it >= 0 && !(simple && views[it] is ViewEntry.LogView) }
+        look?.let { viewIndex = it }
+        lutStrength = p.lutStrength.coerceIn(0, 100)
+        saturationPct = p.saturation.coerceIn(0, 200)
+        vibrancePct = p.vibrance.coerceIn(-100, 100)
+        wbWarmth = p.wbWarm.coerceIn(-100, 100)
+        wbTint = p.wbTint.coerceIn(-100, 100)
+        edrOn = p.edrOn
+        edrHighlights = p.edrHi.coerceIn(-100, 100)
+        edrShadows = p.edrLo.coerceIn(-100, 100)
+        photoTexture = p.texture.coerceIn(-100, 100)
+        photoClarity = p.clarity.coerceIn(-100, 100)
+        photoDehaze = p.dehaze.coerceIn(-100, 100)
+        profile = p.logProfile
+        renderer?.profile = profile
+        aspect = p.aspect
+        superpixel = p.superpixel
+        renderer?.superpixel = superpixel
+        bitrateMbps = p.bitrate
+        if (bitrateMbps !in bitrateOptions()) bitrateMbps = bitrateOptions().minBy { abs(it - bitrateMbps) }
+        bakeLut = p.recordLook
+        cleanup = p.cleanup.coerceIn(0, 3)
+        renderer?.cleanup = cleanup
+        nrFast = p.nrFast
+        renderer?.nrFast = nrFast
+        applyView()
+        applyLookAdjust()
+        applyWbShift()
+        applyTone()
+        applyPhotoFinish()
+        applyAspect()
+        if (p.fps != capture.fps) setCapture(capture.copy(fps = p.fps))
+        setCodec(p.codec) // saves and redraws; rebuilds the GL config for another bit depth
+        note("Profile \"${p.name}\"" + if (look == null) " (its look \"${p.look}\" isn't here any more)" else "")
+    }
+
+    private fun saveProfile(typed: String) {
+        val name = typed.ifEmpty { "Profile ${profiles.size + 1}" }
+        val p = snapshotProfile(name)
+        val i = profiles.indexOfFirst { it.name.equals(name, ignoreCase = true) }
+        profiles = if (i >= 0) profiles.toMutableList().also { it[i] = p } else profiles + p
+        Profile.save(prefs, profiles)
+        note("Profile \"$name\" ${if (i >= 0) "updated" else "saved"}")
+        updateUi()
+    }
+
+    private fun renameProfile(p: Profile, name: String) {
+        if (name.isEmpty() || name == p.name) return
+        if (profiles.any { it !== p && it.name.equals(name, ignoreCase = true) }) return note("There's already a profile called \"$name\"")
+        profiles = profiles.map { if (it === p) it.copy(name = name) else it }
+        Profile.save(prefs, profiles)
+        note("Profile renamed to \"$name\"")
+    }
+
+    private fun deleteProfile(p: Profile) {
+        profiles = profiles.filter { it !== p }
+        Profile.save(prefs, profiles)
+        note("Profile \"${p.name}\" deleted")
+    }
+
+    /**
+     * A name for a profile, in the layout's own dialog (Glass's panel, or the system's in Classic):
+     * [action] gets the trimmed text; [extra] is one more button (Delete).
+     */
+    private fun askProfileName(title: String, message: String, initial: String, action: String,
+                               extra: Pair<String, () -> Unit>? = null, keyboard: Boolean = true, onName: (String) -> Unit) {
+        val input = android.widget.EditText(this).apply {
+            setText(initial)
+            setSelectAllOnFocus(true)
+            isSingleLine = true
+            hint = "e.g. B&W Dreamy"
+            filters = arrayOf(android.text.InputFilter.LengthFilter(Profile.MAX_NAME))
+            // The screen is landscape: a full-screen keyboard editor would hide the dialog.
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE or android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+        }
+        val done = { onName(input.text.toString().trim()) }
+        val dialog: android.app.Dialog = if (kit.glass) {
+            input.setTextColor(Glass.TEXT)
+            input.setHintTextColor(Glass.TEXT_DIM)
+            input.backgroundTintList = android.content.res.ColorStateList.valueOf(Glass.TEXT_DIM)
+            val content = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(24), dp(20), dp(24), dp(4))
+                addView(kit.label(title, 18f).apply { typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) })
+                addView(kit.label(message, 13f, dim = true), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+                addView(input, LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(10) })
+            }
+            GlassDialog.show(this, kit, content, listOfNotNull(
+                extra?.let { (text, run) -> GlassDialog.Action(text) { run() } },
+                GlassDialog.Action("Cancel"),
+                GlassDialog.Action(action, main = true) { done() },
+            ))
+        } else {
+            android.app.AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setView(input)
+                .setPositiveButton(action) { _, _ -> done() }
+                .setNegativeButton("Cancel", null)
+                .apply { extra?.let { (text, run) -> setNeutralButton(text) { _, _ -> run() } } }
+                .show()
+        }
+        input.setOnEditorActionListener { _, id, _ ->
+            if (id != android.view.inputmethod.EditorInfo.IME_ACTION_DONE) return@setOnEditorActionListener false
+            dialog.dismiss()
+            done()
+            true
+        }
+        if (keyboard) {
+            dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+            input.requestFocus()
+        }
+    }
+
     /** Drop-down of every look and LUT. */
     internal fun showViewMenu(anchor: View = ui.lookAnchor) {
         val menu = android.widget.PopupMenu(this, anchor)
+        menu.menu.setGroupDividerEnabled(true)
+        // Profiles first: a whole look (and format) in one tap. Not while recording or taking a photo.
+        val free = profilesUsable()
+        val now = snapshotProfile("")
+        if (profiles.isNotEmpty()) menu.menu.add(PROFILE_GROUP, PROFILE_HEADER, 0, "Profiles").isEnabled = false
+        profiles.forEachIndexed { i, p ->
+            menu.menu.add(PROFILE_GROUP, PROFILE_BASE + i, 1 + i, (if (p.sameSettings(now)) "● " else "") + p.name).isEnabled = free
+        }
+        menu.menu.add(PROFILE_GROUP, PROFILE_SAVE, 1 + profiles.size, "Save current as profile…")
+        if (profiles.isNotEmpty()) {
+            val sub = menu.menu.addSubMenu(PROFILE_GROUP, PROFILE_EDIT_MENU, 2 + profiles.size, "Rename or delete a profile ▸")
+            profiles.forEachIndexed { i, p -> sub.add(PROFILE_EDIT_GROUP, PROFILE_EDIT_BASE + i, i, p.name) }
+        }
+        val first = 3 + profiles.size  // the looks' place in the menu, after the profiles
         views.forEachIndexed { i, v ->
             if (simple && v is ViewEntry.LogView) return@forEachIndexed
             val group = when (v) {
@@ -1575,32 +1755,26 @@ class CameraActivity : Activity() {
                 is ViewEntry.UserLook -> 2
                 is ViewEntry.CubeFile -> 3
             }
-            menu.menu.add(group, i, i, (if (i == viewIndex) "● " else "") + v.label)
+            menu.menu.add(group, i, first + i, (if (i == viewIndex) "● " else "") + v.label)
         }
         // An imported LUT is built for one log format; ours gets converted to it before the lookup.
         val cube = views.getOrNull(viewIndex) as? ViewEntry.CubeFile
         if (cube != null && !simple) {
             val current = lutInputOf(cube.file)
-            val sub = menu.menu.addSubMenu(4, LUT_INPUT_MENU, views.size, "LUT expects: ${current?.label ?: "our log as is"} ▸")
+            val sub = menu.menu.addSubMenu(4, LUT_INPUT_MENU, first + views.size, "LUT expects: ${current?.label ?: "our log as is"} ▸")
             sub.add(5, LUT_INPUT_BASE, 0, (if (current == null) "● " else "") + "Our log as is (no conversion)")
             LogProfile.entries.forEach { p -> sub.add(5, LUT_INPUT_BASE + 1 + p.ordinal, p.ordinal + 1, (if (current == p) "● " else "") + p.label) }
         }
-        if (!simple) menu.menu.add(6, IMPORT_ITEM, views.size + 1, "Import a .cube LUT…")
+        if (!simple) menu.menu.add(6, IMPORT_ITEM, first + views.size + 1, "Import a .cube LUT…")
         menu.setOnMenuItemClickListener { item ->
             when {
-                item.itemId == LUT_INPUT_MENU -> return@setOnMenuItemClickListener false // opens the submenu
+                item.itemId == LUT_INPUT_MENU || item.itemId == PROFILE_EDIT_MENU -> return@setOnMenuItemClickListener false // opens the submenu
+                item.itemId == PROFILE_SAVE -> promptSaveProfile()
+                item.itemId in PROFILE_EDIT_BASE until PROFILE_EDIT_BASE + profiles.size -> promptEditProfile(profiles[item.itemId - PROFILE_EDIT_BASE])
+                item.itemId in PROFILE_BASE until PROFILE_BASE + profiles.size -> applyProfile(profiles[item.itemId - PROFILE_BASE])
                 item.itemId == IMPORT_ITEM -> pickLut()
-                item.itemId >= LUT_INPUT_BASE -> {
-                    val p = LogProfile.entries.getOrNull(item.itemId - LUT_INPUT_BASE - 1)
-                    prefs.edit().putString("lutInput:${cube?.file?.name}", p?.name ?: "NONE").apply()
-                    applyView()
-                    updateUi()
-                }
-                else -> {
-                    viewIndex = item.itemId
-                    applyView()
-                    settingsChanged()
-                }
+                item.itemId in LUT_INPUT_BASE..LUT_INPUT_BASE + LogProfile.entries.size -> cube?.let { setLutInput(it.file, LogProfile.entries.getOrNull(item.itemId - LUT_INPUT_BASE - 1)) }
+                else -> selectView(item.itemId)
             }
             true
         }
@@ -1611,7 +1785,7 @@ class CameraActivity : Activity() {
      * The log format an imported LUT expects: what the user picked, else a guess from its file
      * name (most are named after their input, e.g. "…SLog3…"), else null (apply to our log as is).
      */
-    private fun lutInputOf(file: File): LogProfile? {
+    internal fun lutInputOf(file: File): LogProfile? {
         prefs.getString("lutInput:${file.name}", null)?.let { return runCatching { LogProfile.valueOf(it) }.getOrNull() }
         val name = file.name.lowercase().replace(Regex("[^a-z0-9]"), "")
         return when {
@@ -2572,6 +2746,7 @@ class CameraActivity : Activity() {
      * photomerge = false (`--ez`: no burst merge, to compare), photoalign = false (`--ez`: merged
      * without aligning), photoshake = quads (`--ei`: each burst frame read that far off, 0 = off),
      * texture / clarity / dehaze = −100..100 (`--ei`: Photo mode's dials), cmd = snap (a still while recording),
+     * presetsave / preset / presetdelete = name (save the current settings as a profile, apply one, delete one),
      * torch = true|false (`--ez`).
      */
     private fun handleCommands(intent: Intent?) {
@@ -2688,6 +2863,9 @@ class CameraActivity : Activity() {
         if (extras.containsKey("texture") || extras.containsKey("clarity") || extras.containsKey("dehaze")) {
             setPhotoFinish(extras.getInt("texture", photoTexture), extras.getInt("clarity", photoClarity), extras.getInt("dehaze", photoDehaze))
         }
+        extras.getString("presetsave")?.let { saveProfile(it.trim()) }
+        extras.getString("preset")?.let { name -> profiles.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { applyProfile(it) } ?: note("No profile \"$name\"") }
+        extras.getString("presetdelete")?.let { name -> profiles.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { deleteProfile(it) } }
         extras.getString("open")?.let { name ->
             info.postDelayed({ if (name == "recordings") openRecordings() else ui.openForTest(name) }, 1200)
         }
@@ -2784,5 +2962,12 @@ class CameraActivity : Activity() {
         private const val BENCH_ITEM = 10_002
         private const val STYLE_ITEM = 10_003
         private const val IMPORT_ITEM = 10_004
+        private const val PROFILE_GROUP = 7
+        private const val PROFILE_EDIT_GROUP = 8
+        private const val PROFILE_HEADER = 11_000
+        private const val PROFILE_SAVE = 11_001
+        private const val PROFILE_EDIT_MENU = 11_002
+        private const val PROFILE_BASE = 12_000
+        private const val PROFILE_EDIT_BASE = 13_000
     }
 }
