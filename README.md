@@ -13,6 +13,7 @@ balance, colour matrix, lens shading).
 - HEVC 10-bit, HEVC 8-bit, H.264 ; up to 150 Mbps
 - 16:9, 2:1, 2.39:1 and vertical support
 - Live 3D LUTs and looks; look editor that exports `.cube`; LUT import available
+- Profiles: the look with its adjustments, the video format and noise reduction, saved under a name
 - eDR (extended dynamic range) - customizable highlight and shadow recovery
 - Temporal colour noise reduction with hot pixel fix
 - AE Auto / Priority / Locked / Manual, ISO and shutter
@@ -20,7 +21,7 @@ balance, colour matrix, lens shading).
 - Pause / resume recording support
 - Finds lenses hidden from normal apps (ultrawide, telephoto where the phone allows)
 - Recordings screen with Compress (HEVC / H.264 / AV1 on the CPU, size-capped for grain)
-- Simple and Pro mode
+- Simple and Pro mode; the controls turn upright with the phone (not mid-recording)
 - Photo mode: a burst aligned and merged in RAW, colour noise reduction on the merged frame, the
   look applied; JPEG (+ optional DNG); manual shutter up to ½ s
 - Texture / Clarity / Dehaze (with a highlight bloom) for photos and look-baked video

@@ -1,4 +1,4 @@
-# Handoff: state as of 0.8.1 (2026-11-07, GitHub pre-release v0.8.1)
+# Handoff: state as of 0.8.2 (2026-11-08, GitHub pre-release v0.8.2)
 
 How it got here: built in one long session from a capability bench → live RAW preview → recording
 → features (0.2.0), then field tests on the owner's Xiaomi 14 and a friend's Xiaomi 15 Ultra
@@ -105,14 +105,14 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 
 ## Start here (next session)
 
-00000000. **Unreleased (branch, 2026-11-08)**: feedback/notes.md items 90–92. Profiles (the look
+00000000. **0.8.2 (2026-11-08)**: feedback/notes.md items 89–92 (89 below). Profiles (the look
     with its adjustments and dials, the video format and colour NR under a name) at the top of the
     Look menu; Glass's Look chip opens a glass sheet instead of the system pop-up; Glass's controls
     turn and re-lay-out when the phone is held upright (not mid-clip; Classic stays landscape). The
     turned layer reports its real screen area to the window's transparent region (views report an
     unrotated rectangle, and a strip of controls vanished).
 
-0000000. **Unreleased (branch, 2026-11-08)**: feedback/notes.md item 89. The dials no longer look
+0000000. **0.8.2, part 1 (2026-11-08)**: feedback/notes.md item 89. The dials no longer look
     "jagged": their pyramid filters each level past 0 with [1 3 3 1] (2×2 means aliased) and the
     coarse levels are read as cubic B-splines (bilinear showed every texel as a crease, a
     staircase along diagonal edges); a new small pass (`finishUp`) blends the coarse levels onto
