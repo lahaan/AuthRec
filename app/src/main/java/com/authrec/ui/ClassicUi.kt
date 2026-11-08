@@ -266,7 +266,10 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         fpsButton.text = "${a.capture.fps} fps"
         codecButton.text = a.effectiveCodec().label
         bitrateButton.text = "${a.bitrateMbps} Mbps"
-        resButton.text = if (a.simple) (if (a.superpixel) "2K" else "4K") else if (a.superpixel) "Superpixel 2K" else "Open gate 4K"
+        val twoK = a.effectiveSuperpixel()
+        resButton.text = if (a.simple) (if (twoK) "2K" else "4K") else if (twoK) "Superpixel 2K" else "Open gate 4K"
+        // Where 4K wouldn't record more than 2K (CameraActivity.fourKOffered) there's nothing to switch.
+        resButton.isEnabled = resButton.isEnabled && (a.fourKOffered() || a.superpixel)
         audioButton.text = if (a.audioOn) "Audio: on" else "Audio: off"
         aspectButton.text = "Frame: ${a.aspect.label}"
         edrButton.text = when {

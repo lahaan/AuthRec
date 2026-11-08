@@ -819,10 +819,15 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         videoRows += resNote
         videoRows += choice("Resolution", false, listOf("4K open gate" to false, "2K superpixel" to true), {
             val limit = a.fourKLimit()
-            resNote.text = limit?.let { "4K records at ${it.first}×${it.second} on this phone (its video encoder's limit)." } ?: ""
+            resNote.text = when {
+                limit == null -> ""
+                !a.fourKOffered() -> "This phone's video encoder takes ${limit.first}×${limit.second} at most here: 2K superpixel " +
+                    "records that with a quarter of the work, so it's used instead of 4K."
+                else -> "4K records at ${limit.first}×${limit.second} on this phone (its video encoder's limit)."
+            }
             resNote.visibility = if (resNote.text.isEmpty()) View.GONE else View.VISIBLE
-            a.superpixel
-        }, note = resNote) { a.setSuperpixel(it) }
+            a.effectiveSuperpixel()
+        }, usable = { it || a.fourKOffered() }, note = resNote) { a.setSuperpixel(it) }
         choice("Frame", false, CameraActivity.FrameAspect.entries.map { it.label to it }, { a.aspect }) { a.setAspect(it) }
         videoRows += choice("Frame rate", false, listOf("24" to 24, "25" to 25, "30" to 30), { a.capture.fps }) { a.setFps(it) }
         val codecNote = kit.label("", 11f, dim = true)
@@ -881,7 +886,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
     // ---- Lenses ----
 
-    private fun lensChipText(label: String) = label.substringBefore(" ").replace("x", "×")
+    /** "3x (backup AF)" → "3×"; a lens told apart by its megapixels ("1x 2MP") → "2MP". */
+    private fun lensChipText(label: String) = label.split(" ").let { parts -> parts.firstOrNull { it.endsWith("MP") } ?: parts[0] }.replace("x", "×")
 
     private fun rebuildLenses() {
         val order = a.lensOrder().filter { !a.lenses[it].front }
@@ -966,9 +972,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         edrChip.isEnabled = a.edrAvailable()
         edrChip.text = if (a.edrOn) "eDR  on" else "eDR  off"
         kit.setOn(adjustChip, adjustPanel.visibility == View.VISIBLE)
-        resChip.text = if (a.superpixel) "2K" else "4K"
+        resChip.text = if (a.effectiveSuperpixel()) "2K" else "4K"
         resChip.visibility = if (a.simple) View.VISIBLE else View.GONE
-        resChip.isEnabled = !busy
+        resChip.isEnabled = !busy && a.fourKOffered()
         settingsChip.isEnabled = !busy
         kit.setOn(settingsChip, settingsSheet.visibility == View.VISIBLE)
         if (busy && settingsSheet.visibility == View.VISIBLE) settingsSheet.visibility = View.GONE

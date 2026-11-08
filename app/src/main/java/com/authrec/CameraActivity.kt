@@ -757,6 +757,7 @@ class CameraActivity : Activity() {
 
     internal fun updateUi() {
         if (!::ui.isInitialized) return
+        syncResolution()
         val mf = manualFocus
         focusBar.visibility = if (mf) View.VISIBLE else View.GONE
         if (mf) {
@@ -885,7 +886,7 @@ class CameraActivity : Activity() {
     private var rendererTenBit = false
     /** Bitrates offered for the current resolution: 2K needs far less (owner asked for 25 and 75). */
     internal fun bitrateOptions(): List<Int> {
-        val all = if (superpixel) BITRATES_2K else BITRATES_4K
+        val all = if (effectiveSuperpixel()) BITRATES_2K else BITRATES_4K
         val cap = recordingLimits?.maxMbps ?: 0
         return if (cap <= 0) all else all.filter { it <= cap * 1.1 }.ifEmpty { listOf(all.first()) }
     }
@@ -917,6 +918,7 @@ class CameraActivity : Activity() {
     }
 
     private fun applyAspect() {
+        syncResolution()
         val cam = camera ?: return
         renderer?.frameCrop = frameSize(cam).third
     }
@@ -925,13 +927,60 @@ class CameraActivity : Activity() {
      * Recorded frame for the current resolution and [aspect]: width, height (multiples of 16, which
      * every encoder takes) and the share of the image's height it keeps.
      */
-    internal fun frameSize(cam: RawCamera): Triple<Int, Int, Float> {
-        val w = if (superpixel) cam.info.size.width / 2 else cam.info.size.width
-        val h = if (superpixel) cam.info.size.height / 2 else cam.info.size.height
+    internal fun frameSize(cam: RawCamera, twoK: Boolean = effectiveSuperpixel()): Triple<Int, Int, Float> {
+        val w = if (twoK) cam.info.size.width / 2 else cam.info.size.width
+        val h = if (twoK) cam.info.size.height / 2 else cam.info.size.height
         if (aspect.ratio <= w.toFloat() / h + 0.01f) return Triple(w, h, 1f)
         val cropH = (Math.round(w / aspect.ratio / 16f) * 16).coerceAtMost(h)
         return Triple(w, cropH, cropH.toFloat() / h)
     }
+    /**
+     * What a clip on [cam] records in 4K or 2K superpixel ([twoK]): the frame fitted to this phone's
+     * encoder (its declared limits, then a box found when it put out nothing), as [startRecording] does.
+     */
+    private fun recordedSize(cam: RawCamera, twoK: Boolean): Pair<Int, Int> {
+        val (fullW, fullH) = frameSize(cam, twoK)
+        val (fitW, fitH) = Recorder.fitToEncoder(effectiveCodec().mime, fullW, fullH, capture.fps)
+        if (encoderBox == null && prefs.getBoolean(encoderBoxKey(), false)) encoderBox = 4096 to 2160
+        return encoderBox?.let { (bw, bh) -> Recorder.fitInside(fitW, fitH, bw, bh) } ?: (fitW to fitH)
+    }
+
+    private var fourKKey: List<Any?>? = null
+    private var fourKValue = true
+
+    /**
+     * Whether 4K records more than 2K superpixel on this lens. Where the encoder takes no more than
+     * the 2K frame, 4K would develop four times the pixels for the same clip: the POCO M6 Pro's takes
+     * 2560 px at most, so 4K came out at 1920×1440 and its GPU managed 52–74 ms a frame for it
+     * (diagnostics 2026-11-07). 2K superpixel records it there instead (see [effectiveSuperpixel]).
+     */
+    internal fun fourKOffered(): Boolean {
+        val cam = camera ?: return true
+        val key = listOf(cam.info.size.width, cam.info.size.height, aspect, capture.fps, effectiveCodec(), encoderBox)
+        if (key != fourKKey) {
+            val (w4, h4) = recordedSize(cam, twoK = false)
+            val (w2, h2) = recordedSize(cam, twoK = true)
+            fourKValue = w4.toLong() * h4 * 10 > w2.toLong() * h2 * 11
+            fourKKey = key
+        }
+        return fourKValue
+    }
+
+    /** 2K superpixel as set, or where 4K wouldn't record more ([fourKOffered]); the setting stays. */
+    internal fun effectiveSuperpixel() = superpixel || !fourKOffered()
+
+    /**
+     * The renderer and the bitrate follow [effectiveSuperpixel], which changes with the lens, frame
+     * and frame rate; never mid-clip (the recorded size can't change).
+     */
+    private fun syncResolution() {
+        if (recorder != null || stopping) return
+        val twoK = effectiveSuperpixel()
+        renderer?.let { if (it.superpixel != twoK) it.superpixel = twoK }
+        // Keep the bitrate one this resolution offers (the nearest, e.g. 4K 150 → 2K 100).
+        if (bitrateMbps !in bitrateOptions()) bitrateMbps = bitrateOptions().minBy { abs(it - bitrateMbps) }
+    }
+
     internal fun togglePriorityPanel() {
         priorityPanelOpen = !priorityPanelOpen
         updateUi()
@@ -1650,7 +1699,6 @@ class CameraActivity : Activity() {
         renderer?.profile = profile
         aspect = p.aspect
         superpixel = p.superpixel
-        renderer?.superpixel = superpixel
         bitrateMbps = p.bitrate
         if (bitrateMbps !in bitrateOptions()) bitrateMbps = bitrateOptions().minBy { abs(it - bitrateMbps) }
         bakeLut = p.recordLook
@@ -1977,7 +2025,7 @@ class CameraActivity : Activity() {
         cam.reader.setOnImageAvailableListener({ r.onFrameAvailable() }, cameraHandler)
         cam.onResult = { r.onFrameAvailable() } // a frame waiting for its capture result
         r.profile = profile
-        r.superpixel = superpixel
+        r.superpixel = superpixel // made effective once the camera is set (applyAspect)
         r.cleanup = cleanup
         r.nrFast = nrFast
         camera = cam
@@ -2118,11 +2166,8 @@ class CameraActivity : Activity() {
     /** The 4K frame of the current lens and aspect as recorded here, if smaller than the image (for Settings). */
     internal fun fourKLimit(): Pair<Int, Int>? {
         val cam = camera ?: return null
-        val w = cam.info.size.width
-        val h = cam.info.size.height
-        val ch = if (aspect.ratio <= w.toFloat() / h + 0.01f) h else (Math.round(w / aspect.ratio / 16f) * 16).coerceAtMost(h)
-        val box = encoderBox ?: return null
-        return Recorder.fitInside(w, ch, box.first, box.second).takeIf { it.first != w }
+        val (w, _) = frameSize(cam, twoK = false)
+        return recordedSize(cam, twoK = false).takeIf { it.first != w }
     }
 
     override fun onPause() {
@@ -2152,10 +2197,7 @@ class CameraActivity : Activity() {
 
     internal fun setSuperpixel(on: Boolean) {
         superpixel = on
-        // Keep the bitrate one this resolution offers (the nearest, e.g. 4K 150 → 2K 100).
-        if (bitrateMbps !in bitrateOptions()) bitrateMbps = bitrateOptions().minBy { abs(it - bitrateMbps) }
-        renderer?.superpixel = on
-        applyAspect()
+        applyAspect() // the renderer and bitrate follow (syncResolution)
         settingsChanged()
     }
 
@@ -2256,7 +2298,7 @@ class CameraActivity : Activity() {
         }
         photoBusy = true
         photoQueued = false
-        val keep = frameSize(cam).third
+        val (fullW, _, keep) = frameSize(cam)
         val turn = recordingRotation()
         // The RAW is the sensor's image: never mirrored, and the front camera's half turn not applied.
         val rawTurn = ((if (cam.info.front) (360 - poseTurn()) % 360 else poseTurn()) + if (displayQuarterTurns == 2) 180 else 0) % 360
@@ -2422,12 +2464,11 @@ class CameraActivity : Activity() {
             showMessage("Phone too hot to record (the system reports critical heat); let it cool")
             return
         }
-        val (fullW, fullH, keep) = frameSize(cam)
+        syncResolution()
+        val (fullW, _, keep) = frameSize(cam)
         val recCodec = effectiveCodec()
         // Scaled down where this phone's encoder doesn't take the full frame (Xiaomi 12: 4096×2176 at most).
-        val (fitW, fitH) = Recorder.fitToEncoder(recCodec.mime, fullW, fullH, capture.fps)
-        if (encoderBox == null && prefs.getBoolean(encoderBoxKey(), false)) encoderBox = 4096 to 2160
-        val (boxW, boxH) = encoderBox?.let { (bw, bh) -> Recorder.fitInside(fitW, fitH, bw, bh) } ?: (fitW to fitH)
+        val (boxW, boxH) = recordedSize(cam, effectiveSuperpixel())
         // adb recscale: smaller on purpose, to exercise and time the scaled develop path.
         val (w, h) = if (debugRecScale in 30..99) (boxW * debugRecScale / 100 / 16 * 16) to (boxH * debugRecScale / 100 / 16 * 16) else boxW to boxH
         preRollExtended = false
@@ -2485,7 +2526,7 @@ class CameraActivity : Activity() {
         if (limits.isNotEmpty()) note("This phone records ${limits.joinToString(", ")}")
         // The preview runs at half resolution between recordings to save power; the pre-roll runs
         // at the recorded size so the GPU has clocked up before the clip starts.
-        info.postDelayed(commitRecording, if (superpixel) PRE_ROLL_2K_MS else PRE_ROLL_MS)
+        info.postDelayed(commitRecording, if (effectiveSuperpixel()) PRE_ROLL_2K_MS else PRE_ROLL_MS)
         updateUi()
     }
 
@@ -2664,7 +2705,7 @@ class CameraActivity : Activity() {
         val (fw, fh) = frameSize(cam)
         val out = if (photo) "Photo ${cam.info.size.width}×${(cam.info.size.height * frameSize(cam).third).roundToInt()}" +
             (if (aspect != FrameAspect.OPEN_GATE) " ${aspect.label}" else "")
-        else "$fw×$fh" + (if (aspect != FrameAspect.OPEN_GATE) " ${aspect.label}" else "") + if (superpixel) " superpixel" else ""
+        else "$fw×$fh" + (if (aspect != FrameAspect.OPEN_GATE) " ${aspect.label}" else "") + if (effectiveSuperpixel()) " superpixel" else ""
         // Sensor ISO times the digital gain before the log curve: what the noise looks like.
         val gainEv = renderer?.totalGainEv ?: 0f
         val effectiveIso = m?.iso?.let { (it * Math.pow(2.0, gainEv.toDouble())).roundToInt() }

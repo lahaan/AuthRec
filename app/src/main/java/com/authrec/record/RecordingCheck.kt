@@ -24,7 +24,9 @@ import android.util.Log
  * flat test frames hid (40 of 40 out at 4208×3120). Pure noise was too hard instead: the X14 had
  * to put out 180–390 Mbps for it and managed only 16–23 fps, where it records 4K at 30.
  * - Size: the largest 4K frame any lens makes, at 50 Mbps; if that doesn't keep up, the first of
- *   4096×2304, 4096×2176 and 3840×2160 that does, together with that frame shrunk into it.
+ *   4096×2304, 4096×2176 and 3840×2160 that does, together with that frame shrunk into it; failing
+ *   those (an encoder well short of 4K: the POCO M6 Pro's takes 2560 px, all of them 0/40), what
+ *   recordings there use: the frame and the 2K frame fitted to the encoder's declared limits.
  * - 10-bit: the same through a recordable 10-bit EGL surface.
  * - Bitrate: the highest bitrate offered, then 100 Mbps if the encoder won't take that; what
  *   comes out is what it really delivers (grain needs more than the encoder is asked for).
@@ -34,7 +36,7 @@ import android.util.Log
  */
 internal object RecordingCheck {
     /** Bump when the check changes so phones check again. */
-    private const val VERSION = 4
+    private const val VERSION = 5
     private const val PREFS = "reccheck"
     private const val TAG = "AuthRec"
     private const val FPS = 30
@@ -88,22 +90,40 @@ internal object RecordingCheck {
         var size = largest
         val full = test(lw, lh)
         if (cancelled()) return null
-        if (!works(full)) {
+        var recorded = works(full)
+        if (!recorded) {
             for (candidate in listOf(4096 to 2304, 4096 to 2176, 3840 to 2160)) {
                 val fitted = Recorder.fitInside(lw, lh, candidate.first, candidate.second)
                 if (works(test(candidate.first, candidate.second)) && works(test(fitted.first, fitted.second))) {
                     box = candidate
                     size = fitted
+                    recorded = true
                     break
                 }
                 if (cancelled()) return null
             }
         }
-        val tenBit = works(test(size.first, size.second, tenBit = true))
+        if (!recorded) {
+            // Recordings fit these anyway (Recorder.fitToEncoder): they only tell 10-bit and the
+            // bitrate apart at a size the phone records, so no box from them.
+            val twoK = (lw / 2 / 16 * 16) to (lh / 2 / 16 * 16)
+            for (candidate in listOf(Recorder.fitToEncoder(mime, lw, lh, FPS), Recorder.fitToEncoder(mime, twoK.first, twoK.second, FPS)).distinct()) {
+                if (candidate == largest) continue
+                if (works(test(candidate.first, candidate.second))) {
+                    size = candidate
+                    recorded = true
+                    break
+                }
+                if (cancelled()) return null
+            }
+        }
+        // Nothing recorded at any size: say nothing about 10-bit or the bitrate (a failed size isn't
+        // a ceiling; it put "max 99 Mbps" on the M6 Pro), and leave it to the recordings' own fallbacks.
+        val tenBit = !recorded || works(test(size.first, size.second, tenBit = true))
         // VBR on noise lands at or above the target where the encoder can (the X14 put out 339 Mbps
         // for 150); well under it means a ceiling, and no output at all a bitrate it won't take.
         var maxMbps = 0
-        for (mbps in listOf(offeredMbps, 100).distinct()) {
+        if (recorded) for (mbps in listOf(offeredMbps, 100).distinct()) {
             val o = test(size.first, size.second, mbps = mbps)
             if (cancelled()) return null
             if (works(o)) {

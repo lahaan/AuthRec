@@ -101,7 +101,7 @@ class LensProbe(private val context: Context) {
     fun cached(): List<Lens>? {
         if (prefs.getString("fingerprint", null) != Build.FINGERPRINT || prefs.getInt("version", 0) != VERSION) return null
         val arr = JSONArray(prefs.getString("lenses", null) ?: return null)
-        return List(arr.length()) { Lens.fromJson(arr.getJSONObject(it)) }.takeIf { it.isNotEmpty() }
+        return List(arr.length()) { Lens.fromJson(arr.getJSONObject(it)) }.takeIf { it.isNotEmpty() }?.also { distinctLabels(it) }
     }
 
     fun clearCache() = prefs.edit().remove("lenses").remove("fingerprint").apply()
@@ -538,9 +538,24 @@ class LensProbe(private val context: Context) {
                 l.label += " (backup AF)"
             }
         }
+        distinctLabels(lenses)
     }
 
     companion object {
+        /**
+         * Back lenses that came out with the same label get their megapixels on all but the largest:
+         * the POCO M6 Pro's main lens and its 2 MP one (same field of view) were both "1x"
+         * (diagnostics 2026-11-07). Applied to saved lenses too, so no rescan is needed.
+         */
+        fun distinctLabels(lenses: List<Lens>) {
+            lenses.filter { !it.front && " " !in it.label }.groupBy { it.label }.values.filter { it.size > 1 }.forEach { same ->
+                val largest = same.maxBy { it.rawWidth.toLong() * it.rawHeight }
+                same.filter { it !== largest }.forEach { l ->
+                    l.label += " %dMP".format(Math.round(l.rawWidth.toLong() * l.rawHeight / 1e6).coerceAtLeast(1))
+                }
+            }
+        }
+
         /** Bump to force a rescan after changing how lenses are found (9: test streams carry a YUV stream, ids 0–99). */
         private const val VERSION = 9
         private const val ERROR_CAMERA_DISABLED = CameraDevice.StateCallback.ERROR_CAMERA_DISABLED

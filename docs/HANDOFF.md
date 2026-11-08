@@ -105,6 +105,13 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 
 ## Start here (next session)
 
+000000000. **Unreleased (branch, 2026-11-08)**: feedback/notes.md item 93 (a POCO M6 Pro, the first
+    MediaTek report). Where the encoder makes 4K record no more than 2K superpixel would (the M6
+    Pro's takes 2560 px: 4K came out 1920×1440 at 52–74 ms a frame), clips run as 2K superpixel
+    (`fourKOffered` / `effectiveSuperpixel`, per lens, 4K greyed in Settings). The recording check
+    (v5) also tests what such phones record and no longer turns failed sizes into a bitrate cap.
+    Back lenses with the same label are told apart by megapixels ("1x 2MP").
+
 00000000. **0.8.2 (2026-11-08)**: feedback/notes.md items 89–92 (89 below). Profiles (the look
     with its adjustments and dials, the video format and colour NR under a name) at the top of the
     Look menu; Glass's Look chip opens a glass sheet instead of the system pop-up; Glass's controls
