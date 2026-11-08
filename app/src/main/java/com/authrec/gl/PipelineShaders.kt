@@ -1371,8 +1371,11 @@ internal object PipelineShaders {
      * Photo mode's Texture / Clarity / Dehaze (Lightroom's Presence dials), step 1, one level per
      * pass: two pyramids of the view, level 0 at half its size, each level half the one before:
      * log brightness (r) and darkest channel (g); and the highlights' colour, what Dehaze's
-     * negative side blooms. One texture per level: written as mip levels of one texture (the level
-     * below read from it in the same pass) the Adreno 750 smeared bright areas along the rows.
+     * negative side blooms. Level 0 is 2×2 means of the pixels; each level past it filters 4×4
+     * texels of the one below, [1 3 3 1] each way: 2×2 means all the way down (0.8.1) alias, a
+     * bright line or edge came out as a row of blobs that stepped along diagonals (owner: "jagged",
+     * 2026-11-08). One texture per level: written as mip levels of one texture (the level below
+     * read from it in the same pass) the Adreno 750 smeared bright areas along the rows.
      */
     val finishDown = """
         #version 310 es
@@ -1388,22 +1391,27 @@ internal object PipelineShaders {
         void main() {
             ivec2 o = ivec2(gl_GlobalInvocationID.xy);
             if (o.x >= imageSize(uOut).x || o.y >= imageSize(uOut).y) return;
-            ivec2 last = textureSize(uIn, 0) - 1;
             vec2 a = vec2(0.0);
             vec3 g = vec3(0.0);
-            for (int i = 0; i < 4; i++) {
-                ivec2 p = min(o * 2 + ivec2(i & 1, i >> 1), last);
-                if (uLevel == 0) {
-                    vec3 c = clamp(texelFetch(uIn, p, 0).rgb, 0.0, 1.0);
-                    a += brightnessAndDark(c);
-                    g += glowSource(c);
-                } else {
-                    a += texelFetch(uIn, p, 0).rg;
-                    g += texelFetch(uInGlow, p, 0).rgb;
+            if (uLevel == 0) {
+                // Measured per pixel, then averaged (brightness is a log).
+                ivec2 last = textureSize(uIn, 0) - 1;
+                for (int i = 0; i < 4; i++) {
+                    vec3 c = clamp(texelFetch(uIn, min(o * 2 + ivec2(i & 1, i >> 1), last), 0).rgb, 0.0, 1.0);
+                    a += 0.25 * brightnessAndDark(c);
+                    g += 0.25 * glowSource(c);
+                }
+            } else {
+                // The same filter in 4 bilinear taps: each pair of texels weighted 1:3 is one tap.
+                vec2 texel = 1.0 / vec2(textureSize(uIn, 0));
+                for (int i = 0; i < 4; i++) {
+                    vec2 uv = (vec2(o * 2) + vec2((i & 1) == 0 ? 0.25 : 1.75, (i >> 1) == 0 ? 0.25 : 1.75)) * texel;
+                    a += 0.25 * texture(uIn, uv).rg;
+                    g += 0.25 * texture(uInGlow, uv).rgb;
                 }
             }
-            imageStore(uOut, o, vec4(a * 0.25, 0.0, 1.0));
-            imageStore(uOutGlow, o, vec4(g * 0.25, 1.0));
+            imageStore(uOut, o, vec4(a, 0.0, 1.0));
+            imageStore(uOutGlow, o, vec4(g, 1.0));
         }
     """.trimIndent()
 
@@ -1424,18 +1432,83 @@ internal object PipelineShaders {
     """
 
     /**
+     * A level read as a cubic B-spline: smooth where bilinear, on a level 32× smaller than the
+     * photo, shows its grid as creases, a staircase along diagonal edges (owner: "jagged", 2026-11-08).
+     */
+    private const val SMOOTH_READ = """
+        /** [t] at [uv] as a cubic B-spline, in 4 bilinear taps (each pair of its 4×4 weights is one). */
+        vec4 smoothRead(highp sampler2D t, vec2 uv) {
+            vec2 size = vec2(textureSize(t, 0));
+            vec2 x = uv * size - 0.5;
+            vec2 i = floor(x);
+            vec2 f = x - i;
+            vec2 f2 = f * f;
+            vec2 f3 = f2 * f;
+            vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+            vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+            vec2 w3 = f3 / 6.0;
+            vec2 g0 = w0 + w1;
+            vec2 g1 = 1.0 - g0;
+            vec2 h0 = (i - 0.5 + w1 / g0) / size;
+            vec2 h1 = (i + 1.5 + w3 / g1) / size;
+            return g0.y * (g0.x * texture(t, h0) + g1.x * texture(t, vec2(h1.x, h0.y)))
+                 + g1.y * (g0.x * texture(t, vec2(h0.x, h1.y)) + g1.x * texture(t, h1));
+        }
+    """
+
+    /**
+     * Step 1½: what [photoFinish] needs from the coarse levels, blended onto level 1's grid (a
+     * quarter of the photo each way), so the full-size pass reads one image instead of a
+     * B-spline of each level (29 taps a pixel; 14 now, 0.8.1 read 8): log brightness over ~50 px
+     * (r) and the darkest channel over ~12 px (g); and the bloom, the highlights' colour over
+     * ~3–50 px. Open gate 4K on the X14: the dials +2.5 ms a frame.
+     */
+    val finishUp = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 16, local_size_y = 16) in;
+        // finishDown's levels as blurred as level n of the full photo's (the renderer binds them).
+        layout(binding = 0) uniform highp sampler2D uB3;
+        layout(binding = 1) uniform highp sampler2D uB5;
+        layout(binding = 2) uniform highp sampler2D uG1;
+        layout(binding = 3) uniform highp sampler2D uG2;
+        layout(binding = 4) uniform highp sampler2D uG3;
+        layout(binding = 5) uniform highp sampler2D uG4;
+        layout(binding = 6) uniform highp sampler2D uG5;
+        layout(rgba16f, binding = 0) writeonly uniform highp image2D uOut;
+        layout(rgba16f, binding = 1) writeonly uniform highp image2D uOutGlow;
+        uniform bool uGlow;  // Dehaze below 0
+        $SMOOTH_READ
+        void main() {
+            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+            ivec2 size = imageSize(uOut);
+            if (p.x >= size.x || p.y >= size.y) return;
+            vec2 uv = (vec2(p) + 0.5) / vec2(size);
+            imageStore(uOut, p, vec4(smoothRead(uB5, uv).r, smoothRead(uB3, uv).g, 0.0, 1.0));
+            if (uGlow) {
+                vec3 glow = 0.05 * smoothRead(uG1, uv).rgb + 0.25 * smoothRead(uG2, uv).rgb + 0.25 * smoothRead(uG3, uv).rgb
+                          + 0.35 * smoothRead(uG4, uv).rgb + 0.1 * smoothRead(uG5, uv).rgb;
+                imageStore(uOutGlow, p, vec4(glow, 1.0));
+            }
+        }
+    """.trimIndent()
+
+    /**
      * Step 2, on the finished view (look and all, display-referred), tuned on the owner's photos
      * (a prototype with the same pyramids, 2026-11-07; the first version barely showed: absolute
      * differences in the dark, a midtone weight that left night scenes out, a veil that only
      * flattened):
      * - Texture and Clarity act on log brightness (a ratio, so dark scenes get them too): Texture
-     *   the detail between ~2 and ~8 px of the full photo, Clarity the local contrast between ~8
-     *   and ~64 px, softened where it's strong (less halo), left out only near black and white.
-     * - Dehaze +: lifts a veil, the darkest channel over ~32 px (never above the pixel's own, at
+     *   the detail between ~1 and ~3 px of the full photo, Clarity the local contrast between ~3
+     *   and ~50 px, softened where it's strong (less halo), left out only near black and white.
+     * - Dehaze +: lifts a veil, the darkest channel over ~12 px (never above the pixel's own, at
      *   most 45 % of it, so white stays white), stretches back, and adds some local contrast and
      *   saturation. Dehaze −: a light veil toward the surroundings' brightness and a bloom: the
-     *   highlights' colour spread over ~8–64 px, screened on (owner: "bring out highlights as
-     *   bloomy").
+     *   highlights' colour spread over ~3–50 px, screened on (owner: "bring out highlights as
+     *   bloomy"), easing into white instead of clipping (a flat, hard-edged band where it did).
+     * Level 1 and finishUp's images are read as cubic B-splines ([SMOOTH_READ]). The levels and
+     * weights keep 0.8.1's radii (its pyramid blurred ~1.5× less per level; numpy fit, 2026-11-08).
      * Radii are the full photo's: the half-size viewfinder gets the pyramids one level lower, so
      * it shows what the photo will get. Amounts −1..1.
      */
@@ -1445,23 +1518,20 @@ internal object PipelineShaders {
         precision highp int;
         layout(local_size_x = 16, local_size_y = 16) in;
         layout(binding = 0) uniform highp sampler2D uView;
-        // finishDown's levels blurred to 2^n pixels of the full photo: log brightness and darkest
-        // channel (uB), the highlights' colour (uG). The renderer binds the right level for the
-        // view's size; uB1Self: at half size 2 px is the pixel itself.
-        layout(binding = 1) uniform highp sampler2D uB1;
-        layout(binding = 2) uniform highp sampler2D uB3;
-        layout(binding = 3) uniform highp sampler2D uB5;
-        layout(binding = 4) uniform highp sampler2D uB6;
-        layout(binding = 5) uniform highp sampler2D uG3;
-        layout(binding = 6) uniform highp sampler2D uG4;
-        layout(binding = 7) uniform highp sampler2D uG5;
-        layout(binding = 8) uniform highp sampler2D uG6;
+        // finishDown's levels 0 and 1 as blurred as the full photo's (log brightness; the renderer
+        // binds the right ones for the view's size; uB0Self: at half size level 0 is the pixel
+        // itself), and finishUp's images.
+        layout(binding = 1) uniform highp sampler2D uB0;
+        layout(binding = 2) uniform highp sampler2D uB1;
+        layout(binding = 3) uniform highp sampler2D uCoarse;
+        layout(binding = 4) uniform highp sampler2D uGlow;
         layout(rgba16f, binding = 0) writeonly uniform highp image2D uOut;
-        uniform bool uB1Self;
+        uniform bool uB0Self;
         uniform float uTexture;
         uniform float uClarity;
         uniform float uDehaze;
         $FINISH_COMMON
+        $SMOOTH_READ
 
         void main() {
             ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -1470,17 +1540,17 @@ internal object PipelineShaders {
             vec2 uv = (vec2(p) + 0.5) / vec2(size);
             vec3 c = clamp(texelFetch(uView, p, 0).rgb, 0.0, 1.0);
             vec2 self = brightnessAndDark(c);
-            vec2 b1 = uB1Self ? self : texture(uB1, uv).rg;
-            vec2 b3 = texture(uB3, uv).rg;
-            vec2 b6 = texture(uB6, uv).rg;
+            float b0 = uB0Self ? self.x : texture(uB0, uv).r;
+            float b1 = smoothRead(uB1, uv).r;
+            vec2 coarse = smoothRead(uCoarse, uv).rg;
             float extraClarity = 0.0;
             if (uDehaze > 0.0) {
-                float veil = 0.45 * uDehaze * min(texture(uB5, uv).g, self.y);
+                float veil = 0.45 * uDehaze * min(coarse.y, self.y);
                 c = (c - veil) / (1.0 - veil);
                 extraClarity = 0.3 * uDehaze;
             }
-            float detail = b1.x - b3.x;
-            float local = b3.x - b6.x;
+            float detail = 1.15 * (b0 - b1);
+            float local = 0.77 * (b1 - coarse.x);
             local /= 1.0 + 0.7 * abs(local);
             float lc = log2(dot(c, W709) + EPS);
             float midtones = smoothstep(-7.0, -4.5, lc) * (1.0 - smoothstep(-0.7, 0.0, lc));
@@ -1492,9 +1562,14 @@ internal object PipelineShaders {
                 c = vec3(y) + (c - vec3(y)) * (1.0 + 0.25 * uDehaze);
             } else if (uDehaze < 0.0) {
                 float s = -uDehaze;
-                vec3 glow = 0.15 * texture(uG3, uv).rgb + 0.25 * texture(uG4, uv).rgb + 0.3 * texture(uG5, uv).rgb + 0.3 * texture(uG6, uv).rgb;
-                c += (vec3(0.05 + 0.7 * exp2(b6.x)) - c) * (0.12 * s);
-                c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - clamp(2.5 * s * glow, 0.0, 1.0));
+                vec3 glow = smoothRead(uGlow, uv).rgb;
+                c += (vec3(0.05 + 0.7 * exp2(coarse.x)) - c) * (0.12 * s);
+                // The bloom's strength, easing into 1 over 0.65..1.35 (quadratic knee) instead of clipping.
+                const float KNEE = 0.35;
+                vec3 x = 2.5 * s * glow;
+                vec3 over = clamp(x - (1.0 - KNEE), 0.0, 2.0 * KNEE);
+                vec3 amount = min(x - over * over / (4.0 * KNEE), 1.0);
+                c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - amount);
             }
             imageStore(uOut, p, vec4(clamp(c, 0.0, 1.0), 1.0));
         }

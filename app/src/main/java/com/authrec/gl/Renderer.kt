@@ -2053,22 +2053,43 @@ class Renderer(
             }
         }
         val out = Gl.texture2D(GLES30.GL_RGBA16F, width, height, linear = true)
+        /** finishUp's images, on the grid of the level read as the full photo's level 1 ([coarseLevel]). */
+        var coarseLevel = -1
+            private set
+        var coarse = 0
+            private set
+        var coarseGlow = 0
+            private set
+        fun coarseAt(level: Int) {
+            if (level == coarseLevel) return
+            releaseCoarse()
+            coarse = Gl.texture2D(GLES30.GL_RGBA16F, levelW[level], levelH[level], linear = true)
+            coarseGlow = Gl.texture2D(GLES30.GL_RGBA16F, levelW[level], levelH[level], linear = true)
+            coarseLevel = level
+        }
+        private fun releaseCoarse() {
+            if (coarseLevel >= 0) GLES30.glDeleteTextures(2, intArrayOf(coarse, coarseGlow), 0)
+            coarseLevel = -1
+        }
         fun release() {
             GLES30.glDeleteTextures(FINISH_LEVELS, brightness, 0)
             GLES30.glDeleteTextures(FINISH_LEVELS, glow, 0)
             GLES30.glDeleteTextures(1, intArrayOf(out), 0)
+            releaseCoarse()
         }
     }
     /** The viewfinder's (half size), and the photo's (full size, until the photo has been shown). */
     private var viewFinish: FinishTarget? = null
     private var photoFinish: FinishTarget? = null
     private var finishDownProgram = 0
+    private var finishUpProgram = 0
     private var finishProgram = 0
 
     /** Photo mode's dials on [view] into [t] ([viewOctave]: 0 the full photo, 1 half its size). */
     private fun applyFinish(view: Int, t: FinishTarget, viewOctave: Int) {
         if (finishProgram == 0) {
             finishDownProgram = Gl.computeProgram(PipelineShaders.finishDown)
+            finishUpProgram = Gl.computeProgram(PipelineShaders.finishUp)
             finishProgram = Gl.computeProgram(PipelineShaders.photoFinish)
         }
         GLES30.glUseProgram(finishDownProgram)
@@ -2082,14 +2103,26 @@ class Renderer(
             GLES31.glDispatchCompute((t.levelW[k] + 15) / 16, (t.levelH[k] + 15) / 16, 1)
             GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
         }
+        // The level as blurred as level [n] of the full photo's, for a view [viewOctave] octaves smaller.
+        fun level(n: Int) = (n - viewOctave).coerceIn(0, FINISH_LEVELS - 1)
+        t.coarseAt(level(1))
+        GLES30.glUseProgram(finishUpProgram)
+        Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, t.brightness[level(3)])
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, t.brightness[level(5)])
+        (1..5).forEachIndexed { i, n -> Gl.bindTexture(2 + i, GLES30.GL_TEXTURE_2D, t.glow[level(n)]) }
+        GLES31.glBindImageTexture(0, t.coarse, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES31.glBindImageTexture(1, t.coarseGlow, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+        GLES30.glUniform1i(Gl.uniform(finishUpProgram, "uGlow"), if (photoDehaze < 0f) 1 else 0)
+        GLES31.glDispatchCompute((t.levelW[t.coarseLevel] + 15) / 16, (t.levelH[t.coarseLevel] + 15) / 16, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
         GLES30.glUseProgram(finishProgram)
-        // The level blurred to 2^octave pixels of the full photo, for a view [viewOctave] octaves smaller.
-        fun level(octave: Int) = (octave - viewOctave - 1).coerceIn(0, FINISH_LEVELS - 1)
         Gl.bindTexture(0, GLES30.GL_TEXTURE_2D, view)
-        listOf(1, 3, 5, 6).forEachIndexed { i, octave -> Gl.bindTexture(1 + i, GLES30.GL_TEXTURE_2D, t.brightness[level(octave)]) }
-        listOf(3, 4, 5, 6).forEachIndexed { i, octave -> Gl.bindTexture(5 + i, GLES30.GL_TEXTURE_2D, t.glow[level(octave)]) }
+        Gl.bindTexture(1, GLES30.GL_TEXTURE_2D, t.brightness[level(0)])
+        Gl.bindTexture(2, GLES30.GL_TEXTURE_2D, t.brightness[level(1)])
+        Gl.bindTexture(3, GLES30.GL_TEXTURE_2D, t.coarse)
+        Gl.bindTexture(4, GLES30.GL_TEXTURE_2D, t.coarseGlow)
         GLES31.glBindImageTexture(0, t.out, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
-        GLES30.glUniform1i(Gl.uniform(finishProgram, "uB1Self"), if (1 - viewOctave - 1 < 0) 1 else 0)
+        GLES30.glUniform1i(Gl.uniform(finishProgram, "uB0Self"), if (viewOctave > 0) 1 else 0)
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uTexture"), photoTexture)
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uClarity"), photoClarity)
         GLES30.glUniform1f(Gl.uniform(finishProgram, "uDehaze"), photoDehaze)

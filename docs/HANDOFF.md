@@ -105,6 +105,13 @@ room (ISO 3200, magenta LEDs), then by the owner in daylight (items 33–38):
 
 ## Start here (next session)
 
+0000000. **Unreleased (branch, 2026-11-08)**: feedback/notes.md item 89. The dials no longer look
+    "jagged": their pyramid filters each level past 0 with [1 3 3 1] (2×2 means aliased) and the
+    coarse levels are read as cubic B-splines (bilinear showed every texel as a crease, a
+    staircase along diagonal edges); a new small pass (`finishUp`) blends the coarse levels onto
+    level 1's grid so the full-size pass stays cheap (open gate 4K with dials +2.5 ms a frame).
+    The bloom eases into white instead of clipping. Same radii and strengths as 0.8.1.
+
 000000. **0.8.1 (2026-11-07)**: feedback/notes.md item 88. Texture / Clarity / Dehaze rebuilt
     (log brightness, a capped veil for Dehaze +, a highlight bloom for Dehaze −; tuned with a
     numpy prototype on the owner's photos) and applied to look-baked recordings too (Pro and
