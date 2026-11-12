@@ -19,8 +19,8 @@ android {
         applicationId = "com.authrec"
         minSdk = 31
         targetSdk = 36
-        versionCode = 17
-        versionName = "0.9.0"
+        versionCode = 18
+        versionName = "0.9.1"
         // Android 12+ phones are 64-bit Arm; other ABIs would only grow the APK.
         ndk { abiFilters += "arm64-v8a" }
         externalNativeBuild {
