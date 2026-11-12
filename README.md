@@ -15,6 +15,7 @@ balance, colour matrix, lens shading).
 - Live 3D LUTs and looks; look editor that exports `.cube`; LUT import available
 - Profiles: the look with its adjustments, the video format and noise reduction, saved under a name
 - eDR (extended dynamic range) - customizable highlight and shadow recovery
+- EVO (exposure value optimizer) - eases the exposure down, smoothly, when bright surfaces blow out
 - Temporal colour noise reduction with hot pixel fix
 - AE Auto / Priority / Locked / Manual, ISO and shutter
 - Tap to focus and follow, long-press to lock; native or contrast-detect AF; focus peaking

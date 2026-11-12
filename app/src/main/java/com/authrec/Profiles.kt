@@ -10,8 +10,10 @@ import org.json.JSONObject
 /**
  * A named set of settings to pull out again in one tap, from the top of the Look menu (owner:
  * "whatever dials you had, lut, settings etc - you can create a profile and name it, for example
- * 'B&W Dreamy'", 2026-11-08): the look and everything on it (Adjust, eDR, the dials), the video
- * format and colour NR. Exposure and the lens stay out: they belong to the scene, not the style.
+ * 'B&W Dreamy'", 2026-11-08): the look and everything on it (Adjust, eDR, the dials) and the video
+ * format. Exposure and the lens stay out: they belong to the scene, not the style. So does colour
+ * NR (owner, 2026-11-12: "that is up for whatever the user had on"; profiles saved with it load
+ * without).
  */
 internal data class Profile(
     val name: String,
@@ -35,8 +37,6 @@ internal data class Profile(
     val bitrate: Int,
     val recordLook: Boolean,
     val logProfile: LogProfile,
-    val cleanup: Int,
-    val nrFast: Boolean,
 ) {
     /** The same settings, whatever the name. */
     fun sameSettings(other: Profile) = copy(name = "") == other.copy(name = "")
@@ -49,7 +49,7 @@ internal data class Profile(
         .put("texture", texture).put("clarity", clarity).put("dehaze", dehaze)
         .put("aspect", aspect.name).put("superpixel", superpixel).put("fps", fps)
         .put("codec", codec.name).put("bitrate", bitrate).put("recordLook", recordLook)
-        .put("logProfile", logProfile.name).put("cleanup", cleanup).put("nrFast", nrFast)
+        .put("logProfile", logProfile.name)
 
     companion object {
         private const val KEY = "profiles"
@@ -86,8 +86,6 @@ internal data class Profile(
             bitrate = o.getInt("bitrate"),
             recordLook = o.getBoolean("recordLook"),
             logProfile = LogProfile.valueOf(o.getString("logProfile")),
-            cleanup = o.getInt("cleanup"),
-            nrFast = o.getBoolean("nrFast"),
         )
     }
 }

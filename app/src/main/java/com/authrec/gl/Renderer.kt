@@ -30,6 +30,7 @@ import kotlin.math.abs
 import kotlin.math.log2
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
  * Owns the GL thread: runs the compute pipeline on each RAW frame at full sensor resolution,
@@ -95,6 +96,170 @@ class Renderer(
     @Volatile var exposureTarget: Double = Double.NaN
     private var shownExposure = Double.NaN
     private var exposureComp = 1f
+
+    /**
+     * AE compensation asked of the camera, in EV (AE Auto / Locked; 0 in the modes that don't use
+     * it). The camera takes a few frames to get there, and how many is its business: the picture
+     * is evened out against each frame's own exposure meanwhile ([compLagEv]), so a step of real
+     * exposure (EVO's, in the phone's ⅙ or ⅓ stops) shows as a gradual change of noise, never as
+     * a brightness step, and a drag of the EV slider no longer jumps and settles.
+     */
+    @Volatile var aeCompEv = 0f
+    /** The compensation the frames really have so far (NaN: not started), on its way from [compFrom] to [compTo]. */
+    private var compShown = Float.NaN
+    private var compFrom = 0f
+    private var compTo = 0f
+    /** ISO × ns of the last frame before the change, and seconds since it. */
+    private var compRef = Double.NaN
+    private var compSince = 0f
+    private var compProgress = 1f
+    private var lastFrameExposure = Double.NaN
+    /** EV of digital gain standing in for compensation the sensor hasn't delivered yet. */
+    @Volatile private var compLagEv = 0f
+    private var frameStepEv = 0f
+    /** EVO asked for the change of compensation that's about to arrive (not the user's EV slider). */
+    private var evoAsked = false
+    /**
+     * The real exposure EVO has as the frames show it, in EV: every change of ISO × shutter after
+     * a request counts as its doing, until the exposure has stood still for a moment (1.2–3 s).
+     * Measured, not assumed, because a camera metering a clipped scene moves further than it's
+     * asked (X14: asked −1.2, went −2.0, and the picture came out 0.8 EV darker for it,
+     * 2026-11-12). The picture is evened out against this ([evoCorrectionEv]), so a step never
+     * shows. With no request left it goes back to nothing in a couple of seconds.
+     */
+    private var evoDelivered = 0f
+    private var evoWindow = 0f
+    private var evoSinceAsk = 10f
+    private var evoStillFrames = 0
+    /** EV of digital gain making up the difference between what EVO asked of the sensor and what it got. */
+    @Volatile private var evoCorrectionEv = 0f
+
+    private fun updateCompLag(frameExposure: Double, dt: Float) {
+        val asked = aeCompEv
+        if (compShown.isNaN()) {
+            // A new session starts with the compensation in place.
+            compShown = asked
+            compTo = asked
+        } else if (asked != compTo) {
+            compFrom = compShown
+            compTo = asked
+            compRef = lastFrameExposure
+            compSince = 0f
+            compProgress = 0f
+            // EVO's own steps are evened out by what the sensor is measured to do (updateEvo), not here.
+            if (evoAsked) compShown = asked
+            evoAsked = false
+        }
+        if (compShown != compTo) {
+            compSince += dt
+            val span = compTo - compFrom
+            var p = 0f
+            if (!frameExposure.isNaN() && !compRef.isNaN() && compRef > 0 && abs(span) > 1e-3f) {
+                p = (log2((frameExposure / compRef).toFloat()) / span).coerceIn(0f, 1f)
+            }
+            // A camera at the end of its range never gets there: then cross over slowly instead.
+            val t = ((compSince - 0.6f) / 0.8f).coerceIn(0f, 1f)
+            compProgress = maxOf(compProgress, p, t * t * (3f - 2f * t))
+            compShown = if (compProgress >= 1f) compTo else compFrom + span * compProgress
+        }
+        compLagEv = compTo - compShown
+        // How far this frame's exposure moved from the one before.
+        frameStepEv = if (!frameExposure.isNaN() && !lastFrameExposure.isNaN() && lastFrameExposure > 0)
+            log2((frameExposure / lastFrameExposure).toFloat()).coerceIn(-3f, 3f) else 0f
+        lastFrameExposure = frameExposure
+    }
+
+    // ---- EVO: the Exposure Value Optimizer (see Evo) ----
+
+    /** Following the scene, holding (exposure locked, a photo burst under way) or off. */
+    @Volatile var evoMode: Evo.Mode = Evo.Mode.OFF
+    /** Scene brightness the view shows as white, and what a clip keeps as white (Evo.update). */
+    @Volatile var evoWhite = 2f
+    @Volatile var evoRecordedWhite = 2f
+    /** The user's own EV: taken out of what EVO looks at, so their bias stays on top of its choice. */
+    @Volatile var evoUserEv = 0f
+    /** EVO may ask for real exposure (AE Auto, kept in Locked). Priority keeps to the user's limits: the view only. */
+    @Volatile var evoSensorAllowed = false
+    /** 0 gentle, 1 balanced, 2 strong (Evo.strength). */
+    @Volatile var evoStrength = 1
+    /** Called on the GL thread when the real exposure EVO asks for changes (EV, whole AE steps). */
+    @Volatile var onEvoSensor: ((Float) -> Unit)? = null
+    /** For the screen: EVO's shift of the view and of real exposure (EV, as measured), and the share of the picture blown out with and without it. */
+    @Volatile var evoViewEv = 0f
+        private set
+    @Volatile var evoSensorEv = 0f
+        private set
+    @Volatile var evoBlown = 0f
+        private set
+    @Volatile var evoBlownWithout = 0f
+        private set
+    /** The sensor's usable range at this ISO in stops, clip point over read noise (NaN: no frame yet). */
+    @Volatile var sensorRangeStops = Float.NaN
+        private set
+    /** Debug (adb evoverbose=true): log EVO's state twice a second. */
+    @Volatile var evoVerbose = false
+    private var evoLogged = 0
+    private val evo = Evo()
+    private val evoMeasure = Evo.Measure()
+    private val gridX = FloatArray(GRID_COLS * GRID_ROWS)
+    private val gridShade = FloatArray(GRID_COLS * GRID_ROWS)
+
+    private fun updateEvo(meta: FrameMeta?, dt: Float) {
+        val mode = evoMode
+        val noise = meta?.noise?.getOrNull(1)?.takeIf { it > 0f }?.let { sqrt(it) } ?: 0f
+        if (meta != null) sensorRangeStops = Evo.rangeStops(noise)
+        if (!evoSensorAllowed && (evo.sensorEv != 0f || evoDelivered != 0f)) {
+            evo.dropSensor()
+            evoDelivered = 0f
+            evoWindow = 0f
+        }
+        // EVO's real exposure as the frames have it.
+        evoSinceAsk += dt
+        evoStillFrames = if (abs(frameStepEv) > 0.01f) 0 else evoStillFrames + 1
+        if (evoWindow > 0f) {
+            evoDelivered = (evoDelivered + frameStepEv).coerceIn(-3f, 3f)
+            // Open while the camera is still on its way (it overshoots and comes back), 3 s at most.
+            if ((evoSinceAsk >= 1.2f && evoStillFrames >= 6) || evoSinceAsk >= 3f) evoWindow = 0f
+        } else if (evo.sensorEv == 0f) {
+            evoDelivered *= kotlin.math.exp(-dt / 2f)
+            if (abs(evoDelivered) < 0.005f) evoDelivered = 0f
+        }
+        evoCorrectionEv = evo.sensorEv - evoDelivered
+        if (meta == null || (mode == Evo.Mode.OFF && evo.viewEv == 0f && evo.sensorEv == 0f)) {
+            evoViewEv = evo.viewEv
+            evoSensorEv = evoDelivered
+            return
+        }
+        if (mode == Evo.Mode.RUN) evoMeasure.fill(gridX, gridShade, GRID_COLS, GRID_ROWS)
+        // The picture's gain without EVO's shift and the user's EV; value × gain has middle grey at 0.18.
+        val gain = currentGain() / 2f.pow(evo.viewEv + evoUserEv)
+        val lo = if (evoSensorAllowed) sensor.evRange.lower * sensor.evStep - evoUserEv else 0f
+        val hi = if (evoSensorAllowed) sensor.evRange.upper * sensor.evStep - evoUserEv else 0f
+        // Brightening is for scenes with light to spare: a dim room stays as dim as the meter and the night limit left it.
+        val push = meta.iso * gain < EVO_PUSH_MAX_ISO
+        val actual = evoDelivered
+        // The last request has shown its effect (the exposure has stopped moving), or isn't going to.
+        val settled = (evoSinceAsk >= 0.3f && evoStillFrames >= 4) || evoSinceAsk >= 1.2f
+        val asked = evo.sensorEv
+        evo.strength = evoStrength
+        evo.update(evoMeasure, gain, evoWhite, evoRecordedWhite, noise, actual, settled, sensor.evStep, lo, hi, push, mode, dt)
+        if (evo.sensorEv != asked) {
+            evoAsked = true
+            evoWindow = 1.2f
+            evoSinceAsk = 0f
+            evoStillFrames = 0
+            evoCorrectionEv = evo.sensorEv - evoDelivered
+            onEvoSensor?.invoke(evo.sensorEv)
+        }
+        if (evoVerbose && ++evoLogged % 15 == 0) android.util.Log.i("AuthRec",
+            "EVO view %+.2f (wants %+.2f) sensor %+.2f (wants %+.2f, has %+.2f) blown %.1f%% -> %.1f%% surfaces %.1f%% sources %.1f%% gain %.2f white %.1f iso %d".format(
+                evo.viewEv, evo.viewWanted, evo.sensorEv, evo.sensorWanted, actual, evo.blownWithout * 100, evo.blownNow * 100,
+                evoMeasure.surfaces * 100, evoMeasure.sources * 100, gain, evoWhite, meta.iso))
+        evoViewEv = evo.viewEv
+        evoSensorEv = evoDelivered
+        evoBlown = evo.blownNow
+        evoBlownWithout = evo.blownWithout
+    }
     /**
      * Share of the image the view shows blown out although the RAW still holds it (more than
      * ~3.5 stops over middle grey after the gain, sensor not clipped): what eDR brings back.
@@ -160,7 +325,9 @@ class Renderer(
         val knee = nightKneeIso
         if (iso == null || iso <= 0) return
         val target = if (!nightLimit || knee <= 0f) 0f else
-            (log2(iso * 2f.pow(auto - sensorCompEv) / knee) * (1f - NIGHT_SLOPE)).coerceAtLeast(0f)
+            // (Of EVO's part of the compensation, what the sensor really did: a camera at its ISO
+            // limit ignores a step, and the night limit mustn't react to one that changed nothing.)
+            (log2(iso * 2f.pow(auto - (sensorCompEv - evoCorrectionEv)) / knee) * (1f - NIGHT_SLOPE)).coerceAtLeast(0f)
         // ~0.4 s to follow, so ISO steps (Priority's, the ISP's) don't show as brightness steps;
         // a new lens starts where it belongs rather than bright and fading down.
         nightCut = if (nightCutStarted) nightCut + (target - nightCut) * 0.08f else target
@@ -168,7 +335,8 @@ class Renderer(
     }
 
     /** All digital gain before the log curve, in EV (auto gain or its default after the night limit, plus the user's). */
-    val totalGainEv: Float get() = (if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv) - nightCut + exposureOffsetEv
+    val totalGainEv: Float get() = (if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv) - nightCut + exposureOffsetEv + compLagEv +
+        evoViewEv + evoCorrectionEv
     @Volatile var lutStrength: Float = 1f
     /**
      * Tone balance of the view, -1..1 each (see PipelineShaders.finish `balanceTone`): pulls the
@@ -792,6 +960,10 @@ class Renderer(
             updateAutoGain(raw)
         }
         updateExposureComp(frameExposure)
+        val dt = if (lastTimestamp != 0L) ((timestamp - lastTimestamp) / 1e9f).coerceIn(0.001f, 0.2f) else 1f / 30
+        lastTimestamp = timestamp
+        updateCompLag(frameExposure, dt)
+        updateEvo(meta, dt)
         sharpnessRegion?.let {
             sharpness = measureSharpness(image, it)
             sharpnessTimestamp = timestamp
@@ -963,7 +1135,10 @@ class Renderer(
         rec.onFailed(why)
     }
 
-    /** Log-average of normalised green RAW samples on a coarse grid (green: same CFA colour everywhere). */
+    /**
+     * Log-average of normalised green RAW samples on a grid (green: same CFA colour everywhere).
+     * The samples and the lens shading gain at each stay in [gridX] / [gridShade] for EVO.
+     */
     private fun rawLogAverage(image: Image, meta: FrameMeta?): Float? {
         meta ?: return null
         val plane = image.planes[0]
@@ -976,13 +1151,17 @@ class Renderer(
         var clipped = 0
         var recoverable = 0
         val gain = currentGain()
-        for (gy in 1 until 24) for (gx in 1 until 32) {
+        val shading = meta.shading?.takeIf { meta.shadingCols > 0 && meta.shadingRows > 0 && it.size >= meta.shadingCols * meta.shadingRows * 4 }
+        for (gy in 1..GRID_ROWS) for (gx in 1..GRID_COLS) {
             // Green on a red row: red's row, the other column parity.
-            val x = ((w * gx / 32) and 1.inv()) + (1 - rx)
-            val y = ((h * gy / 24) and 1.inv()) + ry
+            val x = ((w * gx / (GRID_COLS + 1)) and 1.inv()) + (1 - rx)
+            val y = ((h * gy / (GRID_ROWS + 1)) and 1.inv()) + ry
             val v = ((buf.getShort(y * plane.rowStride + x * 2).toInt() and 0xFFFF) - black) / range
             sum += Math.log(v.coerceAtLeast(0f) + 1e-4)
             if (v > 0.9f) clipped++ else if (v * gain > 2f) recoverable++
+            gridX[n] = v
+            gridShade[n] = if (shading == null) 1f else
+                shading[((gy * meta.shadingRows / (GRID_ROWS + 1)) * meta.shadingCols + gx * meta.shadingCols / (GRID_COLS + 1)) * 4 + 1].coerceAtLeast(1f)
             n++
         }
         rawClipFraction = clipped.toFloat() / n
@@ -1082,6 +1261,9 @@ class Renderer(
     }
 
     private fun currentGain(): Float = 2f.pow(totalGainEv) * exposureComp
+
+    /** Sensor timestamp of the frame before (0: none yet), for the time between frames. */
+    private var lastTimestamp = 0L
 
     private fun updateExposureComp(frameExposure: Double) {
         val target = exposureTarget
@@ -2312,6 +2494,11 @@ class Renderer(
         /** Until the first measurement arrives. */
         const val DEFAULT_GAIN_EV = 2f
         /** Night limit (see [nightKneeIso]): where it starts (the EV slider's amber point) and how much of each stop above it still lifts. */
+        /** The grid of RAW samples each frame is measured on (auto gain, clipping, EVO). */
+        private const val GRID_COLS = 63
+        private const val GRID_ROWS = 47
+        /** EVO brightens only below this effective ISO (sensor ISO × gain): scenes with light to spare. */
+        private const val EVO_PUSH_MAX_ISO = 1600f
         const val NIGHT_KNEE_ISO = 3200f
         private const val NIGHT_SLOPE = 0.5f
         /** Frames over which a recording's frame time is averaged (see watchBudget), and those skipped first. */

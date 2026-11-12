@@ -40,6 +40,7 @@ import com.authrec.camera.RawCamera
 import com.authrec.color.CubeLut
 import com.authrec.color.LogProfile
 import com.authrec.color.Look
+import com.authrec.gl.Evo
 import com.authrec.color.Looks
 import com.authrec.gl.Renderer
 import com.authrec.record.PhotoSaver
@@ -158,6 +159,19 @@ class CameraActivity : Activity() {
      */
     internal var edrOn = false
         private set
+    /**
+     * EVO, the Exposure Value Optimizer (com.authrec.gl.Evo; owner's idea, 2026-11-12): moves the
+     * exposure so bright surfaces aren't blown out, on top of the meter and under the user's own
+     * EV. In AE Auto it shifts the view and, where the sensor itself clips, real exposure; in
+     * Priority the view only (the limits are the user's); Locked holds it; Manual has none.
+     */
+    internal var evoOn = false
+        private set
+    /** How readily EVO darkens: 0 gentle, 1 balanced, 2 strong (Settings; owner: "change EVO aggression/strength"). */
+    internal var evoStrength = 1
+        private set
+    /** Real exposure EVO asks for right now (EV, whole AE steps; the renderer's, see applyExposure). */
+    private var evoSensorEv = 0f
     internal var edrHighlights = EDR_HIGHLIGHTS
         private set
     internal var edrShadows = EDR_SHADOWS
@@ -397,6 +411,8 @@ class CameraActivity : Activity() {
         bakeLut = prefs.getBoolean("recordLook", true)
         cleanup = prefs.getInt("cleanup", 2)
         nrFast = prefs.getBoolean("nrFast", false)
+        evoOn = prefs.getBoolean("evo", false)
+        evoStrength = prefs.getInt("evoStrength", 1).coerceIn(0, 2)
         if (prefs.contains("edrOn")) {
             edrOn = prefs.getBoolean("edrOn", false)
             edrHighlights = prefs.getInt("edrHi", EDR_HIGHLIGHTS)
@@ -445,6 +461,8 @@ class CameraActivity : Activity() {
             .putInt("cleanup", cleanup)
             .putBoolean("nrFast", nrFast)
             .putBoolean("edrOn", edrOn)
+            .putBoolean("evo", evoOn)
+            .putInt("evoStrength", evoStrength)
             .putInt("edrHi", edrHighlights)
             .putInt("edrLo", edrShadows)
             .remove("toneHi")
@@ -630,6 +648,66 @@ class CameraActivity : Activity() {
         saveSoon()
     }
 
+    internal fun setEvo(on: Boolean) {
+        evoOn = on
+        applyEvo()
+        updateUi()
+        saveSoon()
+    }
+
+    internal fun setEvoStrength(level: Int) {
+        evoStrength = level.coerceIn(0, 2)
+        applyEvo()
+        settingsChanged()
+    }
+
+    internal fun evoStrengthLabel() = arrayOf("gentle", "balanced", "strong")[evoStrength]
+
+    /** Tells the renderer whether EVO runs and what counts as white (the view's, and a clip's). */
+    private fun applyEvo() {
+        val r = renderer ?: return
+        r.evoStrength = evoStrength
+        r.evoMode = when {
+            !evoOn || capture.ae == AeMode.MANUAL -> Evo.Mode.OFF
+            // Locked means locked; and a burst's frames must match each other.
+            capture.ae == AeMode.LOCKED || photoBusy -> Evo.Mode.HOLD
+            else -> Evo.Mode.RUN
+        }
+        val white = viewWhite()
+        r.evoWhite = white
+        r.evoRecordedWhite = if (bakeLut || simple || photo) white else Evo.LOG_WHITE
+    }
+
+    /** The look as last given to the renderer (null: the plain log view), for [viewWhite]. */
+    private var viewLut: CubeLut? = null
+    private var whiteKey: List<Any?>? = null
+    private var whiteValue = Evo.LOG_WHITE
+
+    /**
+     * The scene brightness the current view shows as white (Evo.whiteOfLook), worked out again when
+     * the look, its strength, the log profile or eDR change. The plain log view shows everything
+     * the sensor holds.
+     */
+    private fun viewWhite(): Float {
+        val lut = viewLut ?: return Evo.LOG_WHITE
+        val edr = if (edrOn && edrAvailable()) edrHighlights / 100f else 0f
+        val input = renderer?.lutInput
+        val key = listOf(lut, profile, input, lutStrength, edr)
+        if (key != whiteKey) {
+            whiteValue = Evo.whiteOfLook(lut, profile, input, lutStrength / 100f, edr)
+            whiteKey = key
+            if (evoOn) EventLog.log("EVO: \"${currentView()?.label}\" goes white %.1f stops over middle grey".format(kotlin.math.log2(whiteValue / 0.18f)))
+        }
+        return whiteValue
+    }
+
+    /** What EVO is doing, for the controls: null when off or at rest, else its shift of the picture in EV. */
+    internal fun evoShift(): Float? = renderer?.takeIf { evoOn }?.let { r ->
+        val shown = r.evoViewEv
+        val sensor = r.evoSensorEv
+        (if (abs(shown) >= 0.05f) shown else sensor).takeIf { abs(it) >= 0.05f }
+    }
+
     /** Shapes the eDR curve (both −100..100) and switches it on. */
     internal fun setEdrCurve(highlights: Int, shadows: Int) {
         edrHighlights = highlights.coerceIn(-100, 100)
@@ -688,26 +766,37 @@ class CameraActivity : Activity() {
         // The auto gain follows the ISP's rendering, which only means something while the ISP runs
         // AE uncompensated: the ISP's tone mapping partly undoes exposure compensation, and a
         // gain chasing it would cancel the user's EV. So it learns at EV 0 in AUTO and holds otherwise.
-        r?.autoGainFrozen = capture.ae == AeMode.MANUAL || capture.ae == AeMode.PRIORITY || abs(exposureEv) > 0.05f
+        // EVO's real exposure rides on AE compensation too (Auto; Locked keeps what it had).
+        val evoSensor = if (capture.ae == AeMode.AUTO || capture.ae == AeMode.LOCKED) evoSensorEv else 0f
+        r?.autoGainFrozen = capture.ae == AeMode.MANUAL || capture.ae == AeMode.PRIORITY || abs(exposureEv) > 0.05f || evoSensor != 0f
         r?.nightLimit = capture.ae != AeMode.MANUAL
+        r?.evoUserEv = exposureEv
+        r?.evoSensorAllowed = capture.ae == AeMode.AUTO || capture.ae == AeMode.LOCKED
         when (capture.ae) {
             AeMode.AUTO, AeMode.LOCKED -> {
                 val info = camera?.info
                 val step = info?.evStep ?: (1f / 3)
-                val steps = Math.round(exposureEv / step).coerceIn(info?.evRange?.lower ?: 0, info?.evRange?.upper ?: 0)
+                // Rounded apart: the user's 0.1 EV and EVO's whole steps mustn't swallow each other.
+                val steps = (Math.round(exposureEv / step) + Math.round(evoSensor / step)).coerceIn(info?.evRange?.lower ?: 0, info?.evRange?.upper ?: 0)
+                // The picture gets the user's EV; what the sensor got of it and of EVO's is evened
+                // out digitally (the renderer adds EVO's view shift and the frames still on their way).
                 r?.exposureOffsetEv = exposureEv - steps * step
                 r?.sensorCompEv = steps * step
+                r?.aeCompEv = steps * step
                 if (steps != capture.evSteps) setCapture(capture.copy(evSteps = steps), updateUiNow = false)
             }
             AeMode.PRIORITY -> {
                 r?.exposureOffsetEv = 0f // the loop's target carries it
                 r?.sensorCompEv = exposureEv
+                r?.aeCompEv = 0f
             }
             AeMode.MANUAL -> {
                 r?.exposureOffsetEv = exposureEv
                 r?.sensorCompEv = 0f
+                r?.aeCompEv = 0f
             }
         }
+        applyEvo()
     }
 
     private fun updateFocusLabel() {
@@ -758,6 +847,7 @@ class CameraActivity : Activity() {
     internal fun updateUi() {
         if (!::ui.isInitialized) return
         syncResolution()
+        applyEvo()
         val mf = manualFocus
         focusBar.visibility = if (mf) View.VISIBLE else View.GONE
         if (mf) {
@@ -1645,7 +1735,7 @@ class CameraActivity : Activity() {
         wbWarm = wbWarmth, wbTint = wbTint, edrOn = edrOn, edrHi = edrHighlights, edrLo = edrShadows,
         texture = photoTexture, clarity = photoClarity, dehaze = photoDehaze,
         aspect = aspect, superpixel = superpixel, fps = capture.fps, codec = codec, bitrate = bitrateMbps,
-        recordLook = bakeLut, logProfile = profile, cleanup = cleanup, nrFast = nrFast,
+        recordLook = bakeLut, logProfile = profile,
     )
 
     /** Whether the current settings are [p]'s (the list marks it). */
@@ -1655,8 +1745,8 @@ class CameraActivity : Activity() {
     internal fun profilesUsable() = recorder == null && !stopping && !photoBusy
 
     internal fun promptSaveProfile() = askProfileName("Save as profile",
-        "Keeps the look with its Adjust, eDR and Texture / Clarity / Dehaze, the video format and colour NR " +
-            "(not exposure or the lens). A name you already use updates that profile.",
+        "Keeps the look with its Adjust, eDR and Texture / Clarity / Dehaze, and the video format " +
+            "(not exposure, the lens or noise reduction). A name you already use updates that profile.",
         profiles.firstOrNull { profileActive(it) }?.name ?: "", "Save") { saveProfile(it) }
 
     // No keyboard at first: in landscape it covers the dialog's buttons (Delete).
@@ -1702,10 +1792,6 @@ class CameraActivity : Activity() {
         bitrateMbps = p.bitrate
         if (bitrateMbps !in bitrateOptions()) bitrateMbps = bitrateOptions().minBy { abs(it - bitrateMbps) }
         bakeLut = p.recordLook
-        cleanup = p.cleanup.coerceIn(0, 3)
-        renderer?.cleanup = cleanup
-        nrFast = p.nrFast
-        renderer?.nrFast = nrFast
         applyView()
         applyLookAdjust()
         applyWbShift()
@@ -2014,6 +2100,16 @@ class CameraActivity : Activity() {
         val r = Renderer(cam.info, cam.reader, { ts -> cam.metaFor(ts) }, { ts -> cam.metaArrived(ts) }, { cam.ispLinearLogAverage },
             rendererTenBit) { stats ->
             runOnUiThread { showStats(stats) }
+        }
+        // A new renderer's EVO starts from nothing: so does what it had asked of the sensor.
+        evoSensorEv = 0f
+        r.onEvoSensor = { ev ->
+            runOnUiThread {
+                if (renderer === r && evoSensorEv != ev) {
+                    evoSensorEv = ev
+                    applyExposure()
+                }
+            }
         }
         r.onNrShed = { why ->
             EventLog.log("Colour clean-up off for this clip: $why")
@@ -2505,7 +2601,8 @@ class CameraActivity : Activity() {
             "${profile.name}, ${if (bakeLut || simple) "look baked" else "log"}" +
             (if (bakeLut && !simple && (photoTexture != 0 || photoClarity != 0 || photoDehaze != 0))
                 " (texture %+d clarity %+d dehaze %+d)".format(photoTexture, photoClarity, photoDehaze) else "") + ", clean $cleanup, " +
-            "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, WB shift $wbWarmth/$wbTint, " +
+            "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, " +
+            (if (evoOn) "EVO %+.1f EV (sensor %+.1f), ".format(r.evoViewEv, r.evoSensorEv) else "") + "WB shift $wbWarmth/$wbTint, " +
             (if (mirrored()) "mirrored, " else "") +
             (if (turn != 0) "turned $turn° (phone held ${if (turn % 180 == 0) "upside down" else "upright"}), " else "") +
             "battery %.1f °C".format(batteryTempC))
@@ -2696,6 +2793,8 @@ class CameraActivity : Activity() {
         }
         r.lutInput = (views.getOrNull(viewIndex) as? ViewEntry.CubeFile)?.let { lutInputOf(it.file) }
         r.setLut(lut)
+        viewLut = lut
+        applyEvo()
     }
 
     private fun showStats(stats: Renderer.Stats) {
@@ -2728,6 +2827,16 @@ class CameraActivity : Activity() {
                 renderer?.lutInput?.takeIf { it != profile && views.getOrNull(viewIndex) is ViewEntry.CubeFile }
                     ?.let { append("\nLUT expects ${it.label}: converting from ${profile.label}") }
                 if (capture.ae == AeMode.PRIORITY && priorityAtLimit) append("\n⚠ priority limits reached: image darker than target")
+                renderer?.takeIf { evoOn }?.let { r ->
+                    append("\nEVO " + when (r.evoMode) {
+                        Evo.Mode.OFF -> "off in Manual"
+                        Evo.Mode.HOLD -> "held %+.1f EV".format(r.evoViewEv)
+                        Evo.Mode.RUN -> "%+.1f EV".format(r.evoViewEv)
+                    })
+                    if (abs(r.evoSensorEv) > 0.01f) append(" (sensor %+.1f)".format(r.evoSensorEv))
+                    if (r.evoBlownWithout > 0.005f) append(" · blown %.0f%% → %.0f%%".format(r.evoBlownWithout * 100, r.evoBlown * 100))
+                    if (!r.sensorRangeStops.isNaN()) append(" · sensor range ≈%.1f stops".format(r.sensorRangeStops))
+                }
                 renderer?.recoverableClipFraction?.takeIf { it > 0.01f && !edrOn && edrAvailable() }
                     ?.let { append("\n%.0f%% of the view blown out; eDR can bring it back".format(it * 100)) }
                 if (m != null && m.shading == null) append("\nno lens shading map")
@@ -2786,7 +2895,8 @@ class CameraActivity : Activity() {
      * lock focus there), afreset = true (as a double-tap), fullpreview = true|false (full-res preview),
      * fakeheat = °C (pretend battery temperature, until the next real reading) after fakeheatdelay ms,
      * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects),
-     * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false,
+     * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false, evo = true|false (`--ez`), evostrength = 0..2 (`--ei`),
+     * evoverbose = true (`--ez`: log EVO's state twice a second),
      * wbwarm / wbtint = -100..100 (white balance trim), mirror = true (front camera as a mirror image),
      * ui = glass | classic (rebuilds the screen),
      * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
@@ -2883,6 +2993,9 @@ class CameraActivity : Activity() {
             setEdrCurve(extras.getInt("tonehi", edrHighlights), extras.getInt("tonelo", edrShadows))
         }
         if (extras.containsKey("edr")) setEdr(extras.getBoolean("edr"))
+        if (extras.containsKey("evo")) setEvo(extras.getBoolean("evo"))
+        if (extras.containsKey("evostrength")) setEvoStrength(extras.getInt("evostrength"))
+        if (extras.containsKey("evoverbose")) renderer?.evoVerbose = extras.getBoolean("evoverbose")
         when (extras.getString("edrhint")) {
             "reset" -> prefs.edit().remove("edrHintShown").apply()
             "show" -> showEdrHint()

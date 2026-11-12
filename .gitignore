@@ -17,3 +17,4 @@ keystore.properties
 feedback/
 # notes for Claude sessions stay local too
 CLAUDE.md
+docs/HANDOFF.md

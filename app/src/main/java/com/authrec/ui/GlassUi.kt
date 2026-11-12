@@ -118,6 +118,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val edrChip = kit.button("eDR") { a.setEdr(!a.edrOn) }.apply {
         setOnLongClickListener { if (!a.simple) toggle(adjustPanel); true }
     }
+    /** EVO, with eDR (owner: "where eDR is"): lit while on, showing its shift while it acts. */
+    private val evoChip = kit.button("EVO") { a.setEvo(!a.evoOn) }
     private val adjustChip = kit.button("Adjust") { toggle(adjustPanel) }
     private val resChip = kit.button("") { a.setSuperpixel(!a.superpixel) }
     private val settingsChip = kit.button("⚙  Settings") { toggle(settingsSheet) }
@@ -336,7 +338,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         val usable = a.profilesUsable()
         a.profiles.forEach { p -> pill(p.name, usable, { a.profileActive(p) }, onLong = { a.promptEditProfile(p) }) { a.applyProfile(p) } }
         note(when {
-            a.profiles.isEmpty() -> "The look with its adjustments and dials, the video format and colour NR, under a name."
+            a.profiles.isEmpty() -> "The look with its adjustments and dials and the video format, under a name."
             !usable -> "Profiles change the format: after the clip."
             else -> "Hold one to rename or delete it."
         })
@@ -406,7 +408,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val leftColumn = LinearLayout(a).apply {
         orientation = LinearLayout.VERTICAL
         gravity = Gravity.CENTER_VERTICAL
-        listOf(lookChip, edrChip, adjustChip, resChip).forEach { addView(it) }
+        listOf(lookChip, edrChip, evoChip, adjustChip, resChip).forEach { addView(it) }
     }
     /** The Pro bar scrolls sideways where it's wider than the screen (upright). */
     private val proBarScroll = android.widget.HorizontalScrollView(a).apply {
@@ -516,9 +518,13 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         place(modeBox, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(20), top = a.dp(16))
         leftColumn.orientation = LinearLayout.VERTICAL
         for (i in 0 until leftColumn.childCount) {
-            leftColumn.getChildAt(i).layoutParams = LinearLayout.LayoutParams(leftW - a.dp(44), WRAP_CONTENT).apply { bottomMargin = a.dp(10) }
+            val chip = leftColumn.getChildAt(i)
+            chip.layoutParams = LinearLayout.LayoutParams(leftW - a.dp(44), WRAP_CONTENT).apply { bottomMargin = a.dp(7) }
+            if (chip !== lookChip) chip.setPadding(a.dp(14), a.dp(9), a.dp(14), a.dp(9))
         }
-        place(leftColumn, WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER_VERTICAL or start, left = a.dp(20))
+        // Centred between the mode switch (~100 dp) and Settings (~54 dp), i.e. 23 dp below the
+        // screen's middle: five chips (Simple) just fit there.
+        place(leftColumn, WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER_VERTICAL or start, left = a.dp(20), top = a.dp(23))
         place(settingsChip, WRAP_CONTENT, WRAP_CONTENT, bottom or start, left = a.dp(20), bottom = a.dp(16))
 
         // Right margin: the EV slider against the image, then the lens column / record / flip.
@@ -579,8 +585,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         leftColumn.orientation = LinearLayout.HORIZONTAL
         for (i in 0 until leftColumn.childCount) {
             val chip = leftColumn.getChildAt(i)
-            leftColumn.getChildAt(i).layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, if (chip === lookChip) 1.6f else 1f).apply {
-                if (i < leftColumn.childCount - 1) marginEnd = a.dp(8)
+            // Narrow chips: less padding, so "Adjust" and "eDR off" stay on one line with five in the row.
+            if (chip !== lookChip) chip.setPadding(a.dp(4), a.dp(9), a.dp(4), a.dp(9))
+            leftColumn.getChildAt(i).layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, if (chip === lookChip) 1.5f else 1f).apply {
+                if (i < leftColumn.childCount - 1) marginEnd = a.dp(6)
             }
         }
         place(leftColumn, w - a.dp(32), WRAP_CONTENT, top or start, left = a.dp(16), top = (imgTop - a.dp(62)).coerceAtLeast(a.dp(100)))
@@ -847,6 +855,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         // GPU's heaviest pass gets ~7 ms more at 4K); Fast: against the pixel's own noise.
         videoRows += choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }) { a.setNrFast(it) }
         videoRows += choice("Audio", false, listOf("On" to true, "Off" to false), { a.audioOn }) { if (it != a.audioOn) a.toggleAudio() }
+        // How readily EVO darkens the picture to hold bright surfaces (the chip by eDR switches it on).
+        choice("EVO", false, listOf("Gentle" to 0, "Balanced" to 1, "Strong" to 2), { a.evoStrength }) { a.setEvoStrength(it) }
         choice("Layout", false, listOf("Glass" to false, "Classic" to true), { a.classicUi }) { a.setClassicUi(it) }
         fun buttons(pro: Boolean, vararg items: Pair<String, () -> Unit>) {
             val r = LinearLayout(a).apply {
@@ -970,7 +980,10 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }
         kit.setOn(edrChip, a.edrOn && a.edrAvailable())
         edrChip.isEnabled = a.edrAvailable()
-        edrChip.text = if (a.edrOn) "eDR  on" else "eDR  off"
+        // Five chips in the upright row (Simple): the lit chip says "on".
+        val short = upright && a.simple
+        edrChip.text = if (short) "eDR" else if (a.edrOn) "eDR  on" else "eDR  off"
+        updateEvoChip()
         kit.setOn(adjustChip, adjustPanel.visibility == View.VISIBLE)
         resChip.text = if (a.effectiveSuperpixel()) "2K" else "4K"
         resChip.visibility = if (a.simple) View.VISIBLE else View.GONE
@@ -1152,7 +1165,18 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }
     }
 
+    private fun updateEvoChip() {
+        kit.setOn(evoChip, a.evoOn)
+        val short = upright && a.simple
+        val text = when {
+            !a.evoOn -> if (short) "EVO" else "EVO  off"
+            else -> a.evoShift()?.let { (if (short) "%+.1f" else "EVO  %+.1f").format(it).replace('-', '−') } ?: if (short) "EVO" else "EVO  on"
+        }
+        if (evoChip.text.toString() != text) evoChip.text = text
+    }
+
     override fun onStats() {
+        updateEvoChip()
         if (!a.simple) updateExposureValues()
     }
 

@@ -36,6 +36,11 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val viewButton = kit.button("") { a.showViewMenu() }
     private val importButton = kit.button("+ LUT") { a.pickLut() }
     private val edrButton = kit.button("") { a.setEdr(!a.edrOn) }
+    /** Tap: on / off; hold: gentle → balanced → strong. */
+    private val evoButton = kit.button("") { a.setEvo(!a.evoOn) }.apply {
+        setOnLongClickListener { a.setEvoStrength((a.evoStrength + 1) % 3); true }
+    }
+    private fun evoText() = if (!a.evoOn) "EVO: off" else a.evoShift()?.let { "EVO: %+.1f".format(it) } ?: "EVO: ${a.evoStrengthLabel()}"
     /** The flash unit as a steady light (back lenses that have one). */
     private val torchButton = kit.button("") { a.setTorch(!a.capture.torch) }
     /** A still from the recording, under Pause while a clip records. */
@@ -110,7 +115,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             orientation = LinearLayout.VERTICAL
             views.forEach { addView(it, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)) }
         }
-        val left = column(profileButton, viewButton, importButton, adjustButton, edrButton, torchButton)
+        val left = column(profileButton, viewButton, importButton, adjustButton, edrButton, evoButton, torchButton)
         val right = column(recButton, pauseButton, snapButton, rawButton, codecButton, bitrateButton, resButton, aspectButton, audioButton, bakeButton, cleanButton, nrButton)
         right.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             val lp = a.exposureSlider.layoutParams as FrameLayout.LayoutParams
@@ -278,6 +283,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             else -> "eDR: %+d / %+d".format(a.edrHighlights, a.edrShadows)
         }
         edrButton.isEnabled = a.edrAvailable()
+        evoButton.text = evoText()
         torchButton.visibility = if (a.torchAvailable()) View.VISIBLE else View.GONE
         torchButton.text = if (a.capture.torch) "Torch: on" else "Torch: off"
         bakeButton.text = if (a.bakeLut) "Record: Look" else "Record: Log"
@@ -343,6 +349,11 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
             true
         }
         menu.show()
+    }
+
+    override fun onStats() {
+        // EVO's shift changes by itself.
+        evoButton.text = evoText()
     }
 
     override fun dismissPanels(): Boolean {
