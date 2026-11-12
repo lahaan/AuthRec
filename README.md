@@ -13,7 +13,8 @@ balance, colour matrix, lens shading).
 - HEVC 10-bit, HEVC 8-bit, H.264 ; up to 150 Mbps
 - 16:9, 2:1, 2.39:1 and vertical support
 - Live 3D LUTs and looks; look editor that exports `.cube`; LUT import available
-- Profiles: the look with its adjustments, the video format and noise reduction, saved under a name
+- Profiles: the look with its adjustments and the video format, saved under a name; sharable as a
+  file (the LUT travels inside) that others import
 - eDR (extended dynamic range) - customizable highlight and shadow recovery
 - EVO (exposure value optimizer) - eases the exposure down, smoothly, when bright surfaces blow out
 - Temporal colour noise reduction with hot pixel fix

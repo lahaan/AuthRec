@@ -340,9 +340,14 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         note(when {
             a.profiles.isEmpty() -> "The look with its adjustments and dials and the video format, under a name."
             !usable -> "Profiles change the format: after the clip."
-            else -> "Hold one to rename or delete it."
+            else -> "Hold one to rename, share or delete it."
         })
-        lookRows.addView(kit.button("+  Save current as profile") { a.promptSaveProfile() }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        lookRows.addView(LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(kit.button("+  Save current") { a.promptSaveProfile() }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = a.dp(8) })
+            // A preset file from someone else: the profile with its look inside.
+            addView(kit.button("Import…") { a.pickLut() })
+        }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
 
         val groups = listOf<Pair<String, (CameraActivity.ViewEntry) -> Boolean>>(
             "Looks" to { it is CameraActivity.ViewEntry.LogView || it is CameraActivity.ViewEntry.BuiltIn },

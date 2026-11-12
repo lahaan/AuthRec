@@ -370,6 +370,10 @@ class CameraActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) audioOn = false
         // A recreate (layout switch) keeps the launching intent; its adb commands already ran.
         if (savedInstanceState == null && !staleLaunch(intent)) handleCommands(intent)
+        // Opened with a preset file from another app (not again when Android restores the task).
+        if (savedInstanceState == null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) {
+            incomingFile(intent)?.let { uri -> info.post { importFile(uri) } }
+        }
     }
 
     /**
@@ -391,6 +395,15 @@ class CameraActivity : Activity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleCommands(intent)
+        incomingFile(intent)?.let { importFile(it) }
+    }
+
+    /** The file another app opened AuthRec with or shared to it (a preset), if any. */
+    private fun incomingFile(intent: Intent?): Uri? = when (intent?.action) {
+        Intent.ACTION_VIEW -> intent.data
+        Intent.ACTION_SEND -> if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            else @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        else -> null
     }
 
     // ---- Preferences ----
@@ -1751,7 +1764,8 @@ class CameraActivity : Activity() {
 
     // No keyboard at first: in landscape it covers the dialog's buttons (Delete).
     internal fun promptEditProfile(p: Profile) = askProfileName("Rename \"${p.name}\"",
-        "Or delete it. Its settings stay as they are.", p.name, "Rename", extra = "Delete" to { deleteProfile(p) },
+        "Or share it as a file (its look goes with it; whoever imports it keeps their own video format), or delete it.", p.name, "Rename",
+        extras = listOf("Share" to { shareProfile(p) }, "Delete" to { deleteProfile(p) }),
         keyboard = false) { renameProfile(p, it) }
 
     /** Picks look or LUT [i] of [views]. */
@@ -1829,10 +1843,11 @@ class CameraActivity : Activity() {
 
     /**
      * A name for a profile, in the layout's own dialog (Glass's panel, or the system's in Classic):
-     * [action] gets the trimmed text; [extra] is one more button (Delete).
+     * [action] gets the trimmed text; [extras] are more buttons (Share, Delete; the system's dialog
+     * has room for the last only: Classic shares from the look menu).
      */
     private fun askProfileName(title: String, message: String, initial: String, action: String,
-                               extra: Pair<String, () -> Unit>? = null, keyboard: Boolean = true, onName: (String) -> Unit) {
+                               extras: List<Pair<String, () -> Unit>> = emptyList(), keyboard: Boolean = true, onName: (String) -> Unit) {
         val input = android.widget.EditText(this).apply {
             setText(initial)
             setSelectAllOnFocus(true)
@@ -1854,8 +1869,7 @@ class CameraActivity : Activity() {
                 addView(kit.label(message, 13f, dim = true), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
                 addView(input, LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(10) })
             }
-            GlassDialog.show(this, kit, content, listOfNotNull(
-                extra?.let { (text, run) -> GlassDialog.Action(text) { run() } },
+            GlassDialog.show(this, kit, content, extras.map { (text, run) -> GlassDialog.Action(text) { run() } } + listOf(
                 GlassDialog.Action("Cancel"),
                 GlassDialog.Action(action, main = true) { done() },
             ))
@@ -1866,7 +1880,7 @@ class CameraActivity : Activity() {
                 .setView(input)
                 .setPositiveButton(action) { _, _ -> done() }
                 .setNegativeButton("Cancel", null)
-                .apply { extra?.let { (text, run) -> setNeutralButton(text) { _, _ -> run() } } }
+                .apply { extras.lastOrNull()?.let { (text, run) -> setNeutralButton(text) { _, _ -> run() } } }
                 .show()
         }
         input.setOnEditorActionListener { _, id, _ ->
@@ -1896,8 +1910,11 @@ class CameraActivity : Activity() {
         if (profiles.isNotEmpty()) {
             val sub = menu.menu.addSubMenu(PROFILE_GROUP, PROFILE_EDIT_MENU, 2 + profiles.size, "Rename or delete a profile ▸")
             profiles.forEachIndexed { i, p -> sub.add(PROFILE_EDIT_GROUP, PROFILE_EDIT_BASE + i, i, p.name) }
+            val share = menu.menu.addSubMenu(PROFILE_GROUP, PROFILE_SHARE_MENU, 3 + profiles.size, "Share a profile as a file ▸")
+            profiles.forEachIndexed { i, p -> share.add(PROFILE_EDIT_GROUP, PROFILE_SHARE_BASE + i, i, p.name) }
         }
-        val first = 3 + profiles.size  // the looks' place in the menu, after the profiles
+        menu.menu.add(PROFILE_GROUP, PROFILE_IMPORT, 4 + profiles.size, "Import a preset file…")
+        val first = 5 + profiles.size  // the looks' place in the menu, after the profiles
         views.forEachIndexed { i, v ->
             if (simple && v is ViewEntry.LogView) return@forEachIndexed
             val group = when (v) {
@@ -1919,8 +1936,11 @@ class CameraActivity : Activity() {
         if (!simple) menu.menu.add(6, IMPORT_ITEM, first + views.size + 1, "Import a .cube LUT…")
         menu.setOnMenuItemClickListener { item ->
             when {
-                item.itemId == LUT_INPUT_MENU || item.itemId == PROFILE_EDIT_MENU -> return@setOnMenuItemClickListener false // opens the submenu
+                item.itemId == LUT_INPUT_MENU || item.itemId == PROFILE_EDIT_MENU || item.itemId == PROFILE_SHARE_MENU ->
+                    return@setOnMenuItemClickListener false // opens the submenu
                 item.itemId == PROFILE_SAVE -> promptSaveProfile()
+                item.itemId == PROFILE_IMPORT -> pickLut()
+                item.itemId in PROFILE_SHARE_BASE until PROFILE_SHARE_BASE + profiles.size -> shareProfile(profiles[item.itemId - PROFILE_SHARE_BASE])
                 item.itemId in PROFILE_EDIT_BASE until PROFILE_EDIT_BASE + profiles.size -> promptEditProfile(profiles[item.itemId - PROFILE_EDIT_BASE])
                 item.itemId in PROFILE_BASE until PROFILE_BASE + profiles.size -> applyProfile(profiles[item.itemId - PROFILE_BASE])
                 item.itemId == IMPORT_ITEM -> pickLut()
@@ -2707,10 +2727,11 @@ class CameraActivity : Activity() {
         viewIndex = views.indexOfFirst { it.label == selectLabel }.takeIf { it >= 0 } ?: 1
     }
 
+    /** Picks a file to import: a .cube LUT or a preset ([importFile] tells them apart). */
     internal fun pickLut() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*" // .cube has no registered MIME type
+            type = "*/*" // .cube has no registered MIME type (and a preset may arrive as anything)
         }, REQ_PICK_LUT)
     }
 
@@ -2742,7 +2763,7 @@ class CameraActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK || data == null) return
         when (requestCode) {
-            REQ_PICK_LUT -> data.data?.let { importLut(it) }
+            REQ_PICK_LUT -> data.data?.let { importFile(it) }
             REQ_EDIT_LOOK -> data.getStringExtra(LookEditorActivity.EXTRA_LOOK)?.let { path ->
                 // onResume follows and re-applies; point the selection at the saved look first.
                 val saved = runCatching { Look.load(File(path)) }.getOrNull() ?: return
@@ -2750,6 +2771,90 @@ class CameraActivity : Activity() {
                 savePrefs()
             }
         }
+    }
+
+    // ---- Presets: a profile and its look as one file (Presets) ----
+
+    /** Writes [p] with its look to Download/AuthRec and opens the share sheet on it. */
+    internal fun shareProfile(p: Profile) {
+        val source = when (val v = views.firstOrNull { it.label == p.look }) {
+            null -> return note("Can't share \"${p.name}\": its look \"${p.look}\" isn't here any more")
+            ViewEntry.LogView -> Presets.LookSource.Log
+            is ViewEntry.BuiltIn -> Presets.LookSource.BuiltIn(v.look.name)
+            is ViewEntry.UserLook -> Presets.LookSource.Made(v.look)
+            is ViewEntry.CubeFile -> Presets.LookSource.Cube(v.file, lutInputOf(v.file))
+        }
+        val version = packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        Thread {
+            runCatching {
+                val name = Look.safeName(p.name) + Presets.SUFFIX
+                // An earlier export of the same name goes: MediaStore would call this one "….authrec (2).json".
+                runCatching {
+                    contentResolver.delete(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                        "${android.provider.MediaStore.Downloads.DISPLAY_NAME} = ? AND ${android.provider.MediaStore.Downloads.RELATIVE_PATH} = ?",
+                        arrayOf(name, android.os.Environment.DIRECTORY_DOWNLOADS + "/AuthRec/"))
+                }
+                val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(android.provider.MediaStore.Downloads.MIME_TYPE, Presets.MIME)
+                    put(android.provider.MediaStore.Downloads.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS + "/AuthRec")
+                }) ?: error("can't create $name")
+                contentResolver.openOutputStream(uri)!!.bufferedWriter().use { it.write(Presets.encode(p, source, version)) }
+                EventLog.log("Preset \"${p.name}\" written to Download/AuthRec/$name")
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = Presets.MIME
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, "AuthRec preset: ${p.name}")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(Intent.createChooser(send, "Share \"${p.name}\""))
+            }.onFailure { e ->
+                EventLog.log("Sharing preset failed", e)
+                runOnUiThread { note("Couldn't share \"${p.name}\": ${e.message}") }
+            }
+        }.start()
+    }
+
+    /** A file picked in Import or opened from another app: a preset, or else a .cube LUT. */
+    private fun importFile(uri: Uri) {
+        val head = runCatching {
+            contentResolver.openInputStream(uri)!!.use { input ->
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(64 * 1024)
+                while (out.size() <= Presets.MAX_FILE_BYTES) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                }
+                out.toByteArray()
+            }
+        }.getOrElse { return note("Couldn't read that file: ${it.message}") }
+        // Presets are JSON; a .cube starts with a title, a comment or numbers.
+        if (head.firstOrNull { !it.toInt().toChar().isWhitespace() }?.toInt()?.toChar() != '{') return importLut(uri)
+        if (head.size > Presets.MAX_FILE_BYTES) return note("Can't import: the file is too large")
+        val result = runCatching {
+            Presets.import(String(head, Charsets.UTF_8), lutDir(), profiles, here = {
+                it.copy(aspect = aspect, superpixel = superpixel, fps = capture.fps, codec = codec, bitrate = bitrateMbps,
+                    recordLook = bakeLut, logProfile = profile)
+            }) { file, expects ->
+                prefs.edit().putString("lutInput:${file.name}", expects?.name ?: "NONE").apply()
+            }
+        }.getOrElse { e ->
+            EventLog.log("Preset import failed", e)
+            return note("Can't import: ${e.message ?: "not an AuthRec preset"}")
+        }
+        val p = result.profile
+        if (profiles.none { it === p }) {
+            profiles = profiles + p
+            Profile.save(prefs, profiles)
+        }
+        EventLog.log("Preset: ${result.note} (look \"${p.look}\")")
+        refreshViews(selectLabel = views.getOrNull(viewIndex)?.label)
+        // In use at once, unless a clip or a burst is under way: then it waits in the list.
+        val usable = profilesUsable()
+        if (usable) applyProfile(p)
+        note(result.note + if (usable) "" else ": it's in Looks for after the clip")
+        updateUi()
     }
 
     private fun importLut(uri: Uri) {
@@ -2918,6 +3023,7 @@ class CameraActivity : Activity() {
      * without aligning), photoshake = quads (`--ei`: each burst frame read that far off, 0 = off),
      * texture / clarity / dehaze = −100..100 (`--ei`: Photo mode's dials), cmd = snap (a still while recording),
      * presetsave / preset / presetdelete = name (save the current settings as a profile, apply one, delete one),
+     * presetshare = name (write it as a file and open the share sheet), presetimport = uri (import that file),
      * turn = 0 | 90 | 180 | 270 (`--ei`: lay the controls out for that pose until the phone's next real turn),
      * torch = true|false (`--ez`).
      */
@@ -3041,6 +3147,8 @@ class CameraActivity : Activity() {
         if (extras.containsKey("turn")) info.postDelayed({ ui.setTurn(extras.getInt("turn")) }, 600)
         extras.getString("presetsave")?.let { saveProfile(it.trim()) }
         extras.getString("preset")?.let { name -> profiles.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { applyProfile(it) } ?: note("No profile \"$name\"") }
+        extras.getString("presetshare")?.let { name -> profiles.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { shareProfile(it) } }
+        extras.getString("presetimport")?.let { importFile(Uri.parse(it)) }
         extras.getString("presetdelete")?.let { name -> profiles.firstOrNull { it.name.equals(name, ignoreCase = true) }?.let { deleteProfile(it) } }
         extras.getString("open")?.let { name ->
             info.postDelayed({ if (name == "recordings") openRecordings() else ui.openForTest(name) }, 1200)
@@ -3145,5 +3253,8 @@ class CameraActivity : Activity() {
         private const val PROFILE_EDIT_MENU = 11_002
         private const val PROFILE_BASE = 12_000
         private const val PROFILE_EDIT_BASE = 13_000
+        private const val PROFILE_SHARE_MENU = 11_003
+        private const val PROFILE_IMPORT = 11_004
+        private const val PROFILE_SHARE_BASE = 14_000
     }
 }

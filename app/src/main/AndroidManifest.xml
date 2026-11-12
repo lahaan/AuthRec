@@ -27,6 +27,20 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- A preset (<name>.authrec.json, see Presets) opened from, or shared by, another app.
+                 Anything else that's JSON is turned down with a message. -->
+            <intent-filter android:label="Import into AuthRec">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/json" />
+            </intent-filter>
+            <intent-filter android:label="Import into AuthRec">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/json" />
+            </intent-filter>
         </activity>
         <activity
             android:name=".LookEditorActivity"

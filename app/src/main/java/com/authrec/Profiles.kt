@@ -41,7 +41,7 @@ internal data class Profile(
     /** The same settings, whatever the name. */
     fun sameSettings(other: Profile) = copy(name = "") == other.copy(name = "")
 
-    private fun toJson() = JSONObject()
+    fun toJson(): JSONObject = JSONObject()
         .put("name", name).put("look", look)
         .put("lutStrength", lutStrength).put("saturation", saturation).put("vibrance", vibrance)
         .put("wbWarm", wbWarm).put("wbTint", wbTint)
@@ -65,7 +65,7 @@ internal data class Profile(
             prefs.edit().putString(KEY, JSONArray(profiles.map { it.toJson() }).toString()).apply()
         }
 
-        private fun fromJson(o: JSONObject) = Profile(
+        fun fromJson(o: JSONObject) = Profile(
             name = o.getString("name"),
             look = o.getString("look"),
             lutStrength = o.getInt("lutStrength"),
