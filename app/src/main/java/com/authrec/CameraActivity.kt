@@ -687,6 +687,7 @@ class CameraActivity : Activity() {
             capture.ae == AeMode.LOCKED || photoBusy -> Evo.Mode.HOLD
             else -> Evo.Mode.RUN
         }
+        r.evoQuick = photo
         val tone = viewTone()
         r.evoTone = tone
         val white = tone.white
@@ -793,7 +794,14 @@ class CameraActivity : Activity() {
                 val info = camera?.info
                 val step = info?.evStep ?: (1f / 3)
                 // Rounded apart: the user's 0.1 EV and EVO's whole steps mustn't swallow each other.
-                val steps = (Math.round(exposureEv / step) + Math.round(evoSensor / step)).coerceIn(info?.evRange?.lower ?: 0, info?.evRange?.upper ?: 0)
+                // The user's EV past the range is digital gain: EVO's steps count from the end of
+                // the range, not from there (they were swallowed, and the picture evened out against
+                // a step the sensor never took).
+                val lowest = info?.evRange?.lower ?: 0
+                val highest = info?.evRange?.upper ?: 0
+                val user = Math.round(exposureEv / step).coerceIn(lowest, highest)
+                val steps = (user + Math.round(evoSensor / step)).coerceIn(lowest, highest)
+                r?.evoGrantedEv = (steps - user) * step
                 // The picture gets the user's EV; what the sensor got of it and of EVO's is evened
                 // out digitally (the renderer adds EVO's view shift and the frames still on their way).
                 r?.exposureOffsetEv = exposureEv - steps * step
@@ -802,11 +810,13 @@ class CameraActivity : Activity() {
                 if (steps != capture.evSteps) setCapture(capture.copy(evSteps = steps), updateUiNow = false)
             }
             AeMode.PRIORITY -> {
+                r?.evoGrantedEv = 0f
                 r?.exposureOffsetEv = 0f // the loop's target carries it
                 r?.sensorCompEv = exposureEv
                 r?.aeCompEv = 0f
             }
             AeMode.MANUAL -> {
+                r?.evoGrantedEv = 0f
                 r?.exposureOffsetEv = exposureEv
                 r?.sensorCompEv = 0f
                 r?.aeCompEv = 0f

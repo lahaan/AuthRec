@@ -8,6 +8,9 @@ public class EvoSim {
     static final float STEP = 1f / 6f;
     /** How much further than asked the camera moves (a clipped scene fools its metering): 1 = as asked. */
     static float OVER = 1f;
+    /** Photo mode's pace (Evo.quick), and what's left of the AE compensation range for EVO. */
+    static boolean QUICK = false;
+    static float LO = -4f, HI = 4f;
     static float GUARD = Evo.DIM_WEIGHT;
     static int STRENGTH = 1;
 
@@ -66,7 +69,7 @@ public class EvoSim {
             for (int n = 0; n < x.length; n++) x[n] = Math.min(1f, scene[n] * k);
             m.fill(x, shade, COLS, ROWS);
             evo.update(m, gain / (float) Math.pow(2, actual), tone, log ? Evo.LOG_WHITE : tone.getWhite(), noise, actual,
-                Math.abs(evo.getSensorEv() * OVER - actual) < 0.02f, STEP, -4f, 4f, push, mode, dt);
+                Math.abs(evo.getSensorEv() * OVER - actual) < 0.02f, STEP, LO, HI, push, mode, dt);
         }
     }
 
@@ -77,15 +80,23 @@ public class EvoSim {
         rig.log = log;
         rig.evo.setDimWeight(GUARD);
         rig.evo.setStrength(STRENGTH);
-        float maxSpeed = 0f, last = 0f;
+        rig.evo.setQuick(QUICK);
+        float maxSpeed = 0f, last = 0f, maxJerk = 0f, lastSpeed = 0f;
+        float[] view = new float[30 * 20];
         for (int f = 0; f < 30 * 20; f++) {
             rig.frame(render(s, f % 7), gain, white, noise, push, Evo.Mode.RUN, 1f / 30);
-            if (f > 0) maxSpeed = Math.max(maxSpeed, Math.abs(rig.evo.getViewEv() - last) * 30);
+            float speed = (rig.evo.getViewEv() - last) * 30;
+            if (f > 0) { maxSpeed = Math.max(maxSpeed, Math.abs(speed)); maxJerk = Math.max(maxJerk, Math.abs(speed - lastSpeed)); }
+            lastSpeed = speed;
             last = rig.evo.getViewEv();
+            view[f] = last;
         }
-        System.out.printf("%-34s view %+.2f EV  sensor %+.2f EV  blown %4.1f%% -> %4.1f%%  sources %4.1f%%  fastest %.2f EV/s%n",
+        // Seconds until the view is within 0.05 EV of where it ends up, for good.
+        int there = 0;
+        for (int f = 0; f < view.length; f++) if (Math.abs(view[f] - last) > 0.05f) there = f + 1;
+        System.out.printf("%-34s view %+.2f EV  sensor %+.2f EV  blown %4.1f%% -> %4.1f%%  sources %4.1f%%  fastest %.2f EV/s, there in %.1f s%n",
             name, rig.evo.getViewEv(), rig.evo.getSensorEv(), rig.evo.getBlownWithout() * 100, rig.evo.getBlownNow() * 100,
-            rig.m.getSources() * 100, maxSpeed);
+            rig.m.getSources() * 100, maxSpeed, there / 30f);
     }
 
     /**
@@ -161,6 +172,18 @@ public class EvoSim {
             settle("white plate on dark grey", plate, 4.6f, wEarly, n, true);
         }
         GUARD = Evo.DIM_WEIGHT; STRENGTH = 1;
+        System.out.println("-- the user's EV past the AE range (nothing left for EVO, even less than nothing)");
+        LO = -10.8f; HI = -2.8f;
+        settle("white plate, telephoto, EV +6.8", plate, 1.5f, w, n, true);
+        LO = 2f; HI = 10f;
+        settle("white plate, telephoto, EV -6", plate, 1.5f, w, n, true);
+        LO = -4f; HI = 4f;
+        System.out.println("-- Photo mode's pace");
+        QUICK = true;
+        settle("white plate on dark grey", plate, 4.6f, w, n, true);
+        settle("sunset sky over foliage", sunset, 4.6f, w, n, true);
+        settle("white plate, telephoto", plate, 1.5f, w, n, true);
+        QUICK = false;
         System.out.println("-- a camera that moves 1.7x as far as it's asked (telephoto plate)");
         OVER = 1.7f;
         settle("white plate on dark grey", plate, 1.5f, w, n, true);

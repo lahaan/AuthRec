@@ -28,6 +28,8 @@ import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.log2
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -128,6 +130,11 @@ class Renderer(
      * shows. With no request left it goes back to nothing in a couple of seconds.
      */
     private var evoDelivered = 0f
+    /** Seconds since the user's own EV last changed, and the value it had. */
+    private var evoUserQuiet = 10f
+    /** This frame is the first after a break of half a second or more (a new session). */
+    private var frameBreak = false
+    private var evoUserSeen = 0f
     private var evoWindow = 0f
     private var evoSinceAsk = 10f
     private var evoStillFrames = 0
@@ -173,9 +180,16 @@ class Renderer(
 
     /** Following the scene, holding (exposure locked, a photo burst under way) or off. */
     @Volatile var evoMode: Evo.Mode = Evo.Mode.OFF
+    /** Photo mode: EVO may move several times as fast (Evo.quick). */
+    @Volatile var evoQuick = false
     /** How the view shows each scene brightness (Evo.toneOfLook), and the scene brightness a clip keeps as white (Evo.update). */
     @Volatile var evoTone: Evo.Tone = Evo.Tone(FloatArray(89) { (it / 66f).coerceAtMost(1f) })
     @Volatile var evoRecordedWhite = 2f
+    /**
+     * What of EVO's real-exposure request is in the AE compensation the camera was asked for, in EV
+     * (the activity rounds it to the phone's steps and fits it in the range beside the user's EV).
+     */
+    @Volatile var evoGrantedEv = 0f
     /** The user's own EV: taken out of what EVO looks at, so their bias stays on top of its choice. */
     @Volatile var evoUserEv = 0f
     /** EVO may ask for real exposure (AE Auto, kept in Locked). Priority keeps to the user's limits: the view only. */
@@ -220,15 +234,38 @@ class Renderer(
         // EVO's real exposure as the frames have it.
         evoSinceAsk += dt
         evoStillFrames = if (abs(frameStepEv) > 0.01f) 0 else evoStillFrames + 1
-        if (evoWindow > 0f) {
+        val userEv = evoUserEv
+        if (userEv != evoUserSeen) {
+            evoUserSeen = userEv
+            evoUserQuiet = 0f
+        }
+        // A break in the frames (the camera reopened): its AE finds its feet again, which isn't EVO's doing either.
+        if (frameBreak) evoUserQuiet = 0f
+        evoUserQuiet += dt
+        // While the user's own EV is on its way to the sensor the frames can't say whose change is
+        // whose: EVO's share is then taken as asked, and it asks nothing new. (Measured through a
+        // drag of the EV slider, the user's stops counted as EVO's and the picture was evened out
+        // against them: "it started underexposing", owner 2026-11-12.)
+        val userMoving = evoUserQuiet < 1f || (!compShown.isNaN() && compShown != compTo)
+        if (userMoving) {
+            evoWindow = 0f
+            evoDelivered = evoGrantedEv
+        } else if (evoWindow > 0f) {
             evoDelivered = (evoDelivered + frameStepEv).coerceIn(-3f, 3f)
             // Open while the camera is still on its way (it overshoots and comes back), 3 s at most.
             if ((evoSinceAsk >= 1.2f && evoStillFrames >= 6) || evoSinceAsk >= 3f) evoWindow = 0f
-        } else if (evo.sensorEv == 0f) {
+        } else if (evoGrantedEv == 0f) {
             evoDelivered *= kotlin.math.exp(-dt / 2f)
             if (abs(evoDelivered) < 0.005f) evoDelivered = 0f
         }
-        evoCorrectionEv = evo.sensorEv - evoDelivered
+        // Whatever else moved the exposure meanwhile (a pan into the light, the user's EV), EVO's
+        // share is somewhere between nothing (a camera at the end of its range) and well past what
+        // was asked (X14: 1.7× in a clipped scene). Kept in there, a wrong count costs the picture
+        // no more than the request itself, and is gone when the request is.
+        val granted = evoGrantedEv
+        val far = if (granted < 0f) min(granted * 2f, granted - 0.5f) else max(granted * 2f, granted + 0.5f)
+        evoDelivered = if (granted == 0f) evoDelivered.coerceIn(-0.5f, 0.5f) else evoDelivered.coerceIn(min(far, 0f), max(far, 0f))
+        evoCorrectionEv = granted - evoDelivered
         if (meta == null || (mode == Evo.Mode.OFF && evo.viewEv == 0f && evo.sensorEv == 0f)) {
             evoViewEv = evo.viewEv
             evoSensorEv = evoDelivered
@@ -237,15 +274,20 @@ class Renderer(
         if (mode == Evo.Mode.RUN) evoMeasure.fill(gridX, gridShade, GRID_COLS, GRID_ROWS)
         // The picture's gain without EVO's shift and the user's EV; value × gain has middle grey at 0.18.
         val gain = currentGain() / 2f.pow(evo.viewEv + evoUserEv)
-        val lo = if (evoSensorAllowed) sensor.evRange.lower * sensor.evStep - evoUserEv else 0f
-        val hi = if (evoSensorAllowed) sensor.evRange.upper * sensor.evStep - evoUserEv else 0f
+        // What the user's EV leaves of the AE compensation range (their EV past it is digital gain).
+        val compLo = sensor.evRange.lower * sensor.evStep
+        val compHi = sensor.evRange.upper * sensor.evStep
+        val userComp = if (compLo <= compHi) userEv.coerceIn(compLo, compHi) else 0f
+        val lo = if (evoSensorAllowed) compLo - userComp else 0f
+        val hi = if (evoSensorAllowed) compHi - userComp else 0f
         // Brightening is for scenes with light to spare: a dim room stays as dim as the meter and the night limit left it.
         val push = meta.iso * gain < EVO_PUSH_MAX_ISO
         val actual = evoDelivered
         // The last request has shown its effect (the exposure has stopped moving), or isn't going to.
-        val settled = (evoSinceAsk >= 0.3f && evoStillFrames >= 4) || evoSinceAsk >= 1.2f
+        val settled = !userMoving && ((evoSinceAsk >= 0.3f && evoStillFrames >= 4) || evoSinceAsk >= 1.2f)
         val asked = evo.sensorEv
         evo.strength = evoStrength
+        evo.quick = evoQuick
         evo.dimWeight = if (evoDimWeight >= 0f) evoDimWeight else Evo.DIM_WEIGHT
         val tone = evoTone
         evo.update(evoMeasure, gain, tone, evoRecordedWhite, noise, actual, settled, sensor.evStep, lo, hi, push, mode, dt)
@@ -254,7 +296,6 @@ class Renderer(
             evoWindow = 1.2f
             evoSinceAsk = 0f
             evoStillFrames = 0
-            evoCorrectionEv = evo.sensorEv - evoDelivered
             onEvoSensor?.invoke(evo.sensorEv)
         }
         if (evoDump) {
@@ -262,8 +303,8 @@ class Renderer(
             android.util.Log.i("AuthRec", "EVOHIST gain=%.4f white=%.4f %s".format(gain, tone.white, evo.dump()))
         }
         if (evoVerbose && ++evoLogged % 15 == 0) android.util.Log.i("AuthRec",
-            "EVO view %+.2f (wants %+.2f) sensor %+.2f (wants %+.2f, has %+.2f) blown %.1f%% -> %.1f%% surfaces %.1f%% sources %.1f%% gain %.2f white %.1f iso %d".format(
-                evo.viewEv, evo.viewWanted, evo.sensorEv, evo.sensorWanted, actual, evo.blownWithout * 100, evo.blownNow * 100,
+            "EVO view %+.2f (wants %+.2f) sensor %+.2f (wants %+.2f, granted %+.2f, has %+.2f, evened %+.2f) blown %.1f%% -> %.1f%% surfaces %.1f%% sources %.1f%% gain %.2f white %.1f iso %d".format(
+                evo.viewEv, evo.viewWanted, evo.sensorEv, evo.sensorWanted, evoGrantedEv, evoDelivered, evoCorrectionEv, evo.blownWithout * 100, evo.blownNow * 100,
                 evoMeasure.surfaces * 100, evoMeasure.sources * 100, gain, tone.white, meta.iso))
         evoViewEv = evo.viewEv
         evoSensorEv = evoDelivered
@@ -971,6 +1012,7 @@ class Renderer(
         }
         updateExposureComp(frameExposure)
         val dt = if (lastTimestamp != 0L) ((timestamp - lastTimestamp) / 1e9f).coerceIn(0.001f, 0.2f) else 1f / 30
+        frameBreak = lastTimestamp == 0L || timestamp - lastTimestamp > 500_000_000L || timestamp < lastTimestamp
         lastTimestamp = timestamp
         updateCompLag(frameExposure, dt)
         updateEvo(meta, dt)

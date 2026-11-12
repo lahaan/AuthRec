@@ -140,6 +140,12 @@ class Evo {
      * (adb evodim, for comparing).
      */
     @Volatile var dimWeight = DIM_WEIGHT
+    /**
+     * Photo mode: nothing is being recorded, so the view may get where it's going several times
+     * as fast (owner, 2026-11-12: "photomode it doesnt have to be as graceful, as you are just
+     * taking a picture"). Still eased, never a jump.
+     */
+    @Volatile var quick = false
 
     /** Stops the picture is shown darker (−) or brighter (+) than the meter's, eased every frame. */
     var viewEv = 0f
@@ -184,22 +190,26 @@ class Evo {
     fun update(m: Measure, gain: Float, tone: Tone, recordedWhite: Float, noiseFloor: Float, sensorActualEv: Float,
                sensorSettled: Boolean, step: Float, sensorMin: Float, sensorMax: Float, allowPush: Boolean, mode: Mode, dt: Float) {
         val t = dt.coerceIn(0.001f, 0.2f)
+        // Asking nothing of the sensor is always possible, whatever the caller has left of its range
+        // (an empty range crashed here on every start: the owner's EV at +6.8 on a ±4 camera, 2026-11-12).
+        val sensorLo = min(sensorMin, 0f)
+        val sensorHi = max(sensorMax, 0f)
         if (mode == Mode.HOLD) {
             viewSpeed = 0f
             return
         }
         if (mode == Mode.RUN) {
             // ~0.25 s of frames: one frame's noise and a passing glint don't move anything.
-            if (started) m.blendInto(avg, 1f - exp(-t / 0.25f)) else m.blendInto(avg, 1f)
+            if (started) m.blendInto(avg, 1f - exp(-t / (if (quick) 0.12f else 0.25f))) else m.blendInto(avg, 1f)
             started = true
             // The wish stays where it is until another shift is clearly better: a sky at the edge of
             // what can be held flipped between −2 and −0.3 as the light drifted (X14, 2026-11-12).
             val best = bestView(gain, tone, allowPush)
             if (!wished || viewCost(gain, tone, viewWanted) - viewCost(gain, tone, best) > STICK) viewWanted = best
             wished = true
-            sensorWanted = (sensorActualEv + bestSensor(noiseFloor, sensorActualEv, max(viewWanted, 0f), sensorMin, sensorMax,
+            sensorWanted = (sensorActualEv + bestSensor(noiseFloor, sensorActualEv, max(viewWanted, 0f), sensorLo, sensorHi,
                 log2(gain / recordedWhite) + viewWanted))
-                .coerceIn(max(-MAX_DOWN, sensorMin), min(MAX_UP, sensorMax))
+                .coerceIn(max(-MAX_DOWN, sensorLo), min(MAX_UP, sensorHi))
             blownNow = blown(gain, tone, viewEv)
             blownWithout = blown(gain, tone, 0f)
         } else {
@@ -210,12 +220,14 @@ class Evo {
         }
         // The wish, calmed (~1 s), then followed like a damped spring: it starts and stops gently,
         // and never faster than VIEW_DOWN / VIEW_UP stops a second (owner: choppy is unusable).
-        viewTarget += (viewWanted - viewTarget) * (1f - exp(-t / 0.8f))
+        val q = quick
+        viewTarget += (viewWanted - viewTarget) * (1f - exp(-t / (if (q) QUICK_CALM else 0.8f)))
         // Held until the calmed wish has moved a tenth of a stop: a steady scene gets a steady picture.
         if (abs(viewTarget - viewHeld) > HOLD_WITHIN || (abs(viewTarget) < 0.02f && viewHeld != 0f)) viewHeld = viewTarget
         val goal = if (abs(viewHeld) < 0.04f) 0f else viewHeld
-        viewSpeed += (SPRING * SPRING * (goal - viewEv) - 2f * SPRING * viewSpeed) * t
-        viewSpeed = viewSpeed.coerceIn(-VIEW_DOWN, VIEW_UP)
+        val spring = if (q) QUICK_SPRING else SPRING
+        viewSpeed += (spring * spring * (goal - viewEv) - 2f * spring * viewSpeed) * t
+        viewSpeed = if (q) viewSpeed.coerceIn(-QUICK_SPEED, QUICK_SPEED) else viewSpeed.coerceIn(-VIEW_DOWN, VIEW_UP)
         viewEv += viewSpeed * t
         if (goal == 0f && abs(viewEv) < 0.005f && abs(viewSpeed) < 0.01f) {
             viewEv = 0f
@@ -225,13 +237,13 @@ class Evo {
         // does (asking on blind overshot by half a stop where the camera was at its ISO limit), and
         // only for a difference worth a step (no dithering between two). The request is in the
         // camera's terms, the target in what the sensor really does: they needn't be the same number.
-        sensorTarget += (sensorWanted - sensorTarget) * (1f - exp(-t / 1.2f))
+        sensorTarget += (sensorWanted - sensorTarget) * (1f - exp(-t / (if (q) 0.4f else 1.2f)))
         sinceStep += t
         val s = step.coerceAtLeast(0.05f)
         val off = sensorTarget - sensorActualEv
-        if (sensorSettled && sinceStep >= STEP_EVERY && abs(off) >= s * 0.75f) {
-            val lowest = max(-MAX_DOWN, sensorMin)
-            val highest = max(min(if (viewWanted > 0f) MAX_UP else 0f, sensorMax), lowest)
+        if (sensorSettled && sinceStep >= (if (q) QUICK_STEP_EVERY else STEP_EVERY) && abs(off) >= s * 0.75f) {
+            val lowest = max(-MAX_DOWN, sensorLo)
+            val highest = min(if (viewWanted > 0f) MAX_UP else 0f, sensorHi)
             val next = (Math.round((sensorEv + (if (off > 0) s else -s)) / s) * s).coerceIn(lowest, highest)
             if (next != sensorEv) {
                 sensorEv = next
@@ -415,6 +427,11 @@ class Evo {
         private const val VIEW_UP = 0.35f
         private const val SPRING = 2f
         private const val STEP_EVERY = 0.45f
+        /** Photo mode ([quick]): the wish calmed over this many seconds, a stiffer spring, stops a second at most, a sensor step this often. */
+        private const val QUICK_CALM = 0.2f
+        private const val QUICK_SPRING = 5f
+        private const val QUICK_SPEED = 3f
+        private const val QUICK_STEP_EVERY = 0.25f
         private const val HOLD_WITHIN = 0.1f
         /** "White" of a log clip: far above anything a sensor holds, so nothing in it counts as blown by the curve. */
         const val LOG_WHITE = 64f
