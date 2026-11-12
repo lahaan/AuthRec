@@ -687,32 +687,34 @@ class CameraActivity : Activity() {
             capture.ae == AeMode.LOCKED || photoBusy -> Evo.Mode.HOLD
             else -> Evo.Mode.RUN
         }
-        val white = viewWhite()
-        r.evoWhite = white
+        val tone = viewTone()
+        r.evoTone = tone
+        val white = tone.white
         r.evoRecordedWhite = if (bakeLut || simple || photo) white else Evo.LOG_WHITE
     }
 
-    /** The look as last given to the renderer (null: the plain log view), for [viewWhite]. */
+    /** The look as last given to the renderer (null: the plain log view), for [viewTone]. */
     private var viewLut: CubeLut? = null
-    private var whiteKey: List<Any?>? = null
-    private var whiteValue = Evo.LOG_WHITE
+    private var toneKey: List<Any?>? = null
+    private var toneValue: Evo.Tone? = null
 
     /**
-     * The scene brightness the current view shows as white (Evo.whiteOfLook), worked out again when
-     * the look, its strength, the log profile or eDR change. The plain log view shows everything
-     * the sensor holds.
+     * How the current view shows each scene brightness (Evo.toneOfLook), worked out again when the
+     * look, its strength, the log profile, eDR or Dehaze change.
      */
-    private fun viewWhite(): Float {
-        val lut = viewLut ?: return Evo.LOG_WHITE
-        val edr = if (edrOn && edrAvailable()) edrHighlights / 100f else 0f
+    private fun viewTone(): Evo.Tone {
+        val edr = edrOn && edrAvailable()
         val input = renderer?.lutInput
-        val key = listOf(lut, profile, input, lutStrength, edr)
-        if (key != whiteKey) {
-            whiteValue = Evo.whiteOfLook(lut, profile, input, lutStrength / 100f, edr)
-            whiteKey = key
-            if (evoOn) EventLog.log("EVO: \"${currentView()?.label}\" goes white %.1f stops over middle grey".format(kotlin.math.log2(whiteValue / 0.18f)))
-        }
-        return whiteValue
+        val dehaze = if (simple) 0 else photoDehaze
+        val key = listOf(viewLut, profile, input, lutStrength, if (edr) edrHighlights else 0, if (edr) edrShadows else 0, dehaze)
+        toneValue?.takeIf { key == toneKey }?.let { return it }
+        val tone = Evo.toneOfLook(viewLut, profile, input, lutStrength / 100f,
+            if (edr) edrHighlights / 100f else 0f, if (edr) edrShadows / 100f else 0f, dehaze / 100f)
+        toneKey = key
+        toneValue = tone
+        if (evoOn) EventLog.log("EVO: \"${currentView()?.label}\"${if (dehaze != 0) " with Dehaze %+d".format(dehaze) else ""} goes white " +
+            "%.1f stops over middle grey and shows middle grey at %.0f %%".format(kotlin.math.log2(tone.white / 0.18f), tone.at(0f) * 100))
+        return tone
     }
 
     /** What EVO is doing, for the controls: null when off or at rest, else its shift of the picture in EV. */
@@ -3027,7 +3029,8 @@ class CameraActivity : Activity() {
      * fakeheat = °C (pretend battery temperature, until the next real reading) after fakeheatdelay ms,
      * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects),
      * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false, evo = true|false (`--ez`), evostrength = 0..2 (`--ei`),
-     * evoverbose = true (`--ez`: log EVO's state twice a second),
+     * evoverbose = true (`--ez`: log EVO's state twice a second), evodim = weight (`--ef`: EVO's midtone guard, 0 = off),
+     * evodump = true (`--ez`: log EVO's measure of the scene once, 3 s later, for tools/evosim),
      * wbwarm / wbtint = -100..100 (white balance trim), mirror = true (front camera as a mirror image),
      * ui = glass | classic (rebuilds the screen),
      * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
@@ -3128,6 +3131,8 @@ class CameraActivity : Activity() {
         if (extras.containsKey("evo")) setEvo(extras.getBoolean("evo"))
         if (extras.containsKey("evostrength")) setEvoStrength(extras.getInt("evostrength"))
         if (extras.containsKey("evoverbose")) renderer?.evoVerbose = extras.getBoolean("evoverbose")
+        if (extras.containsKey("evodim")) renderer?.evoDimWeight = extras.getFloat("evodim")
+        if (extras.getBoolean("evodump")) info.postDelayed({ renderer?.evoDump = true }, 3000)
         when (extras.getString("edrhint")) {
             "reset" -> prefs.edit().remove("edrHintShown").apply()
             "show" -> showEdrHint()

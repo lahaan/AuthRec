@@ -6,7 +6,7 @@ import java.io.File;
 public class WhiteSim {
     static void curve(String name, CubeLut lut, LogProfile profile, LogProfile input) {
         int n = lut.getSize();
-        StringBuilder sb = new StringBuilder(name + " (white " + String.format("%.1f", Math.log(Evo.Companion.whiteOfLook(lut, profile, input, 1f, 0f) / 0.18) / Math.log(2)) + " stops):\n");
+        StringBuilder sb = new StringBuilder(name + " (white " + String.format("%.1f", Math.log(Evo.Companion.toneOfLook(lut, profile, input, 1f, 0f, 0f, 0f).getWhite() / 0.18) / Math.log(2)) + " stops):\n");
         for (int k = -8; k <= 28; k++) {
             double e = k / 4.0, y = 0.18 * Math.pow(2, e);
             float pos = (float) (Math.min(1, Math.max(0, (input == null ? profile : input).encode(y))) * (n - 1));

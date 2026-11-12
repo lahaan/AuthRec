@@ -3,6 +3,9 @@
 # at for each, how fast it moves, and (with "trace") a pan between scenes over time.
 #   tools/evosim/run.sh [trace]            the scenes in EvoSim.java
 #   tools/evosim/run.sh white <file.cube>  how a LUT renders a grey ramp, and where it goes white
+#   tools/evosim/run.sh dump <hist.txt> [file.cube [expects [dehaze]]]
+#                                          a scene measured on a phone (adb hook evodump=true, the
+#                                          EVOHIST line from logcat): where each strength settles
 # Needs Android Studio's JDK; builds the Kotlin first (the classes Gradle leaves in app/build).
 R=${0:a:h:h:h}
 export JAVA_HOME="${JAVA_HOME:-/Applications/Android Studio.app/Contents/jbr/Contents/Home}"

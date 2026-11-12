@@ -35,6 +35,25 @@ import kotlin.math.min
  */
 class Evo {
 
+    /** A look's tone curve ([toneOfLook]): the brightness shown (0..1) per quarter stop of scene brightness. */
+    class Tone(private val display: FloatArray) {
+        /** The brightest the look gives. */
+        val top: Float = display.max()
+        /** The scene brightness (middle grey 0.18) from which a surface shows as white (97 % of [top]). */
+        val white: Float = (display.indexOfFirst { it >= 0.97f * top }.takeIf { it >= 0 } ?: display.lastIndex)
+            .let { 0.18f * Math.pow(2.0, (TONE_LOW + it * BIN).toDouble()).toFloat() }
+
+        /** Brightness shown [e] stops from middle grey. */
+        fun at(e: Float): Float {
+            val x = ((e - TONE_LOW) / BIN).coerceIn(0f, display.size - 1.001f)
+            val i = x.toInt()
+            return display[i] + (display[i + 1] - display[i]) * (x - i)
+        }
+
+        /** How blown a surface [e] stops from middle grey looks: 0 with texture left, 1 flat white. */
+        fun blown(e: Float): Float = ramp(at(e) / top, BLOWN_FROM, BLOWN_FULL)
+    }
+
     /** What one frame shows, from a grid of green RAW samples (see [fill]). */
     class Measure {
         /** Shares of the samples by level (log2 of the lens-shading-corrected value, clip = 1), unclipped ones. */
@@ -115,6 +134,13 @@ class Evo {
      */
     @Volatile var strength = 1
 
+    /**
+     * What a share of the picture sunk into the dark weighs against a blown one ([viewCost]): the
+     * guard against holding a big white surface at the whole picture's expense. 0 = no guard
+     * (adb evodim, for comparing).
+     */
+    @Volatile var dimWeight = DIM_WEIGHT
+
     /** Stops the picture is shown darker (−) or brighter (+) than the meter's, eased every frame. */
     var viewEv = 0f
         private set
@@ -134,6 +160,7 @@ class Evo {
 
     private val avg = Measure()
     private var started = false
+    private var wished = false
     private var viewTarget = 0f
     private var viewHeld = 0f
     private var viewSpeed = 0f
@@ -142,10 +169,11 @@ class Evo {
 
     /**
      * One frame. [gain]: the digital gain the picture has without EVO's [viewEv] and the user's own
-     * EV (linear; value × gain is scene brightness with middle grey at 0.18); [white]: the scene
-     * brightness the view shows as white ([whiteOfLook]); [recordedWhite]: the
-     * same for what a clip keeps ([white] with the look baked in, [LOG_WHITE] for a log clip: its
-     * file holds everything the sensor does); [noiseFloor]: the
+     * EV (linear; value × gain is scene brightness with middle grey at 0.18);
+     * [tone]: how the look shows each scene brightness ([toneOfLook]); [recordedWhite]: the scene
+     * brightness that comes out white in what a clip keeps (the tone's
+     * [Tone.white] with the look baked in, [LOG_WHITE] for a log clip: its file holds everything
+     * the sensor does); [noiseFloor]: the
      * sensor's read noise as a normalised value (0: unknown); [sensorActualEv]: EVO's exposure
      * shift as the frames really have it (measured: requests take a few frames, and a camera
      * metering a clipped scene moves further than asked); [sensorSettled]: the last request has
@@ -153,7 +181,7 @@ class Evo {
      * compensation step, [sensorMin]..[sensorMax] what's left of its range for EVO;
      * [allowPush]: brightening is on the table (a scene with light to spare, not a dim room).
      */
-    fun update(m: Measure, gain: Float, white: Float, recordedWhite: Float, noiseFloor: Float, sensorActualEv: Float,
+    fun update(m: Measure, gain: Float, tone: Tone, recordedWhite: Float, noiseFloor: Float, sensorActualEv: Float,
                sensorSettled: Boolean, step: Float, sensorMin: Float, sensorMax: Float, allowPush: Boolean, mode: Mode, dt: Float) {
         val t = dt.coerceIn(0.001f, 0.2f)
         if (mode == Mode.HOLD) {
@@ -164,14 +192,19 @@ class Evo {
             // ~0.25 s of frames: one frame's noise and a passing glint don't move anything.
             if (started) m.blendInto(avg, 1f - exp(-t / 0.25f)) else m.blendInto(avg, 1f)
             started = true
-            viewWanted = bestView(gain, white, allowPush)
+            // The wish stays where it is until another shift is clearly better: a sky at the edge of
+            // what can be held flipped between −2 and −0.3 as the light drifted (X14, 2026-11-12).
+            val best = bestView(gain, tone, allowPush)
+            if (!wished || viewCost(gain, tone, viewWanted) - viewCost(gain, tone, best) > STICK) viewWanted = best
+            wished = true
             sensorWanted = (sensorActualEv + bestSensor(noiseFloor, sensorActualEv, max(viewWanted, 0f), sensorMin, sensorMax,
                 log2(gain / recordedWhite) + viewWanted))
                 .coerceIn(max(-MAX_DOWN, sensorMin), min(MAX_UP, sensorMax))
-            blownNow = blown(gain, white, viewEv)
-            blownWithout = blown(gain, white, 0f)
+            blownNow = blown(gain, tone, viewEv)
+            blownWithout = blown(gain, tone, 0f)
         } else {
             started = false
+            wished = false
             viewWanted = 0f
             sensorWanted = 0f
         }
@@ -214,39 +247,59 @@ class Evo {
         sensorWanted = 0f
     }
 
+    /** The averaged measure as text (view | sensor | clipped | sources), for tuning on the desktop (adb evodump). */
+    fun dump(): String = avg.view.joinToString(",") + "|" + avg.sensor.joinToString(",") + "|" + avg.clipped.joinToString(",") + "|" + avg.sources
+
+    /** The view's cost at each candidate shift, from −[MAX_DOWN] in steps of [GRID] (after an [update]). */
+    fun viewCosts(): FloatArray = costs.copyOf()
+
     /** Share of the picture shown blown out with the view shifted by [shift] stops. */
-    private fun blown(gain: Float, white: Float, shift: Float): Float {
-        val over = log2(gain / white) + shift
+    private fun blown(gain: Float, tone: Tone, shift: Float): Float {
+        val toGrey = log2(gain / 0.18f) + shift
         var sum = 0f
         for (i in 0 until BINS) {
-            if (avg.view[i] > 0f) sum += avg.view[i] * ramp(level(i) + over, -BLOWN_KNEE, 0f)
-            if (avg.clipped[i] > 0f) sum += avg.clipped[i] * clippedBlown(level(i) + over)
+            if (avg.view[i] > 0f) sum += avg.view[i] * tone.blown(level(i) + toGrey)
+            if (avg.clipped[i] > 0f) sum += avg.clipped[i] * clippedBlown(tone, level(i) + toGrey)
         }
         return sum
     }
 
-    /** A clipped surface's share still blown when its clip point shows [over] stops over white. */
-    private fun clippedBlown(over: Float): Float {
+    /** A clipped surface's share still blown when its clip point sits [e] stops from middle grey. */
+    private fun clippedBlown(tone: Tone, e: Float): Float {
         var sum = 0f
-        for (k in 0 until 3) sum += ramp(over + SAT_SPREAD * (k + 0.5f) / 3f, -BLOWN_KNEE, 0f)
+        for (k in 0 until 3) sum += tone.blown(e + SAT_SPREAD * (k + 0.5f) / 3f)
         return sum / 3f
     }
 
-    private fun bestView(gain: Float, white: Float, allowPush: Boolean): Float {
-        val toGrey = log2(gain / 0.18f)
+    /**
+     * What showing the picture [b] stops off the meter costs: the share blown out, the share sunk
+     * into the dark ([DIM_WEIGHT]: the guard against holding a big white surface at the whole
+     * picture's expense) or gone to black, and the price of the move. All three shares are read
+     * off the look's own tone curve: a bright LUT can come down a long way before its midtones
+     * sink, a plain one can't.
+     */
+    private fun viewCost(gain: Float, tone: Tone, b: Float): Float {
+        val toGrey = log2(gain / 0.18f) + b
+        var dark = 0f
+        for (i in 0 until BINS) if (avg.view[i] > 0f) {
+            val d = tone.at(level(i) + toGrey)
+            dark += avg.view[i] * (dimWeight * (1f - ramp(d, DIM_BLACK, DIM_GREY)) + BLACK_WEIGHT * (1f - ramp(d, BLACK_FULL, BLACK_FROM)))
+        }
+        val st = strength.coerceIn(0, 2)
+        return blown(gain, tone, b) + dark + if (b < 0f) -b * PRICE_DOWN[st] + b * b * PRICE_DOWN_FAR[st] else b * PRICE_UP + b * b * PRICE_UP_FAR
+    }
+
+    private fun bestView(gain: Float, tone: Tone, allowPush: Boolean): Float {
         val count = Math.round((MAX_DOWN + if (allowPush) MAX_UP else 0f) / GRID) + 1
         var best = -1
         for (k in 0 until count) {
             val b = -MAX_DOWN + k * GRID
-            var crushed = 0f
-            for (i in 0 until BINS) if (avg.view[i] > 0f) crushed += avg.view[i] * (1f - ramp(level(i) + toGrey + b, BLACK - 1f, BLACK + 1f))
-            costs[k] = blown(gain, white, b) + CRUSH_WEIGHT * crushed +
-                if (b < 0f) -b * PRICE_DOWN[strength.coerceIn(0, 2)] + b * b * PRICE_DOWN_FAR[strength.coerceIn(0, 2)]
-                else b * PRICE_UP + b * b * PRICE_UP_FAR
+            costs[k] = viewCost(gain, tone, b)
             // Among near-equals, the smaller move.
             if (best < 0 || costs[k] < costs[best] - 1e-4f ||
                 (costs[k] < costs[best] + 1e-4f && abs(b) < abs(-MAX_DOWN + best * GRID))) best = k
         }
+        for (k in count until costs.size) costs[k] = Float.NaN
         var b = -MAX_DOWN + best * GRID
         // Between the candidates, where a parabola through the best and its neighbours is lowest:
         // the wish then moves evenly with the scene instead of hopping from one candidate to the next.
@@ -315,10 +368,29 @@ class Evo {
         private const val SAT_SPREAD = 1.5f
         /** Near-white counts as blown from this many stops under white (a plate at white has no texture left). */
         private const val BLOWN_KNEE = 0.5f
-        /** Stops under middle grey where the picture is black for most looks (dark foliage a stop above still reads). */
-        private const val BLACK = -6.5f
-        /** A crushed share weighs this much of a blown one; a share under the sensor's noise likewise. */
-        private const val CRUSH_WEIGHT = 0.5f
+        /**
+         * The dark side of the cost, in the brightness the look shows (0..1): sunk between
+         * [DIM_GREY] and [DIM_BLACK] (a plain look: ~2 to ~3.5 stops under middle grey), black
+         * below [BLACK_FROM]. An overcast sky filling a quarter of the frame, through a LUT with 2
+         * stops of highlight room and a bloom on top, took the garden under it down 1.9 stops
+         * while the sky stayed white (owner's scene, 2026-11-12): nothing was crushed to black,
+         * so nothing held it back.
+         */
+        private const val DIM_GREY = 0.16f
+        private const val DIM_BLACK = 0.06f
+        const val DIM_WEIGHT = 0.2f
+        private const val BLACK_FROM = 0.03f
+        private const val BLACK_FULL = 0.005f
+        private const val BLACK_WEIGHT = 0.3f
+        /** A share counts as blown from this much of the brightest the look gives, fully from the second. */
+        private const val BLOWN_FROM = 0.93f
+        private const val BLOWN_FULL = 0.985f
+        /** Another shift has to be this much cheaper before the wish moves to it. */
+        private const val STICK = 0.015f
+        /** The tone curve's range in stops from middle grey. */
+        private const val TONE_LOW = -12f
+        private const val TONE_HIGH = 10f
+        /** A share under the sensor's noise weighs this much of a clipped one. */
         private const val NOISE_WEIGHT = 0.5f
         /**
          * What darkening / brightening must save, as a share of the picture: per stop, plus per
@@ -359,39 +431,57 @@ class Evo {
         }
 
         /**
-         * The scene brightness (middle grey 0.18) at which a grey surface comes out white through
-         * the look: [lut] fed our [profile]'s log (converted to [lutInput]'s where the LUT expects
-         * another), mixed in at [strength], after eDR's highlight curve ([edrHighlights] −1..1, 0 =
-         * off; PipelineShaders `balanceTone`). "White" is where the look has given 97 % of the
-         * brightest it gives: looks differ by a stop and more (a plain Rec.709 look goes white
-         * ~3.5 stops over middle grey; a punchy LUT well before), and assuming one point for all
-         * read 1 % blown on a picture that looked half white (owner's CineStill preset, 2026-11-12).
-         * The dials' bloom isn't counted: it's a glow put on top on purpose.
+         * How bright the view shows a large grey surface at each scene brightness: [lut] fed our
+         * [profile]'s log (converted to [lutInput]'s where the LUT expects another; null [lut]:
+         * the plain log view), mixed in at [strength], after eDR's curve ([edrHighlights] /
+         * [edrShadows] −1..1, 0 = off; PipelineShaders `balanceTone`), and with what Dehaze
+         * ([dehaze] −1..1, 0 where the dials don't apply) does to an even surface: its bloom
+         * takes bright ones the rest of the way to white, its other side lifts a veil
+         * (PipelineShaders `photoFinish`; Texture and Clarity leave an even surface alone).
+         * Looks differ by stops (a plain Rec.709 look goes white ~4.5 stops over middle grey and
+         * shows middle grey at 41 %; a punchy LUT at 2 and 50 %), and assuming one curve for all
+         * read 1 % blown on a picture that looked half white (owner's CineStill preset,
+         * 2026-11-12); without the bloom EVO took a sky down 2 stops that stayed white all the
+         * same (owner: "take into account LUTs and settings … dehaze, clarity").
          */
-        fun whiteOfLook(lut: CubeLut, profile: LogProfile, lutInput: LogProfile?, strength: Float, edrHighlights: Float): Float {
-            val n = lut.size
-            val steps = 9 * 8  // middle grey to 9 stops over, in eighths
+        fun toneOfLook(lut: CubeLut?, profile: LogProfile, lutInput: LogProfile?, strength: Float,
+                       edrHighlights: Float, edrShadows: Float, dehaze: Float): Tone {
+            val steps = Math.round((TONE_HIGH - TONE_LOW) / BIN)
             val out = FloatArray(steps + 1)
-            var top = 0f
             for (k in 0..steps) {
-                val e = k / 8.0
-                val tone = 0.6 * edrHighlights * 0.5 * ln(1.0 + exp((e - 1.0) / 0.5))  // softplus(e − 1, 0.5)
-                val y = 0.18 * Math.pow(2.0, e + tone)
-                val log = profile.encode(y).coerceIn(0.0, 1.0)
-                // Neutral in, so the LUT is read along its grey diagonal.
-                val pos = ((lutInput ?: profile).encode(y).coerceIn(0.0, 1.0) * (n - 1)).toFloat()
-                val i = pos.toInt().coerceIn(0, max(n - 2, 0))
-                val f = pos - i
-                fun luma(node: Int): Float {
-                    val at = (node + node * n + node * n * n) * 3
-                    return 0.2126f * lut.rgb[at] + 0.7152f * lut.rgb[at + 1] + 0.0722f * lut.rgb[at + 2]
+                val e = (TONE_LOW + k * BIN).toDouble()
+                fun softplus(x: Double) = 0.5 * ln(1.0 + exp(x / 0.5))
+                val shaped = e + 0.6 * edrHighlights * softplus(e - 1.0) + 2.5 * edrShadows * Math.tanh(softplus(-1.0 - e) / 5.0)
+                val y = 0.18 * Math.pow(2.0, shaped)
+                val log = profile.encode(y).coerceIn(0.0, 1.0).toFloat()
+                var d = log
+                if (lut != null) {
+                    // Neutral in, so the LUT is read along its grey diagonal.
+                    val n = lut.size
+                    val pos = ((lutInput ?: profile).encode(y).coerceIn(0.0, 1.0) * (n - 1)).toFloat()
+                    val i = pos.toInt().coerceIn(0, max(n - 2, 0))
+                    val f = pos - i
+                    fun luma(node: Int): Float {
+                        val at = (node + node * n + node * n * n) * 3
+                        return 0.2126f * lut.rgb[at] + 0.7152f * lut.rgb[at + 1] + 0.0722f * lut.rgb[at + 2]
+                    }
+                    val looked = if (n < 2) luma(0) else luma(i) * (1f - f) + luma(i + 1) * f
+                    d = log * (1f - strength) + looked * strength
                 }
-                val looked = if (n < 2) luma(0) else luma(i) * (1f - f) + luma(i + 1) * f
-                out[k] = (log * (1f - strength) + looked * strength).toFloat()
-                top = max(top, out[k])
+                d = d.coerceIn(0f, 1f)
+                if (dehaze > 0f) {
+                    val veil = 0.45f * dehaze * d
+                    d = (d - veil) / (1f - veil)
+                } else if (dehaze < 0f) {
+                    val amount = -dehaze
+                    d += (0.05f + 0.7f * d - d) * 0.12f * amount
+                    val x = 2.5f * amount * d * ramp(d, 0.35f, 0.9f)
+                    val over = (x - 0.65f).coerceIn(0f, 0.7f)
+                    d = 1f - (1f - d.coerceIn(0f, 1f)) * (1f - min(x - over * over / 1.4f, 1f))
+                }
+                out[k] = d.coerceIn(0f, 1f)
             }
-            for (k in 0..steps) if (out[k] >= 0.97f * top) return 0.18f * Math.pow(2.0, k / 8.0).toFloat()
-            return LOG_WHITE
+            return Tone(out)
         }
 
         /** The sensor's usable range in stops at this noise floor (clip point over read noise). */

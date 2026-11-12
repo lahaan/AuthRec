@@ -173,8 +173,8 @@ class Renderer(
 
     /** Following the scene, holding (exposure locked, a photo burst under way) or off. */
     @Volatile var evoMode: Evo.Mode = Evo.Mode.OFF
-    /** Scene brightness the view shows as white, and what a clip keeps as white (Evo.update). */
-    @Volatile var evoWhite = 2f
+    /** How the view shows each scene brightness (Evo.toneOfLook), and the scene brightness a clip keeps as white (Evo.update). */
+    @Volatile var evoTone: Evo.Tone = Evo.Tone(FloatArray(89) { (it / 66f).coerceAtMost(1f) })
     @Volatile var evoRecordedWhite = 2f
     /** The user's own EV: taken out of what EVO looks at, so their bias stays on top of its choice. */
     @Volatile var evoUserEv = 0f
@@ -196,6 +196,10 @@ class Renderer(
     /** The sensor's usable range at this ISO in stops, clip point over read noise (NaN: no frame yet). */
     @Volatile var sensorRangeStops = Float.NaN
         private set
+    /** Debug (adb evodump=true): log EVO's averaged measure once, for the desktop simulation. */
+    @Volatile var evoDump = false
+    /** Debug (adb evodim=0..1): the weight of EVO's midtone guard (Evo.dimWeight); negative = its default. */
+    @Volatile var evoDimWeight = -1f
     /** Debug (adb evoverbose=true): log EVO's state twice a second. */
     @Volatile var evoVerbose = false
     private var evoLogged = 0
@@ -242,7 +246,9 @@ class Renderer(
         val settled = (evoSinceAsk >= 0.3f && evoStillFrames >= 4) || evoSinceAsk >= 1.2f
         val asked = evo.sensorEv
         evo.strength = evoStrength
-        evo.update(evoMeasure, gain, evoWhite, evoRecordedWhite, noise, actual, settled, sensor.evStep, lo, hi, push, mode, dt)
+        evo.dimWeight = if (evoDimWeight >= 0f) evoDimWeight else Evo.DIM_WEIGHT
+        val tone = evoTone
+        evo.update(evoMeasure, gain, tone, evoRecordedWhite, noise, actual, settled, sensor.evStep, lo, hi, push, mode, dt)
         if (evo.sensorEv != asked) {
             evoAsked = true
             evoWindow = 1.2f
@@ -251,10 +257,14 @@ class Renderer(
             evoCorrectionEv = evo.sensorEv - evoDelivered
             onEvoSensor?.invoke(evo.sensorEv)
         }
+        if (evoDump) {
+            evoDump = false
+            android.util.Log.i("AuthRec", "EVOHIST gain=%.4f white=%.4f %s".format(gain, tone.white, evo.dump()))
+        }
         if (evoVerbose && ++evoLogged % 15 == 0) android.util.Log.i("AuthRec",
             "EVO view %+.2f (wants %+.2f) sensor %+.2f (wants %+.2f, has %+.2f) blown %.1f%% -> %.1f%% surfaces %.1f%% sources %.1f%% gain %.2f white %.1f iso %d".format(
                 evo.viewEv, evo.viewWanted, evo.sensorEv, evo.sensorWanted, actual, evo.blownWithout * 100, evo.blownNow * 100,
-                evoMeasure.surfaces * 100, evoMeasure.sources * 100, gain, evoWhite, meta.iso))
+                evoMeasure.surfaces * 100, evoMeasure.sources * 100, gain, tone.white, meta.iso))
         evoViewEv = evo.viewEv
         evoSensorEv = evoDelivered
         evoBlown = evo.blownNow
