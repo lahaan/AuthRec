@@ -357,6 +357,7 @@ class CameraActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         loadPrefs()
         installBundledLuts()
+        installBundledPresets()
         recordingLimits = RecordingCheck.load(this)?.also { r -> r.box?.let { encoderBox = it } }
         buildUi()
         window.insetsController?.apply {
@@ -2715,6 +2716,31 @@ class CameraActivity : Activity() {
             runCatching { assets.open("luts/$name").use { input -> target.outputStream().use { input.copyTo(it) } } }
         }
         if (names.isNotEmpty()) prefs.edit().putStringSet("bundledLuts", installed + names).apply()
+    }
+
+    /**
+     * Adds the presets bundled in assets/presets (`<name>.authrec.json`, as Share writes them: the
+     * owner's own, made on the phone) to the profiles, each with its look: once each, so one the
+     * user deleted or renamed stays that way, and with this phone's video format like any import.
+     */
+    private fun installBundledPresets() {
+        val installed = prefs.getStringSet("bundledPresets", emptySet())!!
+        val names = assets.list("presets").orEmpty().filter { it.endsWith(Presets.SUFFIX) && it !in installed }.sorted()
+        names.forEach { name ->
+            runCatching {
+                val text = assets.open("presets/$name").use { it.readBytes().toString(Charsets.UTF_8) }
+                val result = Presets.import(text, lutDir(), profiles, here = {
+                    it.copy(aspect = aspect, superpixel = superpixel, fps = capture.fps, codec = codec, bitrate = bitrateMbps,
+                        recordLook = bakeLut, logProfile = profile)
+                }) { file, expects -> prefs.edit().putString("lutInput:${file.name}", expects?.name ?: "NONE").apply() }
+                if (profiles.none { it === result.profile }) profiles = profiles + result.profile
+                EventLog.log("Bundled preset $name: ${result.note}")
+            }.onFailure { EventLog.log("Bundled preset $name couldn't be installed", it) }
+        }
+        if (names.isNotEmpty()) {
+            Profile.save(prefs, profiles)
+            prefs.edit().putStringSet("bundledPresets", installed + names).apply()
+        }
     }
 
     /** Rebuilds the view list: Log, built-in looks, the user's looks, imported .cube files. */
