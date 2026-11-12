@@ -250,6 +250,16 @@ class Evo {
                 sinceStep = 0f
             }
         }
+        // A request the range no longer has room for (the user's EV took it) is gone at once, as it
+        // is at the camera: left standing, it came back whole when the user's EV did (X14: −2 asked
+        // with nothing granted, after EV +6.8 then −6 in Photo mode).
+        val floor = max(-MAX_DOWN, sensorLo)
+        val ceiling = min(MAX_UP, sensorHi)
+        if (sensorEv < floor || sensorEv > ceiling) {
+            sensorEv = (sensorEv.coerceIn(floor, ceiling) / s).toInt() * s
+            sensorTarget = sensorTarget.coerceIn(floor, ceiling)
+            sinceStep = 0f
+        }
     }
 
     /** Real exposure is no longer EVO's to ask for (another AE mode): the request is gone at once. */
