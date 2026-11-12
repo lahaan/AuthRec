@@ -1,0 +1,76 @@
+{
+ "authrecPreset": 1,
+ "app": "0.8.3",
+ "profile": {
+  "name": "Tungsten 800",
+  "look": "★ Tungsten 800",
+  "lutStrength": 100,
+  "saturation": 100,
+  "vibrance": 0,
+  "wbWarm": 0,
+  "wbTint": 0,
+  "edrOn": false,
+  "edrHi": -75,
+  "edrLo": 30,
+  "texture": 30,
+  "clarity": 10,
+  "dehaze": -40,
+  "aspect": "OPEN_GATE",
+  "superpixel": false,
+  "fps": 30,
+  "codec": "HEVC_10",
+  "bitrate": 50,
+  "recordLook": true,
+  "logProfile": "SLOG3"
+ },
+ "look": {
+  "kind": "look",
+  "name": "Tungsten 800",
+  "params": {
+   "exposure": 0.0,
+   "contrast": 0.25,
+   "highlights": 0.15,
+   "shadows": 0.0,
+   "fade": 0.0,
+   "temperature": -0.3,
+   "tint": 0.0,
+   "saturation": 1.05,
+   "vibrance": 0.15,
+   "shadowHue": 190.0,
+   "shadowTint": 0.3,
+   "highlightHue": 20.0,
+   "highlightTint": 0.1,
+   "mono": false,
+   "mixHue": [
+    0,
+    -4,
+    0,
+    8,
+    0,
+    -6,
+    0,
+    0
+   ],
+   "mixSat": [
+    0.15,
+    0,
+    0,
+    -0.15,
+    0.1,
+    0,
+    0,
+    0.1
+   ],
+   "mixLum": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ }
+}

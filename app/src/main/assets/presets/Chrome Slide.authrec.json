@@ -1,0 +1,76 @@
+{
+ "authrecPreset": 1,
+ "app": "0.8.3",
+ "profile": {
+  "name": "Chrome Slide",
+  "look": "★ Chrome Slide",
+  "lutStrength": 100,
+  "saturation": 100,
+  "vibrance": 0,
+  "wbWarm": 0,
+  "wbTint": 0,
+  "edrOn": false,
+  "edrHi": -75,
+  "edrLo": 30,
+  "texture": 20,
+  "clarity": 15,
+  "dehaze": 10,
+  "aspect": "OPEN_GATE",
+  "superpixel": false,
+  "fps": 30,
+  "codec": "HEVC_10",
+  "bitrate": 50,
+  "recordLook": true,
+  "logProfile": "SLOG3"
+ },
+ "look": {
+  "kind": "look",
+  "name": "Chrome Slide",
+  "params": {
+   "exposure": 0.0,
+   "contrast": 0.4,
+   "highlights": 0.05,
+   "shadows": -0.2,
+   "fade": 0.0,
+   "temperature": -0.06,
+   "tint": 0.03,
+   "saturation": 1.08,
+   "vibrance": 0.15,
+   "shadowHue": 220.0,
+   "shadowTint": 0.15,
+   "highlightHue": 40.0,
+   "highlightTint": 0.0,
+   "mono": false,
+   "mixHue": [
+    0,
+    0,
+    -3,
+    6,
+    8,
+    0,
+    0,
+    0
+   ],
+   "mixSat": [
+    0.05,
+    -0.05,
+    0,
+    -0.05,
+    0.1,
+    0.1,
+    0,
+    0
+   ],
+   "mixLum": [
+    0,
+    0,
+    0,
+    -0.05,
+    0,
+    -0.1,
+    0,
+    0
+   ]
+  }
+ }
+}
