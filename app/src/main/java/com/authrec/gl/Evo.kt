@@ -146,6 +146,8 @@ class Evo {
      * taking a picture"). Still eased, never a jump.
      */
     @Volatile var quick = false
+    /** Debug (adb evostep): the real exposure asked for, whatever the scene says (NaN: EVO's own choice). */
+    @Volatile var debugSensor = Float.NaN
 
     /** Stops the picture is shown darker (−) or brighter (+) than the meter's, eased every frame. */
     var viewEv = 0f
@@ -237,6 +239,12 @@ class Evo {
         // does (asking on blind overshot by half a stop where the camera was at its ISO limit), and
         // only for a difference worth a step (no dithering between two). The request is in the
         // camera's terms, the target in what the sensor really does: they needn't be the same number.
+        if (!debugSensor.isNaN()) {
+            if (sensorEv != debugSensor) sinceStep = 0f
+            sensorEv = debugSensor
+            sensorTarget = debugSensor
+            return
+        }
         sensorTarget += (sensorWanted - sensorTarget) * (1f - exp(-t / (if (q) 0.4f else 1.2f)))
         sinceStep += t
         val s = step.coerceAtLeast(0.05f)

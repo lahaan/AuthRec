@@ -216,6 +216,11 @@ class Renderer(
     @Volatile var evoDimWeight = -1f
     /** Debug (adb evoverbose=true): log EVO's state twice a second. */
     @Volatile var evoVerbose = false
+    /** Debug (adb explog=frames): log every frame's exposure and each part of the gain for that many frames. */
+    @Volatile var expLogFrames = 0
+    private var expLogPrev = 0L
+    /** Debug (adb evostep=EV, with explog): EVO asks this of the sensor and takes it back, every 75 logged frames. */
+    @Volatile var evoTestStep = 0f
     private var evoLogged = 0
     private val evo = Evo()
     private val evoMeasure = Evo.Measure()
@@ -1016,6 +1021,15 @@ class Renderer(
         lastTimestamp = timestamp
         updateCompLag(frameExposure, dt)
         updateEvo(meta, dt)
+        if (expLogFrames > 0) {
+            expLogFrames--
+            evo.debugSensor = if (evoTestStep == 0f || expLogFrames == 0) Float.NaN else if ((expLogFrames / 75) % 2 == 0) evoTestStep else 0f
+            android.util.Log.i("AuthRec", "EXP %d iso %d ns %d %s off %.1f prev %s raw %.5f isp %.5f auto %.3f night %.3f lag %.3f view %.3f corr %.3f deliv %.3f grant %.3f comp %.3f total %.3f".format(
+                timestamp / 1_000_000, meta?.iso ?: 0, meta?.exposureNs ?: 0L, if (meta?.timestamp == timestamp) "own" else "other", ((meta?.timestamp ?: timestamp) - timestamp) / 1e6,
+                if (expLogPrev != 0L && metaArrived(expLogPrev)) "in" else "missing",
+                rawBrightness, ispBrightness(), autoGainEv, nightCut, compLagEv, evoViewEv, evoCorrectionEv, evoDelivered, evoGrantedEv, exposureComp, totalGainEv))
+        }
+        expLogPrev = timestamp
         sharpnessRegion?.let {
             sharpness = measureSharpness(image, it)
             sharpnessTimestamp = timestamp

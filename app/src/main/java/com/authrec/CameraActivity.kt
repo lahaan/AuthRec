@@ -3141,6 +3141,8 @@ class CameraActivity : Activity() {
      * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false, evo = true|false (`--ez`), evostrength = 0..2 (`--ei`),
      * evoverbose = true (`--ez`: log EVO's state twice a second), evodim = weight (`--ef`: EVO's midtone guard, 0 = off),
      * evodump = true (`--ez`: log EVO's measure of the scene once, 3 s later, for tools/evosim),
+     * explog = frames (`--ei`: log every frame's exposure and each part of the gain for that many frames),
+     * evostep = EV (`--ef`, with explog: EVO asks this of the sensor and takes it back every 75 logged frames),
      * wbwarm / wbtint = -100..100 (white balance trim), mirror = true (front camera as a mirror image),
      * ui = glass | classic (rebuilds the screen),
      * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
@@ -3241,6 +3243,8 @@ class CameraActivity : Activity() {
         if (extras.containsKey("evo")) setEvo(extras.getBoolean("evo"))
         if (extras.containsKey("evostrength")) setEvoStrength(extras.getInt("evostrength"))
         if (extras.containsKey("evoverbose")) renderer?.evoVerbose = extras.getBoolean("evoverbose")
+        if (extras.containsKey("evostep")) renderer?.evoTestStep = extras.getFloat("evostep")
+        if (extras.containsKey("explog")) renderer?.expLogFrames = extras.getInt("explog")
         if (extras.containsKey("evodim")) renderer?.evoDimWeight = extras.getFloat("evodim")
         if (extras.getBoolean("evodump")) info.postDelayed({ renderer?.evoDump = true }, 3000)
         when (extras.getString("edrhint")) {
