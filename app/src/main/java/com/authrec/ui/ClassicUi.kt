@@ -267,7 +267,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
         mirrorButton.text = if (a.mirrorFront) "Mirror: on" else "Mirror: off"
 
         profileButton.text = a.profile.label
-        viewButton.text = (if (a.simple) "Look: " else "View: ") + a.currentView()?.label
+        viewButton.text = (if (a.simple) "Look: " else "View: ") + a.currentView()?.let { a.plainName(it) }
         fpsButton.text = "${a.capture.fps} fps"
         codecButton.text = a.effectiveCodec().label
         bitrateButton.text = "${a.bitrateMbps} Mbps"

@@ -530,7 +530,7 @@ class CameraActivity : Activity() {
         })
         surfaceView.setOnTouchListener { _, e -> gestures.onTouchEvent(e); true }
 
-        info = TextView(this).apply {
+        info = com.authrec.ui.RimText(this).apply {
             setTextColor(Color.WHITE)
             setShadowLayer(4f, 0f, 0f, Color.BLACK)
             textSize = if (classicUi) 12f else 11.5f
@@ -1816,7 +1816,8 @@ class CameraActivity : Activity() {
                 addView(kit.label("Delete \"$name\"?", 18f).apply { typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) })
                 addView(kit.label(message, 13f, dim = true), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
             }
-            GlassDialog.show(this, kit, content, listOf(GlassDialog.Action("Cancel"), GlassDialog.Action("Delete", main = true) { deleteView(v) }))
+            GlassDialog.show(this, kit, content, listOf(GlassDialog.Action("Cancel"), GlassDialog.Action("Delete", main = true) { deleteView(v) }),
+                turn = ui.heldTurn)
         } else {
             android.app.AlertDialog.Builder(this)
                 .setTitle("Delete \"$name\"?")
@@ -1935,17 +1936,24 @@ class CameraActivity : Activity() {
             input.setTextColor(Glass.TEXT)
             input.setHintTextColor(Glass.TEXT_DIM)
             input.backgroundTintList = android.content.res.ColorStateList.valueOf(Glass.TEXT_DIM)
+            val explanation = kit.label(message, 13f, dim = true)
+            val buttonsWhileTyping = android.widget.FrameLayout(this)
             val content = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(24), dp(20), dp(24), dp(4))
                 addView(kit.label(title, 18f).apply { typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) })
-                addView(kit.label(message, 13f, dim = true), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
-                addView(input, LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(10) })
+                addView(explanation, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+                addView(LinearLayout(this@CameraActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(input, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                    addView(buttonsWhileTyping, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+                }, LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(10) })
             }
             GlassDialog.show(this, kit, content, extras.map { (text, run) -> GlassDialog.Action(text) { run() } } + listOf(
                 GlassDialog.Action("Cancel"),
                 GlassDialog.Action(action, main = true) { done() },
-            ))
+            ), turn = ui.heldTurn, typing = GlassDialog.Typing(buttonsWhileTyping, listOf(explanation)))
         } else {
             android.app.AlertDialog.Builder(this)
                 .setTitle(title)
@@ -1963,7 +1971,9 @@ class CameraActivity : Activity() {
             true
         }
         if (keyboard) {
-            dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+            // (Glass's dialog makes room for the keyboard itself: it needs "resize" to hear of it.)
+            dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or
+                if (kit.glass) WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE else 0)
             input.requestFocus()
         }
     }
@@ -3023,14 +3033,14 @@ class CameraActivity : Activity() {
         lastEffectiveIso = effectiveIso
         maybeSuggestEdr()
         ui.onStats()
-        info.text = buildString {
+        info.text = unbroken(buildString {
             heatNote()?.let { append(it) }
             if (!simple) {
                 if (isNotEmpty()) append("\n")
                 // Pro records the look only with Settings → Record on Look (Simple always): said here,
                 // or Log clips come as a surprise (owner: "Pro only records Log").
                 append("$out · ${profile.label}" + (if (photo) "" else " · records " + if (bakeLut) "the look" else "Log") + "\n")
-                append("ISO ${m?.iso ?: "-"} (≈${effectiveIso ?: "-"} with gain) · $shutter · gain %+.1f EV · %.1f fps · frame %.1f ms".format(
+                append("ISO ${m?.iso ?: "-"} (≈${effectiveIso?.let { isoText(it) } ?: "-"} with gain) · $shutter · gain %+.1f EV · %.1f fps · frame %.1f ms".format(
                     gainEv, stats.fps, stats.gpuMs))
                 // A viewfinder drawing fewer frames than are recorded looks choppy (the GL thread is behind).
                 if (stats.viewFps < stats.fps - 2) append(" · view %.0f fps".format(stats.viewFps))
@@ -3058,7 +3068,23 @@ class CameraActivity : Activity() {
                 if (!simple) append(" · %d frames · %d MB · dropped %d".format(it.framesWritten, it.bytesWritten / 1_000_000, stats.droppedWhileRecording))
             }
             lastResult?.let { if (isNotEmpty()) append("\n"); append(it) }
-        }
+        })
+    }
+
+    /**
+     * A stats line wraps between its " · " items, not inside one: upright, "frame 8.9 ms" left its
+     * "ms" alone on the next line (QA, 2026-11-13). Long items (a file's name) still wrap.
+     */
+    private fun unbroken(text: String) = text.lines().joinToString("\n") { line ->
+        if (" · " !in line) line
+        else line.split(" · ").joinToString("\u00A0· ") { if (it.length <= 30) it.replace(' ', '\u00A0') else it }
+    }
+
+    /** An ISO to read: in k / M past 100 000 (the EV slider's gain on a dark scene gave "≈2026213"). */
+    internal fun isoText(iso: Int) = when {
+        iso >= 1_000_000 -> "%.1fM".format(iso / 1e6)
+        iso >= 100_000 -> "${(iso / 1000.0).roundToInt()}k"
+        else -> "$iso"
     }
 
     /** Sensor ISO × the digital gain before the log curve, as of the last stats update. */

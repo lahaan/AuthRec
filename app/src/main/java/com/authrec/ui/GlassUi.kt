@@ -53,6 +53,18 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     /** Right margin: the EV slider against the image, then a column with lenses / record / flip. */
     private val sliderW = a.dp(64)
     private val rightColumnW = (side - sliderW).coerceAtLeast(a.dp(96))
+    /** Left margin: the column of chips (look, eDR, EVO, Adjust). */
+    private val leftW = side.coerceAtLeast(a.dp(150))
+    // The Adjust panel sits between the left column's chips and the EV slider: centred on the
+    // screen at its old size it reached over both (the look chip, the slider's "+0.0": QA, 2026-11-13).
+    private val adjustLeft = a.dp(20) + leftW - a.dp(44) + a.dp(8)
+    private val adjustRight = rightColumnW + sliderW + a.dp(6)
+    /** Room inside it: less its padding (16 dp a side) and the gap between curve and sliders (14 dp). */
+    private val adjustInner = screenW - adjustLeft - adjustRight - a.dp(46)
+    private val adjustCurveW = (adjustInner * 0.38f).toInt().coerceIn(a.dp(150), a.dp(210))
+    private val adjustSlidersW = (adjustInner - adjustCurveW).coerceIn(a.dp(280), a.dp(336))
+    /** Width of a slider's label: the longest, "LUT strength 100%", is 105 dp. */
+    private val sliderLabelW = a.dp(112)
     private val recSize = a.dp(78)
     /** The record button sits a little below the middle, where the right thumb rests. */
     private val recTop = screenH / 2 + a.dp(24) - recSize / 2
@@ -114,7 +126,13 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         addView(modeButtons[2], LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = a.dp(6) })
     }
-    private val lookChip = captionChip("LOOK") { toggleLooks() }
+    private val lookChip = captionChip("LOOK") { toggleLooks() }.apply {
+        setPadding(a.dp(10), a.dp(6), a.dp(10), a.dp(6))
+        // Its width is known once laid out (and changes with the phone's pose): fit the name again.
+        addOnLayoutChangeListener { _, l, _, r, _, oldL, _, oldR, _ -> if (r - l != oldR - oldL) post { setLookCaption() } }
+    }
+    /** How far the look's name is shrunk to fit its chip. */
+    private var lookFit = 1f
     private val edrChip = kit.button("eDR") { a.setEdr(!a.edrOn) }.apply {
         setOnLongClickListener { if (!a.simple) toggle(adjustPanel); true }
     }
@@ -156,7 +174,11 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val isoChip = captionChip("ISO") { toggle(isoPanel) }
     private val shutterChip = captionChip("SHUTTER") { toggle(shutterPanel) }
     private val wbChip = captionChip("WB") { toggle(wbPanel) }
-    private val focusChip = captionChip("FOCUS") { a.cycleAf() }
+    private val focusChip = captionChip("FOCUS") {
+        a.cycleAf()
+        // The focus bar opens where the panels do: it has the place to itself.
+        if (a.manualFocus) dismissPanels()
+    }
     private val fpsChip = captionChip("FPS") { toggle(fpsPanel) }
     /** Exposure, white balance and focus back to automatic (dimmed while they are). */
     private val resetChip = captionChip("RESET") {
@@ -200,8 +222,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val wbRow = kit.segmented(listOf("Auto", "Locked")) { if ((it == 1) != a.capture.awbLock) a.toggleAwbLock() }
     private val warmthBar = kit.seekBar(200, a.wbWarmth + 100, neutral = 100)
     private val tintBar = kit.seekBar(200, a.wbTint + 100, neutral = 100)
-    private val warmthLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    private val tintLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
+    private val warmthLabel = kit.label(size = 12f)
+    private val tintLabel = kit.label(size = 12f)
     private val wbPanel = panel(
         title("White balance"),
         wbRow.first,
@@ -220,31 +242,31 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private val curveBox = LinearLayout(a).apply {
         orientation = LinearLayout.VERTICAL
         addView(edrSwitch.first)
-        addView(curve, LinearLayout.LayoutParams(a.dp(210), a.dp(150)).apply { topMargin = a.dp(6) })
-        addView(kit.label("Drag a dot up or down; double-tap resets", 10.5f, dim = true))
+        addView(curve, LinearLayout.LayoutParams(adjustCurveW, a.dp(150)).apply { topMargin = a.dp(6) })
+        addView(kit.label("Drag a dot; double-tap resets", 10.5f, dim = true))
     }
     private val strengthBar = kit.seekBar(100, a.lutStrength, neutral = 100)
     private val saturationBar = kit.seekBar(200, a.saturationPct, neutral = 100)
     private val vibranceBar = kit.seekBar(200, a.vibrancePct + 100, neutral = 100)
     private val adjWarmthBar = kit.seekBar(200, a.wbWarmth + 100, neutral = 100)
     private val adjTintBar = kit.seekBar(200, a.wbTint + 100, neutral = 100)
-    private val strengthLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    private val saturationLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    private val vibranceLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    private val adjWarmthLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    private val adjTintLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
+    private val strengthLabel = kit.label(size = 12f)
+    private val saturationLabel = kit.label(size = 12f)
+    private val vibranceLabel = kit.label(size = 12f)
+    private val adjWarmthLabel = kit.label(size = 12f)
+    private val adjTintLabel = kit.label(size = 12f)
     // Texture / Clarity / Dehaze (Lightroom's Presence dials): Pro and Photo.
     private val textureBar = kit.seekBar(200, a.photoTexture + 100, neutral = 100)
     private val clarityBar = kit.seekBar(200, a.photoClarity + 100, neutral = 100)
     private val dehazeBar = kit.seekBar(200, a.photoDehaze + 100, neutral = 100)
-    private val textureLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    private val clarityLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
-    private val dehazeLabel = kit.label(size = 12f).apply { minWidth = a.dp(96) }
+    private val textureLabel = kit.label(size = 12f)
+    private val clarityLabel = kit.label(size = 12f)
+    private val dehazeLabel = kit.label(size = 12f)
     private val photoDials = LinearLayout(a).apply {
         orientation = LinearLayout.VERTICAL
-        addView(sliderRow(textureLabel, textureBar) { a.setPhotoFinish(texture = it - 100) })
-        addView(sliderRow(clarityLabel, clarityBar) { a.setPhotoFinish(clarity = it - 100) })
-        addView(sliderRow(dehazeLabel, dehazeBar) { a.setPhotoFinish(dehaze = it - 100) })
+        addView(sliderRow(textureLabel, textureBar, adjustSlidersW - sliderLabelW) { a.setPhotoFinish(texture = it - 100) })
+        addView(sliderRow(clarityLabel, clarityBar, adjustSlidersW - sliderLabelW) { a.setPhotoFinish(clarity = it - 100) })
+        addView(sliderRow(dehazeLabel, dehazeBar, adjustSlidersW - sliderLabelW) { a.setPhotoFinish(dehaze = it - 100) })
     }
     private val adjustPanel = kit.panel().apply {
         orientation = LinearLayout.HORIZONTAL
@@ -252,11 +274,11 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         addView(curveBox, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = a.dp(14) })
         addView(LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
-            addView(sliderRow(strengthLabel, strengthBar) { a.setLookAdjust(strength = it) })
-            addView(sliderRow(saturationLabel, saturationBar) { a.setLookAdjust(saturation = it) })
-            addView(sliderRow(vibranceLabel, vibranceBar) { a.setLookAdjust(vibrance = it - 100) })
-            addView(sliderRow(adjWarmthLabel, adjWarmthBar) { a.setWbShift(it - 100, a.wbTint) })
-            addView(sliderRow(adjTintLabel, adjTintBar) { a.setWbShift(a.wbWarmth, it - 100) })
+            addView(sliderRow(strengthLabel, strengthBar, adjustSlidersW - sliderLabelW) { a.setLookAdjust(strength = it) })
+            addView(sliderRow(saturationLabel, saturationBar, adjustSlidersW - sliderLabelW) { a.setLookAdjust(saturation = it) })
+            addView(sliderRow(vibranceLabel, vibranceBar, adjustSlidersW - sliderLabelW) { a.setLookAdjust(vibrance = it - 100) })
+            addView(sliderRow(adjWarmthLabel, adjWarmthBar, adjustSlidersW - sliderLabelW) { a.setWbShift(it - 100, a.wbTint) })
+            addView(sliderRow(adjTintLabel, adjTintBar, adjustSlidersW - sliderLabelW) { a.setWbShift(a.wbWarmth, it - 100) })
             addView(photoDials)
             addView(LinearLayout(a).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -270,7 +292,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
                     marginStart = a.dp(8)
                 })
             }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = a.dp(6) })
-        }, LinearLayout.LayoutParams(a.dp(336), WRAP_CONTENT))
+        }, LinearLayout.LayoutParams(adjustSlidersW, WRAP_CONTENT))
     }
 
     // ---- Look sheet: profiles, looks, LUTs ----
@@ -476,6 +498,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     /** Where [setTurn] is heading (the layout changes once the controls have faded out). */
     private var targetTurn = 0
 
+    override val heldTurn: Int get() = targetTurn
+
     override fun setTurn(turn: Int) {
         if (turn == targetTurn) return
         targetTurn = turn
@@ -519,7 +543,6 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         place(hint, WRAP_CONTENT, WRAP_CONTENT, top or centreH, top = a.dp(52))
 
         // Left margin.
-        val leftW = side.coerceAtLeast(a.dp(150))
         place(modeBox, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(20), top = a.dp(16))
         leftColumn.orientation = LinearLayout.VERTICAL
         for (i in 0 until leftColumn.childCount) {
@@ -553,7 +576,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         place(a.priorityPanel, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar + a.dp(130))
         adjustPanel.orientation = LinearLayout.HORIZONTAL
         curveBox.layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = a.dp(14) }
-        place(adjustPanel, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
+        // In the middle of its room (a centred view moves by its left margin less its right).
+        val shift = (adjustLeft - adjustRight) / 2
+        place(adjustPanel, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, left = maxOf(shift, 0), right = maxOf(-shift, 0), bottom = aboveBar)
         place(settingsSheet, minOf(a.dp(560), imageW - a.dp(24)), MATCH_PARENT, centreH, top = a.dp(12), bottom = a.dp(12))
         settingsLines.forEach { line ->
             line.orientation = LinearLayout.HORIZONTAL
@@ -717,7 +742,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         return b
     }
 
-    private fun setCaption(b: Button, value: String, auto: Boolean = false) {
+    private fun setCaption(b: Button, value: String, auto: Boolean = false, valueSize: Float = 1f, force: Boolean = false) {
         val caption = b.tag as String
         val text = android.text.SpannableStringBuilder()
         text.append(caption + if (auto) " · A" else "")
@@ -727,7 +752,21 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         val start = text.length
         text.append(value)
         text.setSpan(android.text.style.StyleSpan(Typeface.BOLD), start, text.length, 0)
-        if (b.text.toString() != text.toString()) b.text = text
+        if (valueSize != 1f) text.setSpan(android.text.style.RelativeSizeSpan(valueSize), start, text.length, 0)
+        if (force || b.text.toString() != text.toString()) b.text = text
+    }
+
+    /**
+     * The look chip shows the name as the look sheet does (no "★ " / "LUT ", no ".cube"), a little
+     * smaller where it's long: "★ Intense-Gre…" said less than the chip has room for (QA, 2026-11-13).
+     */
+    private fun setLookCaption() {
+        val name = a.currentView()?.let { a.plainName(it) } ?: ""
+        val room = lookChip.width - lookChip.paddingLeft - lookChip.paddingRight
+        val wide = android.graphics.Paint(lookChip.paint).apply { typeface = Typeface.create(lookChip.typeface, Typeface.BOLD) }.measureText(name)
+        val fit = if (room > 0 && wide > room) (room / wide).coerceAtLeast(0.8f) else 1f
+        setCaption(lookChip, name, valueSize = fit, force = fit != lookFit)
+        lookFit = fit
     }
 
     private fun roundChip(text: String, onClick: () -> Unit): Button = kit.button(text, onClick).apply {
@@ -765,6 +804,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     private fun sliderRow(label: TextView, bar: SeekBar, width: Int = a.dp(232), onChange: (Int) -> Unit) = LinearLayout(a).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
+        // One width for every label, so the bars start in line ("LUT strength 100%" was wider than
+        // the 96 dp the labels had, and its bar began further right than the rest).
+        label.minWidth = sliderLabelW
         bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) { if (fromUser) onChange(p) }
             override fun onStartTrackingTouch(sb: SeekBar) = Unit
@@ -876,8 +918,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }
         buttons(true, "Import .cube LUT…" to { a.pickLut() }, "Edit look / make LUT…" to { a.openLookEditor() })
         buttons(false, "Recordings…" to { a.openRecordings() }, "About & licences" to { com.authrec.About.show(a) })
-        buttons(false, "Lenses…" to { a.showLensMenu(settingsChip) }, "Rescan lenses" to { toggle(settingsSheet); a.rescanLenses() },
-            "Send diagnostics…" to { a.sendDiagnostics() })
+        buttons(false, "Lenses…" to { a.showLensMenu(settingsChip) }, "Rescan lenses" to { toggle(settingsSheet); a.rescanLenses() })
+        // On its own row: as a third button it wrapped onto two lines in the upright sheet (QA, 2026-11-13).
+        buttons(false, "Send diagnostics…" to { a.sendDiagnostics() })
         content.addView(kit.label("AuthRec ${a.packageManager.getPackageInfo(a.packageName, 0).versionName}", 11f, dim = true).apply {
             setPadding(0, a.dp(12), 0, a.dp(10))
         })
@@ -977,7 +1020,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         modeBox.select(modeButtons[a.modeIndex])
         modeBox.visibility = if (recording) View.INVISIBLE else View.VISIBLE // the REC pill sits there
         modeButtons.forEach { it.isEnabled = !busy }
-        setCaption(lookChip, a.currentView()?.label ?: "")
+        setLookCaption()
         kit.setOn(lookChip, lookSheet.visibility == View.VISIBLE)
         if (lookSheet.visibility == View.VISIBLE) {
             if (currentLookKey() != lookKey) rebuildLooks()
@@ -1029,6 +1072,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         // The info line sits behind the sheet's rows and showed through its glass.
         // (Upright, Adjust reaches the top of the image, where the stats line is.)
         a.info.visibility = if (sheetOpen || (upright && adjustPanel.visibility == View.VISIBLE)) View.INVISIBLE else View.VISIBLE
+        // The focus bar sits where the panels open, and showed through them (QA, 2026-11-13): it
+        // waits while one is open. ([CameraActivity.updateUi] shows it; this runs after, and on its own.)
+        a.focusBar.visibility = if (a.manualFocus && panels.none { it.visibility == View.VISIBLE }) View.VISIBLE else View.GONE
         // Upright the EV slider runs down the image, where the panels open.
         a.exposureSlider.visibility = if (upright && panels.any { it.visibility == View.VISIBLE }) View.INVISIBLE else View.VISIBLE
         if (!pro) listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel).forEach { it.visibility = View.GONE }
@@ -1103,7 +1149,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         val ns = if (manual) a.capture.exposureNs else meta?.exposureNs?.takeIf { it > 0 } ?: a.capture.exposureNs
         val effective = a.lastEffectiveIso
         setCaption(isoChip, "$iso", auto = !manual)
-        isoTitle.text = if (effective != null && effective > iso * 1.4) "ISO  ·  ≈$effective with gain" else "ISO"
+        isoTitle.text = if (effective != null && effective > iso * 1.4) "ISO  ·  ≈${a.isoText(effective)} with gain" else "ISO"
         setCaption(shutterChip, shutterText(ns), auto = !manual)
 
         val isoStops = a.isoStops()

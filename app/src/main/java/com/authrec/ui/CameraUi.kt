@@ -32,6 +32,9 @@ internal interface CameraUi {
 
     /** The phone's pose, quarter turns clockwise from the screen's landscape: the controls turn to read upright (Glass). */
     fun setTurn(turn: Int) = Unit
+
+    /** The pose the controls are in (or turning to), as [setTurn] takes it: dialogs open the same way up. */
+    val heldTurn: Int get() = 0
 }
 
 /** "− value +" control (classic exposure bar, priority limits). */
