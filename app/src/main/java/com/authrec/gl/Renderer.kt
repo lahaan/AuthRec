@@ -79,6 +79,27 @@ class Renderer(
      * fitted against ISP JPEGs in daylight). The log curves keep the sensor's clip point either way.
      */
     @Volatile var exposureOffsetEv: Float = 0f
+        private set
+    /**
+     * What the activity decides about exposure in one go (applyExposure): [offsetEv] is
+     * [exposureOffsetEv], and so on by name. One object, taken at the start of each frame, because
+     * the parts only make sense together: an EVO step of the sensor arrives as a grant and the
+     * digital gain that cancels it, and a frame that got one without the other (the grant is read
+     * when the frame starts, the gain when it's drawn, the UI thread writes in between) came out a
+     * sixth of a stop darker or brighter than its neighbours (X14, 2026-11-13).
+     */
+    class Exposure(val offsetEv: Float = 0f, val sensorCompEv: Float = 0f, val aeCompEv: Float = 0f,
+                   val evoGrantedEv: Float = 0f, val evoUserEv: Float = 0f, val evoSensorAllowed: Boolean = false)
+    @Volatile var exposure = Exposure()
+    private fun takeExposure() {
+        val x = exposure
+        exposureOffsetEv = x.offsetEv
+        sensorCompEv = x.sensorCompEv
+        aeCompEv = x.aeCompEv
+        evoGrantedEv = x.evoGrantedEv
+        evoUserEv = x.evoUserEv
+        evoSensorAllowed = x.evoSensorAllowed
+    }
     /** Holds the auto gain where it is (manual exposure mode). */
     @Volatile var autoGainFrozen: Boolean = false
     /** Log-average linear brightness of the latest RAW frame (green), and the share of near-clipped samples. */
@@ -107,6 +128,7 @@ class Renderer(
      * a brightness step, and a drag of the EV slider no longer jumps and settles.
      */
     @Volatile var aeCompEv = 0f
+        private set
     /** The compensation the frames really have so far (NaN: not started), on its way from [compFrom] to [compTo]. */
     private var compShown = Float.NaN
     private var compFrom = 0f
@@ -176,6 +198,61 @@ class Renderer(
         lastFrameExposure = frameExposure
     }
 
+    // ---- Short excursions of the camera's own exposure ----
+
+    /**
+     * EV of digital gain holding the picture where it was while the camera's exposure is briefly
+     * somewhere else. Phones' AE makes short trips: the X14 shortens the shutter from 1/100 to
+     * 1/120 for 4–10 frames every second or two and raises ISO to match, which shows nothing,
+     * until ISO is at its limit (3200) and can't: then those frames are 0.26 EV darker, sharply,
+     * and back (the owner's clips at dusk, 2026-11-13: "the exposure just goes wonky for
+     * literally no reason"; reproduced against a screen fading down, where the 2.6x sits at ISO
+     * 3200 and 1/100 over a stop and a half of light).
+     *
+     * So a change of ISO × shutter of up to [STEADY_MAX] EV is evened out for its first
+     * [STEADY_FRAMES] frames (half a second): if the exposure comes back, nothing was seen. If it
+     * stays, it was meant, and the picture goes there gently; a larger change is followed at
+     * once, quicker the further off it is. Only in AE Auto and Locked (Priority has its own
+     * evening, [exposureTarget]), and not while the user's EV or a step of EVO's is on its way
+     * to the sensor: those changes are expected and evened out by their own counts.
+     */
+    @Volatile private var steadyEv = 0f
+    /** log2 of the exposure (ISO × ns) the picture is shown as (NaN: not started). */
+    private var steadyRef = Float.NaN
+    private var steadyHeld = 0
+
+    private fun updateSteady(frameExposure: Double, own: Boolean) {
+        if (frameExposure.isNaN() || !exposureTarget.isNaN() || !evoSensorAllowed) {
+            steadyRef = Float.NaN
+            steadyEv = 0f
+            return
+        }
+        // Another frame's exposure says nothing about this one: as it was.
+        if (!own) return
+        val e = log2(frameExposure.toFloat())
+        if (steadyRef.isNaN() || frameBreak) steadyRef = e
+        val off = e - steadyRef
+        val expected = evoWindow > 0f || evoUserQuiet < 1f || (!compShown.isNaN() && compShown != compTo)
+        when {
+            // The change under way has its own evening, so none of it is taken up here (both at once
+            // made a blip of the step's size); what was being held is let go over a few frames.
+            expected -> {
+                steadyRef = e + steadyEv * 0.7f
+                steadyHeld = STEADY_FRAMES
+            }
+            abs(off) < 0.02f -> {
+                steadyRef = e
+                steadyHeld = 0
+            }
+            abs(off) <= STEADY_MAX && steadyHeld < STEADY_FRAMES -> steadyHeld++
+            else -> {
+                steadyRef += off * (abs(off) * 0.6f).coerceIn(0.12f, 0.7f)
+                steadyHeld = STEADY_FRAMES
+            }
+        }
+        steadyEv = steadyRef - e
+    }
+
     // ---- EVO: the Exposure Value Optimizer (see Evo) ----
 
     /** Following the scene, holding (exposure locked, a photo burst under way) or off. */
@@ -190,10 +267,13 @@ class Renderer(
      * (the activity rounds it to the phone's steps and fits it in the range beside the user's EV).
      */
     @Volatile var evoGrantedEv = 0f
+        private set
     /** The user's own EV: taken out of what EVO looks at, so their bias stays on top of its choice. */
     @Volatile var evoUserEv = 0f
+        private set
     /** EVO may ask for real exposure (AE Auto, kept in Locked). Priority keeps to the user's limits: the view only. */
     @Volatile var evoSensorAllowed = false
+        private set
     /** 0 gentle, 1 balanced, 2 strong (Evo.strength). */
     @Volatile var evoStrength = 1
     /** Called on the GL thread when the real exposure EVO asks for changes (EV, whole AE steps). */
@@ -372,14 +452,26 @@ class Renderer(
      * out of the ISO the night limit looks at, or it would take back half of every +EV at night.
      */
     @Volatile var sensorCompEv: Float = 0f
+        private set
     /** EV the night limit currently takes off the auto gain (eased, see [updateNightCut]). */
     @Volatile private var nightCut = 0f
     private var nightCutStarted = false
 
-    private fun updateNightCut(iso: Int?) {
+    /**
+     * The night limit goes by how dark the scene is, which is ISO × shutter, not ISO alone: the
+     * ISO the frame would have had at 1/50 s ([NIGHT_REF_NS], where phones sit in a dim room).
+     * By ISO alone the picture changed with how the camera's AE splits the same exposure: the
+     * X14's 2.6x goes from 1/50 at ISO 900 to 1/100 at ISO 1600 and back around one light level
+     * (a sixth of a stop of compensation is enough to tip it), and each time the picture went
+     * 0.4 EV darker or brighter over the next second (2026-11-13; the owner: "it just going back
+     * and forth not knowing what exposure to use").
+     */
+    private fun updateNightCut(meta: FrameMeta?) {
         val auto = if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv
         val knee = nightKneeIso
-        if (iso == null || iso <= 0) return
+        if (meta == null || meta.iso <= 0) return
+        // (As the picture is shown: a short trip of the exposure that's evened out isn't a darker scene.)
+        val iso = (if (meta.exposureNs > 0) meta.iso * (meta.exposureNs.toFloat() / NIGHT_REF_NS) else meta.iso.toFloat()) * 2f.pow(steadyEv)
         val target = if (!nightLimit || knee <= 0f) 0f else
             // (Of EVO's part of the compensation, what the sensor really did: a camera at its ISO
             // limit ignores a step, and the night limit mustn't react to one that changed nothing.)
@@ -392,7 +484,7 @@ class Renderer(
 
     /** All digital gain before the log curve, in EV (auto gain or its default after the night limit, plus the user's). */
     val totalGainEv: Float get() = (if (autoGainEv.isNaN()) DEFAULT_GAIN_EV else autoGainEv) - nightCut + exposureOffsetEv + compLagEv +
-        evoViewEv + evoCorrectionEv
+        evoViewEv + evoCorrectionEv + steadyEv
     @Volatile var lutStrength: Float = 1f
     /**
      * Tone balance of the view, -1..1 each (see PipelineShaders.finish `balanceTone`): pulls the
@@ -642,12 +734,62 @@ class Renderer(
         /** Frames this thread let go undeveloped to keep the camera supplied (see fillPending). */
         var skipped = 0
 
+        // What the exposure did, for clips whose brightness jumps (see exposureSummary).
+        var isoLow = 0
+        var isoHigh = 0
+        var nsLow = 0L
+        var nsHigh = 0L
+        var foreignMeta = 0
+        var exposureSteps = 0
+        val exposureStepsAt = StringBuilder()
+        var jumps = 0
+        val jumpsAt = StringBuilder()
+        private var lastShown = Float.NaN
+
+        /**
+         * One frame of the clip: its ISO and shutter ([own]: from its own capture result), how far
+         * its exposure moved from the frame before ([stepEv]) and how bright it comes out
+         * ([shownEv]: log2 of the RAW's average after all gain).
+         */
+        fun noteExposure(timestamp: Long, iso: Int, ns: Long, own: Boolean, stepEv: Float, shownEv: Float) {
+            val at = (timestamp - firstTimestamp) / 1e9
+            if (!own) foreignMeta++
+            if (iso > 0 && ns > 0) {
+                isoLow = if (isoLow == 0) iso else minOf(isoLow, iso)
+                isoHigh = maxOf(isoHigh, iso)
+                nsLow = if (nsLow == 0L) ns else minOf(nsLow, ns)
+                nsHigh = maxOf(nsHigh, ns)
+            }
+            if (abs(stepEv) >= 0.08f) {
+                exposureSteps++
+                if (exposureStepsAt.length < 110) exposureStepsAt.append(" %.2f s %+.2f".format(at, stepEv))
+            }
+            if (!shownEv.isNaN() && !lastShown.isNaN() && abs(shownEv - lastShown) >= 0.2f) {
+                jumps++
+                if (jumpsAt.length < 110) jumpsAt.append(" %.2f s %+.2f".format(at, shownEv - lastShown))
+            }
+            lastShown = shownEv
+        }
+
+        /**
+         * For the event log: the camera's ISO and shutter over the clip, the frame-to-frame steps
+         * of its exposure, and the frames that came out brighter or darker than the one before by
+         * a fifth of a stop or more (a pan does that too; a still scene shouldn't).
+         */
+        private fun exposureSummary() = if (isoHigh == 0) "" else
+            ", ISO " + (if (isoLow == isoHigh) "$isoLow" else "$isoLow–$isoHigh") + " at 1/%.0f".format(1e9 / nsHigh) +
+            (if (nsLow != nsHigh) "–1/%.0f".format(1e9 / nsLow) else "") +
+            (if (exposureSteps > 0) ", $exposureSteps exposure steps (EV:$exposureStepsAt)" else "") +
+            (if (jumps > 0) ", $jumps brightness jumps (EV:$jumpsAt)" else "") +
+            (if (foreignMeta > 0) ", $foreignMeta frames without their own capture result" else "")
+
         /** One line for the event log: when frames were lost and what the GL thread was doing. */
         fun timingSummary() = "Recording timing: $dropped frames lost" +
             (if (gaps.isNotEmpty()) " (at$gaps)" else "") +
             (if (skipped > 0) ", $skipped skipped here to keep the camera supplied" else "") +
             ", average frame %.1f ms, slowest frame %.0f ms at %.2f s, slowest encoder hand-over %.0f ms, slowest pre-roll frame %.0f ms (%d lost), preview showed %d of %d frames"
-                .format(if (clipFrames > 0) clipMs / clipFrames else 0.0, slowestFrameMs, slowestFrameAt, slowestSwapMs, prerollSlowestMs, prerollLost, viewFrames, clipFrames)
+                .format(if (clipFrames > 0) clipMs / clipFrames else 0.0, slowestFrameMs, slowestFrameAt, slowestSwapMs, prerollSlowestMs, prerollLost, viewFrames, clipFrames) +
+            exposureSummary()
     }
 
     private var frameCount = 0
@@ -881,7 +1023,7 @@ class Renderer(
                     break
                 }
                 val image = pending.firstOrNull() ?: break
-                if (!readyToDevelop(image, rec.frameNs)) break // its capture result wakes us
+                if (!readyToDevelop(image, rec.frameNs, WAIT_RECORDING)) break // its capture result wakes us
                 pending.removeFirst()
                 val f0 = SystemClock.elapsedRealtimeNanos()
                 val ts = image.timestamp
@@ -904,14 +1046,14 @@ class Renderer(
                 // 0 fps" (owner: "choppy as hell"); drawing it costs a hot phone the odd frame, and
                 // losing frames sheds colour NR (watchBudget), which gives the time back.
                 fillPending(rec)
-                val caughtUp = pending.firstOrNull()?.let { !readyToDevelop(it, rec.frameNs) } ?: true
+                val caughtUp = pending.firstOrNull()?.let { !readyToDevelop(it, rec.frameNs, WAIT_RECORDING) } ?: true
                 if (caughtUp || SystemClock.elapsedRealtimeNanos() - lastViewNs >= VIEW_INTERVAL_NS) drawView(rec)
             }
         } else {
             // The preview needn't show every frame: the newest one whose result is in, else the
             // newest once the oldest can't wait any longer.
             val ready = pending.indexOfLast { metaArrived(it.timestamp) }
-            val pick = if (ready >= 0) ready else pending.lastIndex.takeIf { it >= 0 && readyToDevelop(pending.first(), PREVIEW_FRAME_NS) }
+            val pick = if (ready >= 0) ready else pending.lastIndex.takeIf { it >= 0 && readyToDevelop(pending.first(), PREVIEW_FRAME_NS, MAX_PENDING) }
             if (pick != null) {
                 repeat(pick) { pending.removeFirst().close() }
                 meta = processFrame(pending.removeFirst())
@@ -974,15 +1116,22 @@ class Renderer(
     }
 
     /**
-     * Whether [image] may be developed now: its result is in, or it can't wait longer: two newer
-     * frames behind it, or older than 2.5 frame intervals ([frameNs]). Waiting only until the next
+     * Whether [image] may be developed now: its result is in, or isn't coming (a later frame's is
+     * in: results arrive in order), or it can't wait longer: [room] frames are waiting, or it is
+     * older than [room] and a half frame intervals ([frameNs]). Waiting only until the next
      * frame wasn't enough on the Xiaomi 15 Ultra, whose results come more than a frame late
-     * (0–14 of 90 matched, 2026-10-19).
+     * (0–14 of 90 matched, 2026-10-19); nor was waiting for two: the X14's 2.6x delivers a result
+     * about when the second frame after it arrives, so the limit let the frame go just before
+     * (118 of 322 matched on a warm phone, and the preview, which then takes the newest frame,
+     * the one furthest from its result, drew every other frame). A frame with another's result
+     * gets the wrong exposure, and a step of real exposure is then evened out a frame or two
+     * late: a dip or flash of the step's size (2026-11-13).
      */
-    private fun readyToDevelop(image: Image, frameNs: Long): Boolean {
+    private fun readyToDevelop(image: Image, frameNs: Long, room: Int): Boolean {
         val ts = image.timestamp
-        if (metaArrived(ts) || pending.size >= 3) return true
-        return sensor.timestampsAreBoottime && SystemClock.elapsedRealtimeNanos() - ts > frameNs * 5 / 2
+        if (metaArrived(ts) || pending.size >= room) return true
+        if (pending.any { it.timestamp > ts && metaArrived(it.timestamp) }) return true
+        return sensor.timestampsAreBoottime && SystemClock.elapsedRealtimeNanos() - ts > frameNs * (2 * room + 1) / 2
     }
 
     /** acquireNextImage throws instead of returning null when all buffers are held; treat both as "none". */
@@ -1004,12 +1153,13 @@ class Renderer(
         val timestamp = image.timestamp
         lastFrameMs = SystemClock.elapsedRealtime()
         val meta = metaSource(timestamp)
+        takeExposure()
         photo?.takeIf { it.taken == 0 }?.let {
             it.refTimestamp = timestamp
             it.refMeta = meta
             it.onReference(timestamp)
         }
-        updateNightCut(meta?.iso)
+        updateNightCut(meta)
         val frameExposure = meta?.let { it.iso.toDouble() * it.exposureNs }?.takeIf { it > 0 } ?: Double.NaN
         rawLogAverage(image, meta)?.let { raw ->
             rawExposure = frameExposure
@@ -1021,13 +1171,16 @@ class Renderer(
         lastTimestamp = timestamp
         updateCompLag(frameExposure, dt)
         updateEvo(meta, dt)
+        updateSteady(frameExposure, meta?.timestamp == timestamp)
+        recording?.takeIf { !it.preroll && it.firstTimestamp >= 0 }?.noteExposure(timestamp, meta?.iso ?: 0, meta?.exposureNs ?: 0L,
+            meta?.timestamp == timestamp, frameStepEv, if (rawBrightness > 0f) log2(rawBrightness) + totalGainEv else Float.NaN)
         if (expLogFrames > 0) {
             expLogFrames--
             evo.debugSensor = if (evoTestStep == 0f || expLogFrames == 0) Float.NaN else if ((expLogFrames / 75) % 2 == 0) evoTestStep else 0f
-            android.util.Log.i("AuthRec", "EXP %d iso %d ns %d %s off %.1f prev %s raw %.5f isp %.5f auto %.3f night %.3f lag %.3f view %.3f corr %.3f deliv %.3f grant %.3f comp %.3f total %.3f".format(
+            android.util.Log.i("AuthRec", "EXP %d iso %d ns %d %s off %.1f prev %s raw %.5f isp %.5f auto %.3f night %.3f lag %.3f view %.3f corr %.3f deliv %.3f grant %.3f comp %.3f steady %.3f total %.3f".format(
                 timestamp / 1_000_000, meta?.iso ?: 0, meta?.exposureNs ?: 0L, if (meta?.timestamp == timestamp) "own" else "other", ((meta?.timestamp ?: timestamp) - timestamp) / 1e6,
                 if (expLogPrev != 0L && metaArrived(expLogPrev)) "in" else "missing",
-                rawBrightness, ispBrightness(), autoGainEv, nightCut, compLagEv, evoViewEv, evoCorrectionEv, evoDelivered, evoGrantedEv, exposureComp, totalGainEv))
+                rawBrightness, ispBrightness(), autoGainEv, nightCut, compLagEv, evoViewEv, evoCorrectionEv, evoDelivered, evoGrantedEv, exposureComp, steadyEv, totalGainEv))
         }
         expLogPrev = timestamp
         sharpnessRegion?.let {
@@ -2565,6 +2718,11 @@ class Renderer(
         private const val GRID_ROWS = 47
         /** EVO brightens only below this effective ISO (sensor ISO × gain): scenes with light to spare. */
         private const val EVO_PUSH_MAX_ISO = 1600f
+        /** The largest change of exposure taken for a short trip, in EV, and the frames it's given to come back (see steadyEv). */
+        private const val STEADY_MAX = 0.5f
+        private const val STEADY_FRAMES = 15
+        /** The shutter time the night limit's ISO is counted at: 1/50 s (see updateNightCut). */
+        private const val NIGHT_REF_NS = 20_000_000f
         const val NIGHT_KNEE_ISO = 3200f
         private const val NIGHT_SLOPE = 0.5f
         /** Frames over which a recording's frame time is averaged (see watchBudget), and those skipped first. */
@@ -2578,6 +2736,8 @@ class Renderer(
         /** Frames taken from the reader at most (it has 10; the camera needs some): preview, recording. */
         private const val MAX_PENDING = 4
         private const val MAX_PENDING_RECORDING = 8
+        /** Frames a recording lets wait for the oldest one's capture result (see readyToDevelop). */
+        private const val WAIT_RECORDING = 5
         /** Debug (adb slowframe=ms): each recorded frame holds this thread that much longer, as a hot phone's GPU would. */
         @Volatile var debugSlowFrameMs = 0
         /** Debug (adb photomerge=false): photos without the burst merge. */

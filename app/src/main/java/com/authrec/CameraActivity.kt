@@ -790,8 +790,8 @@ class CameraActivity : Activity() {
         val evoSensor = if (capture.ae == AeMode.AUTO || capture.ae == AeMode.LOCKED) evoSensorEv else 0f
         r?.autoGainFrozen = capture.ae == AeMode.MANUAL || capture.ae == AeMode.PRIORITY || abs(exposureEv) > 0.05f || evoSensor != 0f
         r?.nightLimit = capture.ae != AeMode.MANUAL
-        r?.evoUserEv = exposureEv
-        r?.evoSensorAllowed = capture.ae == AeMode.AUTO || capture.ae == AeMode.LOCKED
+        val evoAllowed = capture.ae == AeMode.AUTO || capture.ae == AeMode.LOCKED
+        // The renderer takes these as one set per frame (Renderer.Exposure).
         when (capture.ae) {
             AeMode.AUTO, AeMode.LOCKED -> {
                 val info = camera?.info
@@ -804,26 +804,15 @@ class CameraActivity : Activity() {
                 val highest = info?.evRange?.upper ?: 0
                 val user = Math.round(exposureEv / step).coerceIn(lowest, highest)
                 val steps = (user + Math.round(evoSensor / step)).coerceIn(lowest, highest)
-                r?.evoGrantedEv = (steps - user) * step
                 // The picture gets the user's EV; what the sensor got of it and of EVO's is evened
                 // out digitally (the renderer adds EVO's view shift and the frames still on their way).
-                r?.exposureOffsetEv = exposureEv - steps * step
-                r?.sensorCompEv = steps * step
-                r?.aeCompEv = steps * step
+                r?.exposure = Renderer.Exposure(offsetEv = exposureEv - steps * step, sensorCompEv = steps * step, aeCompEv = steps * step,
+                    evoGrantedEv = (steps - user) * step, evoUserEv = exposureEv, evoSensorAllowed = evoAllowed)
                 if (steps != capture.evSteps) setCapture(capture.copy(evSteps = steps), updateUiNow = false)
             }
-            AeMode.PRIORITY -> {
-                r?.evoGrantedEv = 0f
-                r?.exposureOffsetEv = 0f // the loop's target carries it
-                r?.sensorCompEv = exposureEv
-                r?.aeCompEv = 0f
-            }
-            AeMode.MANUAL -> {
-                r?.evoGrantedEv = 0f
-                r?.exposureOffsetEv = exposureEv
-                r?.sensorCompEv = 0f
-                r?.aeCompEv = 0f
-            }
+            // The loop's target carries the user's EV.
+            AeMode.PRIORITY -> r?.exposure = Renderer.Exposure(sensorCompEv = exposureEv, evoUserEv = exposureEv, evoSensorAllowed = evoAllowed)
+            AeMode.MANUAL -> r?.exposure = Renderer.Exposure(offsetEv = exposureEv, evoUserEv = exposureEv, evoSensorAllowed = evoAllowed)
         }
         applyEvo()
     }
@@ -1704,6 +1693,8 @@ class CameraActivity : Activity() {
         val current = lenses.getOrNull(lensIndex) ?: return false
         if (current.zoomRatio == 1f) return false
         val backup = twinOf(current) ?: return false
+        // No camera is there while the camera service restarts: that isn't this route's fault.
+        if (!cameraThere(backup.openId)) return false
         EventLog.log("Native AF route ${current.key} failed ($reason); using backup ${backup.key}")
         nativeFailed += current.key
         stopRecording("Stopped: ${current.label} native AF route failed") // also cancels a warm-up
@@ -2129,13 +2120,50 @@ class CameraActivity : Activity() {
             // While the camera service has the camera down (restarting HAL, device still closing),
             // an attempt would only fail again and count against the lens: wait for it, up to 10 s.
             val id = lenses.getOrNull(lensIndex)?.openId
-            if (id != null && id in unavailableCameras && SystemClock.elapsedRealtime() - retryWaitStartMs < 10_000) {
+            if (id != null && (id in unavailableCameras || !cameraThere(id)) && SystemClock.elapsedRealtime() - retryWaitStartMs < 10_000) {
                 info.postDelayed(this, 300)
                 return
             }
             retryPending = false
             if (resumed && !scanning) restartPipeline()
         }
+    }
+
+    /**
+     * Whether the camera service knows camera [id] just now. While its HAL restarts after a crash
+     * it knows none, hidden lenses included (which the list of cameras never names).
+     */
+    private fun cameraThere(id: String): Boolean = SystemClock.elapsedRealtime() >= debugGoneUntilMs && runCatching {
+        getSystemService(android.hardware.camera2.CameraManager::class.java).getCameraCharacteristics(id)
+    }.isSuccess
+
+    /** Debug (adb camgone=ms): until then the app behaves as if the camera service had no cameras. */
+    private var debugGoneUntilMs = 0L
+
+    /** The lens and time of the last second go given to a zoom route that failed after working (see [onCameraFailure]). */
+    private var secondGoKey: String? = null
+    private var secondGoMs = 0L
+
+    /**
+     * The lens couldn't even be looked up ([reason]): the camera service doesn't have it just now.
+     * Tried again like any failure, where it used to end on a black screen with the service's
+     * error text until the app was reopened (X14, 2026-11-13: its camera service died 15 s into a
+     * clip, and the backup lens the app turned to wasn't there yet).
+     */
+    private fun cameraNotThere(reason: String) {
+        val lens = lenses.getOrNull(lensIndex)
+        cameraFailures++
+        if (resumed && cameraFailures <= MAX_CAMERA_RETRIES) {
+            val delay = minOf(4000L, 600L shl (cameraFailures - 1))
+            EventLog.log("Lens ${lens?.key}: not there; retry $cameraFailures/$MAX_CAMERA_RETRIES in $delay ms")
+            showMessage("Camera not available. Retrying ($cameraFailures/$MAX_CAMERA_RETRIES)…")
+            retryPending = true
+            retryWaitStartMs = SystemClock.elapsedRealtime() + delay
+            info.postDelayed(retryCamera, delay)
+            return
+        }
+        EventLog.log("Giving up on lens ${lens?.key}: not there after $cameraFailures tries")
+        showMessage("Camera unavailable: $reason. Lens button → Rescan lenses, or Send diagnostics")
     }
 
     /**
@@ -2150,7 +2178,17 @@ class CameraActivity : Activity() {
         cam.close()
         stopRecording("Stopped: camera problem ($reason)") // also cancels a warm-up
         if (!resumed) return // onResume reopens
-        if (fallBackToBackup(reason)) return
+        // A zoom route that had been delivering for seconds isn't a broken route: the failure is
+        // more likely the camera service's (its HAL died 130 s into the X14's 2.6x, and the backup
+        // lens wasn't there either until it had restarted). It gets one more go, once a minute;
+        // failing again, or before it delivered, it goes to its backup as before.
+        val key = lenses.getOrNull(lensIndex)?.key
+        val now = SystemClock.elapsedRealtime()
+        val secondGo = cam.resultsSeen >= 150 && (key != secondGoKey || now - secondGoMs > 60_000)
+        if (secondGo) {
+            secondGoKey = key
+            secondGoMs = now
+        } else if (fallBackToBackup(reason)) return
         val lens = lenses.getOrNull(lensIndex)
         val noFrames = (renderer?.frameCounter ?: 0L) == 0L
         cameraFailures++
@@ -2204,12 +2242,13 @@ class CameraActivity : Activity() {
         if (camera != null) return
         lateinit var cam: RawCamera
         cam = try {
+            if (SystemClock.elapsedRealtime() < debugGoneUntilMs) throw IllegalArgumentException("unknown device (camgone test)")
             RawCamera(this, cameraHandler, lenses.getOrNull(lensIndex), sessionVariant) { reason ->
                 runOnUiThread { onCameraFailure(cam, reason) }
             }
         } catch (e: Exception) {
             EventLog.log("Camera unavailable for lens ${lenses.getOrNull(lensIndex)?.key}", e)
-            info.text = "Camera unavailable: ${e.message}"
+            cameraNotThere(e.message ?: e.javaClass.simpleName)
             return
         }
         // One GL context for preview and encoder needs the recording's bit depth up front (EglCore).
@@ -2719,6 +2758,8 @@ class CameraActivity : Activity() {
             (if (bakeLut && !simple && (photoTexture != 0 || photoClarity != 0 || photoDehaze != 0))
                 " (texture %+d clarity %+d dehaze %+d)".format(photoTexture, photoClarity, photoDehaze) else "") + ", clean $cleanup, " +
             "eDR ${if (edrOn) "$edrHighlights/$edrShadows" else "off"}, " +
+            "AE ${capture.ae.name.lowercase()} EV %+.1f".format(exposureEv) +
+            (camera?.latestMeta?.let { ", ISO ${it.iso} at 1/%.0f".format(1e9 / it.exposureNs.coerceAtLeast(1)) } ?: "") + ", " +
             (if (evoOn) "EVO %+.1f EV (sensor %+.1f), ".format(r.evoViewEv, r.evoSensorEv) else "") + "WB shift $wbWarmth/$wbTint, " +
             (if (mirrored()) "mirrored, " else "") +
             (if (turn != 0) "turned $turn° (phone held ${if (turn % 180 == 0) "upside down" else "upright"}), " else "") +
@@ -3143,6 +3184,7 @@ class CameraActivity : Activity() {
      * evodump = true (`--ez`: log EVO's measure of the scene once, 3 s later, for tools/evosim),
      * explog = frames (`--ei`: log every frame's exposure and each part of the gain for that many frames),
      * evostep = EV (`--ef`, with explog: EVO asks this of the sensor and takes it back every 75 logged frames),
+     * camgone = ms (`--ei`: 2.5 s later the camera fails and the camera service has no cameras for that long),
      * wbwarm / wbtint = -100..100 (white balance trim), mirror = true (front camera as a mirror image),
      * ui = glass | classic (rebuilds the screen),
      * edrhint = reset (the one-time eDR suggestion may come again) | show (show it now),
@@ -3244,6 +3286,10 @@ class CameraActivity : Activity() {
         if (extras.containsKey("evostrength")) setEvoStrength(extras.getInt("evostrength"))
         if (extras.containsKey("evoverbose")) renderer?.evoVerbose = extras.getBoolean("evoverbose")
         if (extras.containsKey("evostep")) renderer?.evoTestStep = extras.getFloat("evostep")
+        if (extras.containsKey("camgone")) info.postDelayed({
+            debugGoneUntilMs = SystemClock.elapsedRealtime() + extras.getInt("camgone")
+            camera?.let { onCameraFailure(it, "camera error DEVICE (camgone test)") }
+        }, 2500)
         if (extras.containsKey("explog")) renderer?.expLogFrames = extras.getInt("explog")
         if (extras.containsKey("evodim")) renderer?.evoDimWeight = extras.getFloat("evodim")
         if (extras.getBoolean("evodump")) info.postDelayed({ renderer?.evoDump = true }, 3000)

@@ -1,0 +1,17 @@
+<!doctype html><html><head><meta charset="utf-8"><title>AuthRec exposure target</title>
+<style>html,body{margin:0;height:100%;background:#000;cursor:none}#t{position:fixed;left:8px;bottom:6px;font:11px monospace;color:#444}</style></head>
+<body><div id="t"></div><script>
+// A uniform field whose light goes down 5 stops and back up, linearly in stops, once every
+// PERIOD seconds, timed by the wall clock (so the phone's log can be lined up with it).
+// ?period=90&stops=5&hold=0 ; ?level=-2 holds one level (stops under white).
+const q=new URLSearchParams(location.search);
+const PERIOD=+(q.get('period')||90), STOPS=+(q.get('stops')||5), FIXED=q.get('level');
+function stopsNow(){ if(FIXED!==null) return +FIXED;
+  const p=(Date.now()/1000%PERIOD)/PERIOD; return -STOPS*(p<0.5?2*p:2-2*p); }
+function frame(){ const s=stopsNow(), lin=Math.pow(2,s);
+  const v=lin<=0.0031308?12.92*lin:1.055*Math.pow(lin,1/2.4)-0.055; const c=Math.round(255*v);
+  document.body.style.background='rgb('+c+','+c+','+c+')';
+  document.getElementById('t').textContent=s.toFixed(2)+' stops';
+  requestAnimationFrame(frame);} frame();
+document.body.onclick=()=>document.documentElement.requestFullscreen();
+</script></body></html>
