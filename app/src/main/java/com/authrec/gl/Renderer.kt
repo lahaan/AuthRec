@@ -1163,7 +1163,7 @@ class Renderer(
         val frameExposure = meta?.let { it.iso.toDouble() * it.exposureNs }?.takeIf { it > 0 } ?: Double.NaN
         rawLogAverage(image, meta)?.let { raw ->
             rawExposure = frameExposure
-            updateAutoGain(raw)
+            updateAutoGain(raw, frameExposure, meta?.timestamp == timestamp)
         }
         updateExposureComp(frameExposure)
         val dt = if (lastTimestamp != 0L) ((timestamp - lastTimestamp) / 1e9f).coerceIn(0.001f, 0.2f) else 1f / 30
@@ -1177,10 +1177,10 @@ class Renderer(
         if (expLogFrames > 0) {
             expLogFrames--
             evo.debugSensor = if (evoTestStep == 0f || expLogFrames == 0) Float.NaN else if ((expLogFrames / 75) % 2 == 0) evoTestStep else 0f
-            android.util.Log.i("AuthRec", "EXP %d iso %d ns %d %s off %.1f prev %s raw %.5f isp %.5f auto %.3f night %.3f lag %.3f view %.3f corr %.3f deliv %.3f grant %.3f comp %.3f steady %.3f total %.3f".format(
+            android.util.Log.i("AuthRec", "EXP %d iso %d ns %d %s off %.1f prev %s raw %.5f isp %.5f auto %.3f night %.3f lag %.3f view %.3f corr %.3f deliv %.3f grant %.3f comp %.3f steady %.3f total %.3f quick %d".format(
                 timestamp / 1_000_000, meta?.iso ?: 0, meta?.exposureNs ?: 0L, if (meta?.timestamp == timestamp) "own" else "other", ((meta?.timestamp ?: timestamp) - timestamp) / 1e6,
                 if (expLogPrev != 0L && metaArrived(expLogPrev)) "in" else "missing",
-                rawBrightness, ispBrightness(), autoGainEv, nightCut, compLagEv, evoViewEv, evoCorrectionEv, evoDelivered, evoGrantedEv, exposureComp, steadyEv, totalGainEv))
+                rawBrightness, ispBrightness(), autoGainEv, nightCut, compLagEv, evoViewEv, evoCorrectionEv, evoDelivered, evoGrantedEv, exposureComp, steadyEv, totalGainEv, quickFrames))
         }
         expLogPrev = timestamp
         sharpnessRegion?.let {
@@ -1463,7 +1463,27 @@ class Renderer(
     private var rows = arrayOf<ShortArray>()
     private var colWeights = FloatArray(0)
 
-    private fun updateAutoGain(raw: Float) {
+    /**
+     * The scene's brightness as the sensor has it (log2 of the RAW average over ISO × shutter, so
+     * the camera's own exposure changes cancel out), lightly smoothed and over about a second:
+     * apart by [SCENE_MOVED_EV], the scene has changed (see [updateAutoGain]).
+     */
+    private var sceneNow = Float.NaN
+    private var sceneBefore = Float.NaN
+    /** Frames left of following the ISP quickly: after the scene last changed, and when a camera starts. */
+    private var quickFrames = FIRST_GAIN_FRAMES
+
+    private fun updateAutoGain(raw: Float, frameExposure: Double, own: Boolean) {
+        if (own && !frameExposure.isNaN() && raw > 0f) {
+            val scene = log2(raw) - log2(frameExposure.toFloat())
+            if (sceneNow.isNaN()) {
+                sceneNow = scene
+                sceneBefore = scene
+            }
+            sceneNow += (scene - sceneNow) * 0.3f
+            sceneBefore += (scene - sceneBefore) * 0.03f
+            if (abs(sceneNow - sceneBefore) > SCENE_MOVED_EV) quickFrames = SCENE_FOLLOW_FRAMES
+        }
         // Frozen (EV moved, Priority, Manual: the ISP's tone mapping partly undoes EV, and a gain
         // chasing it would cancel the user's) only once this lens has an estimate. One it knows
         // nothing about learns its first ~1.5 s anyway, slightly off by what the ISP undoes, rather
@@ -1473,8 +1493,20 @@ class Renderer(
         val isp = ispBrightness()
         if (isp.isNaN() || raw <= 0f) return
         val target = (log2(isp / raw) + AUTO_BIAS_EV).coerceIn(0f, 5f)
-        // ~1 s to settle at 30 fps, so exposure follows the scene without visible pumping.
-        autoGainEv = if (autoGainEv.isNaN()) target else autoGainEv + (target - autoGainEv) * 0.08f
+        // ~1 s to settle at 30 fps, so exposure follows the scene without visible pumping: a pan
+        // into backlight has the phone expose the RAW two stops darker and lift it in its
+        // rendering, and ours has to as well. But the ISP also changes its rendering in one go
+        // while the scene only drifts (the X14's went a stop darker in 0.4 s at one light level
+        // of a slow fade, the RAW unchanged, and the picture with it within a second: 2026-11-13).
+        // So unless the scene itself has just jumped (or the camera has just started), the gain
+        // moves no faster than [AUTO_SLEW]: a gradual change is followed as before (a window
+        // brightening 4 stops in 20 s moves the ISP's rendering 0.07 EV a second), and a sudden
+        // one of the ISP's becomes a drift over a few seconds. (Following slowly instead, at 4 s
+        // to settle, left the gain 0.4 EV behind through that window's fade.)
+        val quick = gainFrames < FIRST_GAIN_FRAMES || quickFrames > 0
+        if (quickFrames > 0) quickFrames--
+        val step = (target - autoGainEv) * 0.08f
+        autoGainEv = if (autoGainEv.isNaN()) target else autoGainEv + (if (quick) step else step.coerceIn(-AUTO_SLEW, AUTO_SLEW))
         gainFrames++
         if (!autoGainFrozen && ++gainFramesUnfrozen >= FIRST_GAIN_FRAMES) autoGainTrusted = true
     }
@@ -2752,6 +2784,11 @@ class Renderer(
         private const val PASS_BUDGET_NS = 500_000_000L
         /** Frames the auto gain needs to settle on a new lens (~1.5 s at 30 fps). */
         private const val FIRST_GAIN_FRAMES = 45
+        /** How far the scene's brightness has to move within a second to count as a change of scene (EV), and the frames the ISP is then followed quickly. */
+        private const val SCENE_MOVED_EV = 0.25f
+        private const val SCENE_FOLLOW_FRAMES = 45
+        /** The most the auto gain moves per frame while the scene isn't jumping: a quarter of a stop a second at 30 fps. */
+        private const val AUTO_SLEW = 0.0085f
         /** History weight of colour NR where nothing moved: "+ Colour" / "+ Colour+". */
         private const val TNR_NORMAL = 0.7f
         private const val TNR_STRONG = 0.85f

@@ -1,0 +1,9 @@
+<!doctype html><html><head><meta charset="utf-8"><title>AuthRec HDR scene</title>
+<style>html,body{margin:0;height:100%;background:#000;cursor:none;overflow:hidden}video{width:100vw;height:100vh;object-fit:fill;display:block}</style></head>
+<body><video id="v" src="scene.mp4" muted loop playsinline autoplay></video><script>
+// The clip's time follows the wall clock (180 s loop), so a phone log can be lined up with it.
+const v=document.getElementById('v'), LOOP=180;
+function sync(){ const want=(Date.now()/1000)%LOOP; if(Math.abs(v.currentTime-want)>0.4) v.currentTime=want; if(v.paused) v.play().catch(()=>{}); }
+v.addEventListener('loadedmetadata',sync); setInterval(sync,2000);
+document.body.onclick=()=>document.documentElement.requestFullscreen();
+</script></body></html>
