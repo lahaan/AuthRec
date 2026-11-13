@@ -360,9 +360,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             section(name)
             // The section says what they are: no "★ " / "LUT " in front, nor ".cube.txt" behind.
             items.forEach { (i, v) ->
-                val name = v.label.removePrefix("★ ").removePrefix("LUT ").replace(Regex("""(\.cube)?(\.txt)?$""", RegexOption.IGNORE_CASE), "")
-                pill(name, current = { a.viewIndex == i }) { a.selectView(i) }
+                pill(a.plainName(v), current = { a.viewIndex == i }, onLong = if (a.deletable(v)) ({ a.promptDeleteView(v) }) else null) { a.selectView(i) }
             }
+            if (items.any { (_, v) -> a.deletable(v) }) note("Hold one to delete it.")
         }
 
         // An imported LUT is built for one log format; ours is converted to it before the lookup.

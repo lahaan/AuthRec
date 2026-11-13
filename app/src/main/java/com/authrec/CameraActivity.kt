@@ -1781,6 +1781,66 @@ class CameraActivity : Activity() {
         extras = listOf("Share" to { shareProfile(p) }, "Delete" to { deleteProfile(p) }),
         keyboard = false) { renameProfile(p, it) }
 
+    /** A look made in the editor or an imported LUT: the user's to delete (Log and the built-in looks aren't). */
+    internal fun deletable(v: ViewEntry) = v is ViewEntry.UserLook || v is ViewEntry.CubeFile
+
+    private fun fileOf(v: ViewEntry): File? = when (v) {
+        is ViewEntry.UserLook -> v.look.file ?: File(lutDir(), Look.safeName(v.look.name) + Look.SUFFIX)
+        is ViewEntry.CubeFile -> v.file
+        else -> null
+    }
+
+    /** A look's or LUT's name as the lists show it under their headings: no "★ " / "LUT ", no ".cube.txt". */
+    internal fun plainName(v: ViewEntry) =
+        v.label.removePrefix("★ ").removePrefix("LUT ").replace(Regex("""(\.cube)?(\.txt)?$""", RegexOption.IGNORE_CASE), "")
+
+    /**
+     * Asks, then deletes one of the user's looks or imported LUTs (owner, 2026-11-13: "make it so
+     * that self created + imported LUTs are deletable"). Not mid-clip: the clip may be recording it.
+     */
+    internal fun promptDeleteView(v: ViewEntry) {
+        if (!deletable(v)) return
+        if (!profilesUsable()) return note("Looks can be deleted after the clip")
+        val name = plainName(v)
+        val users = profiles.filter { it.look == v.label }.map { "\"${it.name}\"" }
+        val message = (if (v is ViewEntry.CubeFile) "The LUT is removed from AuthRec. The file you imported it from stays where it is."
+            else "The look and its settings are removed.") + when (users.size) {
+            0 -> ""
+            1 -> " The profile ${users[0]} uses it and will open without a look."
+            else -> " The profiles ${users.joinToString(", ")} use it and will open without a look."
+        }
+        if (kit.glass) {
+            val content = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(24), dp(20), dp(24), dp(4))
+                addView(kit.label("Delete \"$name\"?", 18f).apply { typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) })
+                addView(kit.label(message, 13f, dim = true), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+            }
+            GlassDialog.show(this, kit, content, listOf(GlassDialog.Action("Cancel"), GlassDialog.Action("Delete", main = true) { deleteView(v) }))
+        } else {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Delete \"$name\"?")
+                .setMessage(message)
+                .setPositiveButton("Delete") { _, _ -> deleteView(v) }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+    }
+
+    private fun deleteView(v: ViewEntry) {
+        val file = fileOf(v) ?: return
+        if (!profilesUsable()) return note("Looks can be deleted after the clip")
+        val name = plainName(v)
+        if (file.exists() && !file.delete()) return note("\"$name\" couldn't be deleted")
+        if (v is ViewEntry.CubeFile) prefs.edit().remove("lutInput:${file.name}").apply()
+        // The look in use stays; if it was this one, the first built-in look takes over.
+        val current = views.getOrNull(viewIndex)?.label
+        refreshViews(selectLabel = current.takeIf { it != v.label })
+        applyView()
+        note("\"$name\" deleted")
+        settingsChanged()
+    }
+
     /** Picks look or LUT [i] of [views]. */
     internal fun selectView(i: Int) {
         if (i !in views.indices || (simple && views[i] is ViewEntry.LogView)) return
@@ -1947,9 +2007,15 @@ class CameraActivity : Activity() {
             LogProfile.entries.forEach { p -> sub.add(5, LUT_INPUT_BASE + 1 + p.ordinal, p.ordinal + 1, (if (current == p) "● " else "") + p.label) }
         }
         if (!simple) menu.menu.add(6, IMPORT_ITEM, first + views.size + 1, "Import a .cube LUT…")
+        // The user's own looks and imported LUTs can go again (Glass: hold one in the list).
+        val own = views.filter { deletable(it) }
+        if (own.isNotEmpty() && !simple) {
+            val sub = menu.menu.addSubMenu(6, VIEW_DELETE_MENU, first + views.size + 2, "Delete a look or LUT ▸")
+            own.forEachIndexed { i, v -> sub.add(PROFILE_EDIT_GROUP, VIEW_DELETE_BASE + i, i, v.label) }
+        }
         menu.setOnMenuItemClickListener { item ->
             when {
-                item.itemId == LUT_INPUT_MENU || item.itemId == PROFILE_EDIT_MENU || item.itemId == PROFILE_SHARE_MENU ->
+                item.itemId == LUT_INPUT_MENU || item.itemId == PROFILE_EDIT_MENU || item.itemId == PROFILE_SHARE_MENU || item.itemId == VIEW_DELETE_MENU ->
                     return@setOnMenuItemClickListener false // opens the submenu
                 item.itemId == PROFILE_SAVE -> promptSaveProfile()
                 item.itemId == PROFILE_IMPORT -> pickLut()
@@ -1957,6 +2023,7 @@ class CameraActivity : Activity() {
                 item.itemId in PROFILE_EDIT_BASE until PROFILE_EDIT_BASE + profiles.size -> promptEditProfile(profiles[item.itemId - PROFILE_EDIT_BASE])
                 item.itemId in PROFILE_BASE until PROFILE_BASE + profiles.size -> applyProfile(profiles[item.itemId - PROFILE_BASE])
                 item.itemId == IMPORT_ITEM -> pickLut()
+                item.itemId in VIEW_DELETE_BASE until VIEW_DELETE_BASE + own.size -> promptDeleteView(own[item.itemId - VIEW_DELETE_BASE])
                 item.itemId in LUT_INPUT_BASE..LUT_INPUT_BASE + LogProfile.entries.size -> cube?.let { setLutInput(it.file, LogProfile.entries.getOrNull(item.itemId - LUT_INPUT_BASE - 1)) }
                 else -> selectView(item.itemId)
             }
@@ -3297,5 +3364,7 @@ class CameraActivity : Activity() {
         private const val PROFILE_SHARE_MENU = 11_003
         private const val PROFILE_IMPORT = 11_004
         private const val PROFILE_SHARE_BASE = 14_000
+        private const val VIEW_DELETE_MENU = 11_005
+        private const val VIEW_DELETE_BASE = 15_000
     }
 }
