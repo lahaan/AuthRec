@@ -426,7 +426,7 @@ class CameraActivity : Activity() {
         cleanup = prefs.getInt("cleanup", 2)
         nrFast = prefs.getBoolean("nrFast", false)
         evoOn = prefs.getBoolean("evo", false)
-        evoStrength = prefs.getInt("evoStrength", 1).coerceIn(0, 2)
+        evoStrength = prefs.getInt("evoStrength", 1).coerceIn(0, 3)
         if (prefs.contains("edrOn")) {
             edrOn = prefs.getBoolean("edrOn", false)
             edrHighlights = prefs.getInt("edrHi", EDR_HIGHLIGHTS)
@@ -670,12 +670,12 @@ class CameraActivity : Activity() {
     }
 
     internal fun setEvoStrength(level: Int) {
-        evoStrength = level.coerceIn(0, 2)
+        evoStrength = level.coerceIn(0, 3)
         applyEvo()
         settingsChanged()
     }
 
-    internal fun evoStrengthLabel() = arrayOf("gentle", "balanced", "strong")[evoStrength]
+    internal fun evoStrengthLabel() = arrayOf("gentle", "balanced", "strong", "extra")[evoStrength]
 
     /** Tells the renderer whether EVO runs and what counts as white (the view's, and a clip's). */
     private fun applyEvo() {
@@ -3179,7 +3179,7 @@ class CameraActivity : Activity() {
      * lock focus there), afreset = true (as a double-tap), fullpreview = true|false (full-res preview),
      * fakeheat = °C (pretend battery temperature, until the next real reading) after fakeheatdelay ms,
      * lutinput = APPLE_LOG | SLOG3 | LOGC3 | NONE (what the selected imported LUT expects),
-     * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false, evo = true|false (`--ez`), evostrength = 0..2 (`--ei`),
+     * tonehi / tonelo = -100..100 (the eDR curve; switches eDR on), edr = true|false, evo = true|false (`--ez`), evostrength = 0..3 (`--ei`),
      * evoverbose = true (`--ez`: log EVO's state twice a second), evodim = weight (`--ef`: EVO's midtone guard, 0 = off),
      * evodump = true (`--ez`: log EVO's measure of the scene once, 3 s later, for tools/evosim),
      * explog = frames (`--ei`: log every frame's exposure and each part of the gain for that many frames),

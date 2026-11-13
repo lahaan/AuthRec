@@ -935,7 +935,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         videoRows += choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }, usable = { a.cleanup >= 2 }) { a.setNrFast(it) }
         videoRows += choice("Audio", false, listOf("On" to true, "Off" to false), { a.audioOn }) { if (it != a.audioOn) a.toggleAudio() }
         // How readily EVO darkens the picture to hold bright surfaces (the chip by eDR switches it on).
-        choice("EVO", false, listOf("Gentle" to 0, "Balanced" to 1, "Strong" to 2), { a.evoStrength }) { a.setEvoStrength(it) }
+        choice("EVO", false, listOf("Gentle" to 0, "Balanced" to 1, "Strong" to 2, "Extra" to 3), { a.evoStrength }) { a.setEvoStrength(it) }
         choice("Layout", false, listOf("Glass" to false, "Classic" to true), { a.classicUi }) { a.setClassicUi(it) }
         fun buttons(pro: Boolean, vararg items: Pair<String, () -> Unit>) {
             val r = LinearLayout(a).apply {

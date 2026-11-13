@@ -120,7 +120,7 @@ public class EvoSim {
         Evo.Tone tone = Evo.Companion.toneOfLook(lut, LogProfile.SLOG3, expects, 1f, 0f, 0f, dehaze);
         System.out.printf("gain %.2f, look goes white %.1f stops over grey and shows grey at %.0f%%, dehaze %+.2f%n", gain,
             Math.log(tone.getWhite() / 0.18) / Math.log(2), tone.at(0f) * 100, dehaze);
-        for (float guard : new float[]{0f, Evo.DIM_WEIGHT}) for (int st = 0; st < 3; st++) {
+        for (float guard : new float[]{0f, Evo.DIM_WEIGHT}) for (int st = 0; st < 4; st++) {
             Evo evo = new Evo();
             evo.setDimWeight(guard); evo.setStrength(st);
             for (int f = 0; f < 600; f++) evo.update(m, gain, tone, tone.getWhite(), 6.6e-4f, 0f, true, STEP, -4f, 4f, false, Evo.Mode.RUN, 1f / 30);
@@ -163,7 +163,7 @@ public class EvoSim {
         settle("white plate on dark grey", plate, 1.5f, w, n, true);
         settle("sunset sky over foliage", sunset, 1.5f, w, n, true);
 
-        for (float dw : new float[]{0f, Evo.DIM_WEIGHT}) for (int st = 0; st < 3; st++) {
+        for (float dw : new float[]{0f, Evo.DIM_WEIGHT}) for (int st = 0; st < 4; st++) {
             System.out.println("-- a look that clips early, strength " + st + ", guard " + dw);
             GUARD = dw; STRENGTH = st;
             settle("overcast sky over a garden", garden, 4.6f, wEarly, n, true);

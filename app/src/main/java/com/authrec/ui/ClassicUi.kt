@@ -39,7 +39,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     private val edrButton = kit.button("") { a.setEdr(!a.edrOn) }
     /** Tap: on / off; hold: gentle → balanced → strong. */
     private val evoButton = kit.button("") { a.setEvo(!a.evoOn) }.apply {
-        setOnLongClickListener { a.setEvoStrength((a.evoStrength + 1) % 3); true }
+        setOnLongClickListener { a.setEvoStrength((a.evoStrength + 1) % 4); true }
     }
     private fun evoText() = if (!a.evoOn) "EVO: off" else a.evoShift()?.let { "EVO: %+.1f".format(it) } ?: "EVO: ${a.evoStrengthLabel()}"
     /** The flash unit as a steady light (back lenses that have one). */

@@ -128,9 +128,12 @@ class Evo {
     }
 
     /**
-     * How readily the picture is darkened: 0 gentle, 1 balanced, 2 strong (Settings → EVO). The
-     * owner, on a bright room through a LUT that clips early: balanced's −0.8…−1.2 "a bit weak",
-     * −2 "more accurate", −1.2 to −1.8 the best: balanced is tuned to land there.
+     * How readily the picture is darkened: 0 gentle, 1 balanced, 2 strong, 3 extra (Settings →
+     * EVO). The owner, on a bright room through a LUT that clips early: balanced's −0.8…−1.2 "a
+     * bit weak", −2 "more accurate", −1.2 to −1.8 the best: balanced is tuned to land there.
+     * Extra (owner, 2026-11-13: "−1 on top of current Strongest option or well just even more
+     * agro just bc why not") pays next to nothing for moving and may go a stop further down
+     * ([MAX_DOWN_EXTRA]); what still holds it back is the picture sinking into the dark.
      */
     @Volatile var strength = 1
 
@@ -280,7 +283,7 @@ class Evo {
     /** The averaged measure as text (view | sensor | clipped | sources), for tuning on the desktop (adb evodump). */
     fun dump(): String = avg.view.joinToString(",") + "|" + avg.sensor.joinToString(",") + "|" + avg.clipped.joinToString(",") + "|" + avg.sources
 
-    /** The view's cost at each candidate shift, from −[MAX_DOWN] in steps of [GRID] (after an [update]). */
+    /** The view's cost at each candidate shift, from −[MAX_DOWN] (extra: −[MAX_DOWN_EXTRA]) in steps of [GRID] (after an [update]). */
     fun viewCosts(): FloatArray = costs.copyOf()
 
     /** Share of the picture shown blown out with the view shifted by [shift] stops. */
@@ -315,22 +318,23 @@ class Evo {
             val d = tone.at(level(i) + toGrey)
             dark += avg.view[i] * (dimWeight * (1f - ramp(d, DIM_BLACK, DIM_GREY)) + BLACK_WEIGHT * (1f - ramp(d, BLACK_FULL, BLACK_FROM)))
         }
-        val st = strength.coerceIn(0, 2)
+        val st = strength.coerceIn(0, PRICE_DOWN.lastIndex)
         return blown(gain, tone, b) + dark + if (b < 0f) -b * PRICE_DOWN[st] + b * b * PRICE_DOWN_FAR[st] else b * PRICE_UP + b * b * PRICE_UP_FAR
     }
 
     private fun bestView(gain: Float, tone: Tone, allowPush: Boolean): Float {
-        val count = Math.round((MAX_DOWN + if (allowPush) MAX_UP else 0f) / GRID) + 1
+        val down = viewDown()
+        val count = Math.round((down + if (allowPush) MAX_UP else 0f) / GRID) + 1
         var best = -1
         for (k in 0 until count) {
-            val b = -MAX_DOWN + k * GRID
+            val b = -down + k * GRID
             costs[k] = viewCost(gain, tone, b)
             // Among near-equals, the smaller move.
             if (best < 0 || costs[k] < costs[best] - 1e-4f ||
-                (costs[k] < costs[best] + 1e-4f && abs(b) < abs(-MAX_DOWN + best * GRID))) best = k
+                (costs[k] < costs[best] + 1e-4f && abs(b) < abs(-down + best * GRID))) best = k
         }
         for (k in count until costs.size) costs[k] = Float.NaN
-        var b = -MAX_DOWN + best * GRID
+        var b = -down + best * GRID
         // Between the candidates, where a parabola through the best and its neighbours is lowest:
         // the wish then moves evenly with the scene instead of hopping from one candidate to the next.
         if (best > 0 && best < count - 1 && b != 0f) {
@@ -340,7 +344,10 @@ class Evo {
         return b
     }
 
-    private val costs = FloatArray(Math.round((MAX_DOWN + MAX_UP) / GRID) + 1)
+    private val costs = FloatArray(Math.round((MAX_DOWN_EXTRA + MAX_UP) / GRID) + 1)
+
+    /** How far down the view may go at this [strength]. */
+    private fun viewDown() = if (strength >= 3) MAX_DOWN_EXTRA else MAX_DOWN
 
     /**
      * The change of real exposure (from where this frame is) that costs least; [prefer]: where the
@@ -428,16 +435,17 @@ class Evo {
          * through a LUT that clips 2 stops over middle grey went the whole 2 stops (X14,
          * 2026-11-12): whites that span more than the look holds can't all be kept, and the
          * picture's brightness is worth something too. How much is taste, hence [strength]
-         * (gentle, balanced, strong): that room, 18–24 % of it blown, came out about −0.9, −1.3
-         * and −1.7.
+         * (gentle, balanced, strong, extra): that room, 18–24 % of it blown, came out about −0.9,
+         * −1.3 and −1.7.
          */
-        private val PRICE_DOWN = floatArrayOf(0.04f, 0.03f, 0.02f)
-        private val PRICE_DOWN_FAR = floatArrayOf(0.05f, 0.025f, 0.005f)
+        private val PRICE_DOWN = floatArrayOf(0.04f, 0.03f, 0.02f, 0.006f)
+        private val PRICE_DOWN_FAR = floatArrayOf(0.05f, 0.025f, 0.005f, 0f)
         private const val PRICE_UP = 0.08f
         private const val PRICE_UP_FAR = 0.04f
         private const val SENSOR_PRICE = 0.01f
-        /** At most this far from the meter. */
+        /** At most this far from the meter (the sensor's exposure never goes further down than [MAX_DOWN]). */
         const val MAX_DOWN = 2f
+        const val MAX_DOWN_EXTRA = 3f
         const val MAX_UP = 1f
         private const val GRID = 0.125f
         /** The view's fastest (stops a second) and its spring (rad/s: ~2.5 s to settle). */
