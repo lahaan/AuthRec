@@ -214,7 +214,7 @@ class RecordingsActivity : Activity() {
             kit.button("Play") { play(clip) },
             kit.button("Share") { share(clip) },
             compress.takeIf { COMPRESS_IN_LIST },
-            kit.button("Delete") { askDelete(clip) },
+            kit.button("Delete") { askDelete(clip) }.apply { setTextColor(com.authrec.ui.Glass.DANGER) },
         )
         rowUpdaters[clip.uri] = {
             val mine = jobClip == clip.uri && busy
@@ -276,7 +276,7 @@ class RecordingsActivity : Activity() {
 
     private fun askDelete(c: Clip) {
         GlassDialog.message(this, kit, "Delete ${c.name}?", "${mb(c.bytes)}. This can't be undone from here.",
-            listOf(GlassDialog.Action("Keep"), GlassDialog.Action("Delete", main = true) { delete(c) }))
+            listOf(GlassDialog.Action("Keep"), GlassDialog.Action("Delete", main = true, danger = true) { delete(c) }))
     }
 
     private fun delete(c: Clip) {

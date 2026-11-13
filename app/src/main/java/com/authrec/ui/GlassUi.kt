@@ -410,8 +410,17 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
                 if (lookScroll.height == 0) return
                 lookScroll.viewTreeObserver.removeOnGlobalLayoutListener(this)
                 val current = lookMarks.lastOrNull { (_, isCurrent) -> isCurrent() }?.first
-                if (showCurrent && current != null) lookScroll.scrollTo(0, (current.top - lookScroll.height / 3).coerceAtLeast(0))
-                else lookScroll.scrollTo(0, scrollY)
+                if (showCurrent && current != null) {
+                    // The look in use a third of the way down; but all the way to an end where that's
+                    // nearly there (it stopped with the last row, "Edit look…", cut in half).
+                    val want = current.top - lookScroll.height / 3
+                    val end = (lookRows.height - lookScroll.height).coerceAtLeast(0)
+                    lookScroll.scrollTo(0, when {
+                        want < a.dp(60) -> 0
+                        want > end - a.dp(60) -> end
+                        else -> want
+                    })
+                } else lookScroll.scrollTo(0, scrollY)
             }
         })
     }
@@ -424,6 +433,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     /** Rows only video uses (hidden in Photo mode), and Photo's own. */
     private val videoRows = mutableListOf<View>()
     private val photoRows = mutableListOf<View>()
+    private lateinit var settingsScroll: ScrollView
     private val settingsSheet: View = buildSettings()
 
     private val panels: List<View> = listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel, adjustPanel, settingsSheet, lookSheet)
@@ -530,6 +540,18 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         controls.requestLayout()
     }
 
+    private fun tightenProBar(tight: Boolean) {
+        for (i in 0 until proBar.childCount) {
+            val chip = proBar.getChildAt(i) as Button
+            chip.textSize = if (tight) 12f else 13f
+            chip.setPadding(a.dp(if (tight) 5 else 14), a.dp(6), a.dp(if (tight) 5 else 14), a.dp(6))
+            (chip.layoutParams as LinearLayout.LayoutParams).apply {
+                marginStart = a.dp(if (tight) 2 else 4)
+                marginEnd = a.dp(if (tight) 2 else 4)
+            }
+        }
+    }
+
     private fun arrangeLandscape() {
         val top = Gravity.TOP
         val bottom = Gravity.BOTTOM
@@ -568,6 +590,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         place(torchButton, a.dp(40), a.dp(40), bottom or end, right = rightColumnW + (sliderW - a.dp(40)) / 2, bottom = a.dp(21))
 
         // Bottom of the image (Pro), with its panels above it.
+        tightenProBar(false)
         place(proBarScroll, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = a.dp(10))
         val aboveBar = a.dp(76)
         for (p in listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel)) place(p, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
@@ -606,11 +629,14 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         val below = h - imgBottom  // the band under the image
         a.info.maxWidth = w - a.dp(28)
         place(a.info, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(14), top = imgTop + a.dp(10))
-        place(recPill, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(16), top = a.dp(14))
+        // Turned this way the screen's top right corner, where Android shows its green "camera in
+        // use" dot, is this layout's top left: the mode switch starts beside the dot, not under it.
+        val cornerLeft = a.dp(if (turn == 270) 42 else 16)
+        place(recPill, WRAP_CONTENT, WRAP_CONTENT, top or start, left = cornerLeft, top = a.dp(14))
         hintText.maxWidth = w - a.dp(140)
         place(hint, WRAP_CONTENT, WRAP_CONTENT, top or centreH, top = imgTop + a.dp(52))
 
-        place(modeBox, WRAP_CONTENT, WRAP_CONTENT, top or start, left = a.dp(16), top = a.dp(14))
+        place(modeBox, WRAP_CONTENT, WRAP_CONTENT, top or start, left = cornerLeft, top = a.dp(14))
         place(settingsChip, WRAP_CONTENT, WRAP_CONTENT, top or end, right = a.dp(16), top = a.dp(14))
         leftColumn.orientation = LinearLayout.HORIZONTAL
         for (i in 0 until leftColumn.childCount) {
@@ -637,7 +663,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
 
         val sliderH = (imageW * 0.6f).toInt()
         place(a.exposureSlider, sliderW, sliderH, top or end, top = imgTop + (imageW - sliderH) / 2 - a.dp(30))
-        place(proBarScroll, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, left = a.dp(8), right = a.dp(8), bottom = below + a.dp(10))
+        // Tighter chips, so the whole bar fits the width (FPS and RESET were scrolled out of sight).
+        tightenProBar(true)
+        place(proBarScroll, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, left = a.dp(4), right = a.dp(4), bottom = below + a.dp(10))
         val aboveBar = below + a.dp(76)
         for (p in listOf(aePanel, isoPanel, shutterPanel, wbPanel, fpsPanel)) place(p, WRAP_CONTENT, WRAP_CONTENT, bottom or centreH, bottom = aboveBar)
         dialViews.forEach { it.layoutParams = (it.layoutParams as LinearLayout.LayoutParams).apply { width = w - a.dp(64) } }
@@ -820,6 +848,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         val show = panel.visibility != View.VISIBLE
         panels.forEach { if (it !== panel) it.visibility = View.GONE }
         if (show && panel === adjustPanel) a.priorityPanelOpen = false
+        // From the top each time: it reopened where it was left, with Mode and Resolution out of view.
+        if (show && panel === settingsSheet) settingsScroll.scrollTo(0, 0)
         panel.visibility = if (show) View.VISIBLE else View.GONE
         if (show) kit.reveal(panel)
         update()
@@ -857,7 +887,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
                         seg.getChildAt(i).alpha = if (can(o.second)) 1f else 0.4f
                     }
                 }
-                mark(options.indexOfFirst { it.second == current() })
+                // Nothing lit where no option can be used (Colour NR with the colour clean-up off).
+                mark(if (usable != null && options.none { usable(it.second) }) -1 else options.indexOfFirst { it.second == current() })
             }
             return r
         }
@@ -900,7 +931,8 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         videoRows += choice("Clean-up", true, listOf("Off" to 0, "Pixels" to 1, "+ Colour" to 2, "+ Colour+" to 3), { a.cleanup }) { a.setCleanup(it) }
         // Quality: the history checked against each pixel's neighbours (best against trails, the
         // GPU's heaviest pass gets ~7 ms more at 4K); Fast: against the pixel's own noise.
-        videoRows += choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }) { a.setNrFast(it) }
+        // It's the colour clean-up's: greyed out while Clean-up is Off or Pixels.
+        videoRows += choice("Colour NR", true, listOf("Quality" to false, "Fast" to true), { a.nrFast }, usable = { a.cleanup >= 2 }) { a.setNrFast(it) }
         videoRows += choice("Audio", false, listOf("On" to true, "Off" to false), { a.audioOn }) { if (it != a.audioOn) a.toggleAudio() }
         // How readily EVO darkens the picture to hold bright surfaces (the chip by eDR switches it on).
         choice("EVO", false, listOf("Gentle" to 0, "Balanced" to 1, "Strong" to 2), { a.evoStrength }) { a.setEvoStrength(it) }
@@ -917,7 +949,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             if (pro) proSettings += r
         }
         buttons(true, "Import .cube LUT…" to { a.pickLut() }, "Edit look / make LUT…" to { a.openLookEditor() })
-        buttons(false, "Recordings…" to { a.openRecordings() }, "About & licences" to { com.authrec.About.show(a) })
+        buttons(false, "Recordings…" to { a.openRecordings() }, "About & licences" to { com.authrec.About.show(a, kit, heldTurn) })
         buttons(false, "Lenses…" to { a.showLensMenu(settingsChip) }, "Rescan lenses" to { toggle(settingsSheet); a.rescanLenses() })
         // On its own row: as a third button it wrapped onto two lines in the upright sheet (QA, 2026-11-13).
         buttons(false, "Send diagnostics…" to { a.sendDiagnostics() })
@@ -932,6 +964,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
             setFadingEdgeLength(a.dp(28))
             addView(content)
         }
+        settingsScroll = rows
         return LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
             background = GlassDrawable(a.dp(24).toFloat(), solid = true).apply { baseColor = 0x99101418.toInt() }
@@ -1034,7 +1067,9 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         updateEvoChip()
         kit.setOn(adjustChip, adjustPanel.visibility == View.VISIBLE)
         resChip.text = if (a.effectiveSuperpixel()) "2K" else "4K"
-        resChip.visibility = if (a.simple) View.VISIBLE else View.GONE
+        // Beside the image its place is kept in Pro and Photo, so the chips above it don't move
+        // when the mode changes (they jumped half a chip: QA, 2026-11-13).
+        resChip.visibility = if (a.simple) View.VISIBLE else if (upright) View.GONE else View.INVISIBLE
         resChip.isEnabled = !busy && a.fourKOffered()
         settingsChip.isEnabled = !busy
         kit.setOn(settingsChip, settingsSheet.visibility == View.VISIBLE)
@@ -1159,6 +1194,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }
         isoDial.show(isoValues.indices.minByOrNull { abs(isoValues[it] - iso) } ?: 0)
         isoDial.auto = !manual
+        isoDial.live = "$iso"
         kit.setOn(isoAuto, !manual)
 
         val shutterStops = a.shutterStops()
@@ -1170,6 +1206,7 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
         }
         shutterDial.show(shutterValues.indices.minByOrNull { abs(shutterValues[it] - ns) } ?: 0)
         shutterDial.auto = !manual
+        shutterDial.live = shutterText(ns)
         kit.setOn(shutterAuto, !manual)
     }
 
@@ -1217,10 +1254,15 @@ internal class GlassUi(private val a: CameraActivity) : CameraUi {
     }
 
     private fun updateEvoChip() {
-        kit.setOn(evoChip, a.evoOn)
+        // In Manual exposure EVO has nothing to shift: the chip isn't lit as if it were working
+        // (the stats said "EVO off in Manual" beside a blue "EVO on": QA, 2026-11-13).
+        val idle = a.evoIdle()
+        kit.setOn(evoChip, a.evoOn && !idle)
+        evoChip.alpha = if (idle) 0.6f else 1f
         val short = upright && a.simple
         val text = when {
             !a.evoOn -> if (short) "EVO" else "EVO  off"
+            idle -> if (short) "EVO" else "EVO  paused"
             else -> a.evoShift()?.let { (if (short) "%+.1f" else "EVO  %+.1f").format(it).replace('-', '−') } ?: if (short) "EVO" else "EVO  on"
         }
         if (evoChip.text.toString() != text) evoChip.text = text

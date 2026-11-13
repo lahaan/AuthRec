@@ -32,6 +32,9 @@ internal object Glass {
     const val ACCENT = 0xFF4FD8FF.toInt()
     const val ACCENT_DEEP = 0xFF1C9BD8.toInt()
     const val REC = 0xFFFF3B30.toInt()
+    /** What deletes: a button's text, or its fill where it's the dialog's main one. */
+    const val DANGER = 0xFFFF9287.toInt()
+    const val DANGER_DEEP = 0xFFD6453A.toInt()
     const val AMBER = 0xFFFFB300.toInt()
     const val TEXT = Color.WHITE
     const val TEXT_DIM = 0xB3FFFFFF.toInt()

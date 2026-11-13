@@ -29,7 +29,8 @@ import android.widget.ScrollView
  * keyboard: both were wrong with a window the panel's size (QA, 2026-11-13).
  */
 internal object GlassDialog {
-    class Action(val text: String, val main: Boolean = false, val onClick: (() -> Unit)? = null)
+    /** [danger]: it deletes something, and is red (text, or the fill of a [main] one). */
+    class Action(val text: String, val main: Boolean = false, val danger: Boolean = false, val onClick: (() -> Unit)? = null)
 
     /**
      * For a dialog with a text field. The keyboard leaves a strip about 140 dp high (the screen is
@@ -54,7 +55,8 @@ internal object GlassDialog {
                     textSize = if (small) 13f else 14f
                     if (small) setPadding(activity.dp(13), activity.dp(8), activity.dp(13), activity.dp(8))
                     else setPadding(activity.dp(18), activity.dp(10), activity.dp(18), activity.dp(10))
-                    if (a.main) kit.setOn(this, true)
+                    if (a.main) kit.setOn(this, true, if (a.danger) Glass.DANGER_DEEP else Glass.ACCENT_DEEP)
+                    else if (a.danger) setTextColor(Glass.DANGER)
                 }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = activity.dp(if (small) 6 else 10) })
             }
         }
@@ -153,7 +155,7 @@ internal object GlassDialog {
     }
 
     /** A title and a message (scrolls when long), for the simple cases. */
-    fun message(activity: Activity, kit: UiKit, title: String, text: String, actions: List<Action>): Dialog =
+    fun message(activity: Activity, kit: UiKit, title: String, text: String, actions: List<Action>, turn: Int = 0): Dialog =
         show(activity, kit, ScrollView(activity).apply {
             addView(LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
@@ -162,5 +164,5 @@ internal object GlassDialog {
                 addView(kit.label(text, 14f, dim = true).apply { setLineSpacing(0f, 1.15f) },
                     LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = activity.dp(10) })
             })
-        }, actions)
+        }, actions, turn)
 }

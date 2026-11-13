@@ -36,6 +36,13 @@ internal class ValueDial(context: Context, private val onChange: (Int) -> Unit) 
     var auto = false
         set(v) { if (field != v) { field = v; invalidate() } }
 
+    /**
+     * While [auto]: the camera's own value, shown under the mark in place of the nearest stop's
+     * (the chip said 1/33 and the dial 1/30, which read as a wrong number: QA, 2026-11-13).
+     */
+    var live: String? = null
+        set(v) { if (field != v) { field = v; invalidate() } }
+
     var index = 0
         private set
 
@@ -98,7 +105,7 @@ internal class ValueDial(context: Context, private val onChange: (Int) -> Unit) 
             text.alpha = if (selected) (if (auto) 170 else 255) else (a * 0.75f).toInt()
             text.textSize = Glass.dp(context, if (selected) 14f else 11f)
             text.isFakeBoldText = selected
-            c.drawText(labels[i], x, baseline, text)
+            c.drawText(if (selected && auto && !dragging) live ?: labels[i] else labels[i], x, baseline, text)
         }
         // The fixed mark the scale slides under.
         c.drawLine(cx, tickTop - Glass.dp(context, 4f), cx, tickBottom + Glass.dp(context, 4f), centre)

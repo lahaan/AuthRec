@@ -52,8 +52,10 @@ class ExposureSlider(context: Context, private val glass: Boolean = false, priva
     private val title = Paint(label).apply { textSize = 28f; textAlign = Paint.Align.CENTER }
 
     private val pad = 56f
+    /** Glass has its "EV" inside the capsule: the track starts under it (at +8 the knob covered it). */
+    private val topPad = if (glass) 84f else pad
     private val trackX get() = width - 44f
-    private fun yOf(v: Float) = height - pad - (v + range) / (2 * range) * (height - 2 * pad)
+    private fun yOf(v: Float) = height - pad - (v + range) / (2 * range) * (height - pad - topPad)
 
     /** The glass capsule in view coordinates (for the backdrop blur), or null in the classic style. */
     fun glassBox(): RectF? = if (glass && width > 0) RectF(trackX - 30f, 4f, trackX + 30f, height - 4f) else null
@@ -111,7 +113,7 @@ class ExposureSlider(context: Context, private val glass: Boolean = false, priva
             MotionEvent.ACTION_MOVE -> {
                 if (!moved && abs(e.y - downY) < 12f) return true
                 moved = true
-                val perPx = 2 * range / (height - 2 * pad)
+                val perPx = 2 * range / (height - pad - topPad)
                 val v = ((downValue + (downY - e.y) * perPx) * 10).roundToInt() / 10f
                 set(v.coerceIn(-range, range))
             }

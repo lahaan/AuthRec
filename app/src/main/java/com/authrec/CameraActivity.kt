@@ -719,6 +719,9 @@ class CameraActivity : Activity() {
     }
 
     /** What EVO is doing, for the controls: null when off or at rest, else its shift of the picture in EV. */
+    /** EVO is switched on but has nothing to work with: exposure is Manual. */
+    internal fun evoIdle() = evoOn && renderer?.evoMode == Evo.Mode.OFF
+
     internal fun evoShift(): Float? = renderer?.takeIf { evoOn }?.let { r ->
         val shown = r.evoViewEv
         val sensor = r.evoSensorEv
@@ -1816,7 +1819,7 @@ class CameraActivity : Activity() {
                 addView(kit.label("Delete \"$name\"?", 18f).apply { typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) })
                 addView(kit.label(message, 13f, dim = true), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
             }
-            GlassDialog.show(this, kit, content, listOf(GlassDialog.Action("Cancel"), GlassDialog.Action("Delete", main = true) { deleteView(v) }),
+            GlassDialog.show(this, kit, content, listOf(GlassDialog.Action("Cancel"), GlassDialog.Action("Delete", main = true, danger = true) { deleteView(v) }),
                 turn = ui.heldTurn)
         } else {
             android.app.AlertDialog.Builder(this)
@@ -1950,7 +1953,7 @@ class CameraActivity : Activity() {
                     addView(buttonsWhileTyping, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
                 }, LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(10) })
             }
-            GlassDialog.show(this, kit, content, extras.map { (text, run) -> GlassDialog.Action(text) { run() } } + listOf(
+            GlassDialog.show(this, kit, content, extras.map { (text, run) -> GlassDialog.Action(text, danger = text == "Delete") { run() } } + listOf(
                 GlassDialog.Action("Cancel"),
                 GlassDialog.Action(action, main = true) { done() },
             ), turn = ui.heldTurn, typing = GlassDialog.Typing(buttonsWhileTyping, listOf(explanation)))
@@ -1985,7 +1988,11 @@ class CameraActivity : Activity() {
         // Profiles first: a whole look (and format) in one tap. Not while recording or taking a photo.
         val free = profilesUsable()
         val now = snapshotProfile("")
-        if (profiles.isNotEmpty()) menu.menu.add(PROFILE_GROUP, PROFILE_HEADER, 0, "Profiles").isEnabled = false
+        // A heading, not a choice: small and grey (disabled alone, it looked like any other item).
+        if (profiles.isNotEmpty()) menu.menu.add(PROFILE_GROUP, PROFILE_HEADER, 0, android.text.SpannableString("PROFILES").apply {
+            setSpan(android.text.style.RelativeSizeSpan(0.75f), 0, length, 0)
+            setSpan(android.text.style.ForegroundColorSpan(Color.GRAY), 0, length, 0)
+        }).isEnabled = false
         profiles.forEachIndexed { i, p ->
             menu.menu.add(PROFILE_GROUP, PROFILE_BASE + i, 1 + i, (if (p.sameSettings(now)) "● " else "") + p.name).isEnabled = free
         }

@@ -30,7 +30,8 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
     // The way back to Glass (and the lens tools) where it can be seen: this layout has no
     // settings sheet, and the same items in the lens menu went unnoticed.
     private val settingsButton = kit.button("⚙") { showSettingsMenu() }
-    private val lensButton = kit.button("") { a.showLensMenu() }
+    // Wide enough to hit: with "1x" on it, it was 32 dp across.
+    private val lensButton = kit.button("") { a.showLensMenu() }.apply { minimumWidth = a.dp(52); minWidth = a.dp(52) }
     private val mirrorButton = kit.button("") { a.setMirrorFront(!a.mirrorFront) }
     private val profileButton = kit.button("") { a.cycleProfile() }
     private val viewButton = kit.button("") { a.showViewMenu() }
@@ -343,7 +344,7 @@ internal class ClassicUi(private val a: CameraActivity) : CameraUi {
                 2 -> a.sendDiagnostics()
                 3 -> a.openBench()
                 4 -> a.openRecordings()
-                5 -> com.authrec.About.show(a)
+                5 -> com.authrec.About.show(a, a.kit)
                 6 -> a.recheckRecording()
             }
             true

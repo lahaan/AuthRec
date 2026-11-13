@@ -1,5 +1,6 @@
 package com.authrec
 
+import com.authrec.ui.dp
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ContentValues
@@ -117,6 +118,7 @@ class LookEditorActivity : Activity() {
         hint = TextView(this).apply {
             setTextColor(Color.LTGRAY)
             textSize = 11f
+            setPadding(dp(14), dp(4), dp(14), dp(6))
             text = "Hold the image to compare with plain Rec.709"
         }
         profileButton = button("") { cycleProfile() }
@@ -138,6 +140,7 @@ class LookEditorActivity : Activity() {
         addColourMixer()
         val mono = Switch(this).apply {
             text = "Black & white"
+            textSize = 12f
             setTextColor(Color.WHITE)
             isChecked = params.mono
             setOnCheckedChangeListener { _: CompoundButton, on: Boolean -> params = params.copy(mono = on); render() }
@@ -156,7 +159,12 @@ class LookEditorActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
             addView(profileButton)
-            addView(ScrollView(this@LookEditorActivity).apply { addView(sliderPanel) }, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+            // The list fades out at its ends: the button row cut a slider in half with no sign of more below.
+            addView(ScrollView(this@LookEditorActivity).apply {
+                isVerticalFadingEdgeEnabled = true
+                setFadingEdgeLength(dp(28))
+                addView(sliderPanel)
+            }, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
             addView(buttons)
         }
         val left = LinearLayout(this).apply {
@@ -219,8 +227,9 @@ class LookEditorActivity : Activity() {
         sliderPanel.addView(TextView(this).apply {
             text = "Colour mixer"
             setTextColor(Color.WHITE)
-            textSize = 13f
-            setPadding(0, 24, 0, 8)
+            textSize = 12f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 24, 0, 12)
         })
         val swatches = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val chips = Looks.MIX_BANDS.mapIndexed { i, (name, hue) ->
@@ -243,7 +252,7 @@ class LookEditorActivity : Activity() {
         }
         sliders += { paintChips() }
         paintChips()
-        sliderPanel.addView(swatches, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        sliderPanel.addView(swatches, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(10) })
         fun band(values: List<Float>) = values[mixBand]
         fun with(values: List<Float>, v: Float) = values.toMutableList().also { it[mixBand] = v }
         addSlider("Hue", -30f, 30f, { "%+.0f°".format(it) }, { band(params.mixHue) }, labelPrefix = { Looks.MIX_BANDS[mixBand].first }) {
